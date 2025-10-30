@@ -1,0 +1,70 @@
+# Mac Training Configuration for 8GB Unified Memory
+
+# Dataset configuration
+data:
+  path: "../data"
+  train: "images/train"
+  val: "images/val" 
+  test: "images/test"
+
+# Class definitions for military targets
+nc: 4  # number of classes
+names:
+  0: "armed_personnel"
+  1: "rocket_launcher"
+  2: "military_vehicle"
+  3: "heavy_weapon"
+
+# Model configuration
+model: "yolov8n.pt"  # Nano model only for 8GB systems
+
+# Memory-constrained hyperparameters
+epochs: 50          # Fewer epochs to reduce training time
+batch_size: 8       # Small batch size for 8GB memory
+img_size: 416       # Smaller input size to save memory
+workers: 4          # Fewer worker processes
+patience: 15
+
+# Optimization
+optimizer: "AdamW"
+lr0: 0.005          # Lower learning rate for stability
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 2
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+
+# Minimal data augmentation to save memory
+hsv_h: 0.01
+hsv_s: 0.5
+hsv_v: 0.3
+degrees: 0.0
+translate: 0.05
+scale: 0.3
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.5
+mosaic: 0.5         # Reduced mosaic
+mixup: 0.0          # Disabled
+copy_paste: 0.0     # Disabled
+
+# Validation
+val: True
+save_period: 15     # Save less frequently
+plots: False        # Disable plots to save memory
+device: "auto"
+
+# Export settings
+export:
+  format: "onnx"
+  dynamic: False    # Static for better mobile performance
+  simplify: True
+  opset: 11
+
+# 8GB Mac optimizations
+memory_optimizations:
+  gradient_checkpointing: True
+  mixed_precision: False    # Disable for compatibility
+  cache_clear_frequency: 5  # Clear cache more frequently

@@ -1,0 +1,70 @@
+# Military Target Detection Configuration - Mac Optimized
+
+# Dataset configuration
+data:
+  path: "../data"
+  train: "images/train"
+  val: "images/val" 
+  test: "images/test"
+
+# Class definitions for military targets
+nc: 4  # number of classes
+names:
+  0: "armed_personnel"    # Soldiers with rifles/weapons
+  1: "rocket_launcher"    # RPGs, anti-tank weapons
+  2: "military_vehicle"   # Tanks, armored vehicles, military trucks
+  3: "heavy_weapon"       # Mounted guns, artillery pieces
+
+# Model configuration
+model: "yolov8n.pt"  # Nano model for Mac efficiency
+
+# Training hyperparameters - Mac optimized
+epochs: 100
+batch_size: 16  # Optimized for 16GB unified memory (reduce to 8 for 8GB Macs)
+img_size: 640
+workers: 6      # Optimized for Apple Silicon CPU cores
+patience: 20
+
+# Optimization
+optimizer: "AdamW"  # Explicit optimizer for Mac
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+
+# Data augmentation - Mac memory optimized
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0.0
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.5
+mosaic: 1.0
+mixup: 0.0
+copy_paste: 0.0  # Disable for memory efficiency
+
+# Validation
+val: True
+save_period: 10
+plots: True
+device: "auto"  # Auto-detect MPS, CUDA, or CPU
+
+# Export settings for deployment
+export:
+  format: "onnx"
+  dynamic: True
+  simplify: True
+  opset: 11
+  
+# Mac-specific optimizations
+mac_optimizations:
+  memory_fraction: 0.8      # Use 80% of unified memory
+  thermal_throttle: True    # Enable thermal management
+  cache_clear_interval: 10  # Clear MPS cache every 10 epochs

@@ -1,0 +1,115 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Models and data
+*.onnx
+*.pt
+*.pth
+*.bin
+data/images/
+data/labels/
+!data/images/.gitkeep
+!data/labels/.gitkeep
+
+# Generated training data
+data/raw_images/
+data/backgrounds/
+data/synthetic_scenes/
+data/dataset_metadata.json
+
+# Downloaded tank images
+data/raw_images/tanks/
+tank_image_sources.txt
+tank_download_metadata.json
+
+# Generated battle scenes
+data/synthetic_scenes/images/
+data/synthetic_scenes/labels/
+data/synthetic_scenes/visualizations/
+data/synthetic_scenes/test_results/
+data/synthetic_scenes/dataset_metadata.json
+data/synthetic_scenes/test_results.json
+
+# Logs
+logs/
+*.log
+wandb/
+runs/
+
+# Training outputs
+runs/detect/
+runs/train/
+results.csv
+results.png
+confusion_matrix.png
+F1_curve.png
+P_curve.png
+PR_curve.png
+R_curve.png
+
+# Output
+output/
+runs/
+
+# Test results and visualizations
+test_results/
+*_detection.jpg
+*_vis.jpg
+test_results.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# System
+.DS_Store
+Thumbs.db
+
+# Unity
+Library/
+Temp/
+obj/
+Build/
+Builds/
+Assets/AssetStoreTools*
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.opendb
+*.VC.db

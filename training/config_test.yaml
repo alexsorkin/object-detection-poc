@@ -1,0 +1,64 @@
+# Quick test configuration - 1 epoch only
+
+# Dataset configuration (will create dummy data if missing)
+data:
+  path: "../data"
+  train: "images/train"
+  val: "images/val" 
+  test: "images/test"
+
+# Class definitions for military targets
+nc: 4  # number of classes
+names:
+  0: "armed_personnel"    # Soldiers with rifles/weapons
+  1: "rocket_launcher"    # RPGs, anti-tank weapons
+  2: "military_vehicle"   # Tanks, armored vehicles, military trucks
+  3: "heavy_weapon"       # Mounted guns, artillery pieces
+
+# Model configuration
+model: "yolov8n.pt"  # Nano model for fast testing
+
+# Training hyperparameters - Quick test
+epochs: 1           # Just 1 epoch for testing
+batch_size: 4       # Small batch for quick test
+img_size: 320       # Smaller image size for speed
+workers: 2          # Fewer workers for test
+patience: 999       # Don't stop early
+
+# Optimization
+optimizer: "AdamW"
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 0    # No warmup for quick test
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+
+# Data augmentation - minimal for test
+hsv_h: 0.0
+hsv_s: 0.0
+hsv_v: 0.0
+degrees: 0.0
+translate: 0.0
+scale: 0.0
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.0
+mosaic: 0.0
+mixup: 0.0
+copy_paste: 0.0
+
+# Validation
+val: True
+save_period: 1
+plots: False        # Disable plots for speed
+device: "auto"      # Auto-detect MPS
+
+# Export settings
+export:
+  format: "onnx"
+  dynamic: True
+  simplify: True
+  opset: 11

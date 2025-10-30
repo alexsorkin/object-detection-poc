@@ -1,0 +1,29 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# ONNX models (too large for git)
+*.onnx
+*.onnx.tar.gz
+
+# Test outputs
+test_output/
+detection_results/
+*.jpg
+*.png
+!docs/*.png
+!docs/*.jpg
+
+# Benchmark results
+benches/results/
+*.criterion/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System
+.DS_Store
