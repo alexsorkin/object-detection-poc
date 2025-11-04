@@ -1,0 +1,17 @@
+# Military Target Detection Dataset Configuration
+
+# Dataset paths (relative to this file)
+path: ../data
+train: images/train
+val: images/val
+test: images/test
+
+# Number of classes
+nc: 4
+
+# Class names
+names:
+  0: armed_personnel
+  1: rocket_launcher
+  2: military_vehicle
+  3: heavy_weapon
