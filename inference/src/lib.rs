@@ -33,9 +33,6 @@ pub mod postprocessing;
 pub mod preprocessing;
 pub mod types;
 
-#[cfg(feature = "opencv")]
-pub mod video;
-
 // Export the detector
 pub use detector_onnx::MilitaryTargetDetector;
 

@@ -1,12 +1,8 @@
 use image::Rgb;
-use image::RgbImage;
 use military_target_detector::image_utils::{
     draw_rect, draw_text, generate_class_color, resize_with_letterbox,
 };
 use military_target_detector::types::{DetectorConfig, ImageData};
-use ndarray::{ArrayD, IxDyn};
-use ort::session::Session;
-use ort::value::Value;
 use std::env;
 use std::time::Instant;
 
@@ -23,174 +19,83 @@ use std::time::Instant;
 /// Example:
 ///   cargo run --release --features metal --example detect_yoloair test.jpg output.jpg
 
-/// Detect shadow regions in an image and return a binary mask
-/// Shadows are typically: dark (low V), low saturation, and not strongly colored
-fn detect_shadow_mask(img: &RgbImage) -> RgbImage {
+/// Apply simple HSV-based shadow removal (brightness enhancement)
+/// Increases V channel for darker pixels (shadows) more than bright pixels
+/// Input: RgbImage
+fn remove_shadows_hsv(img: &image::RgbImage) -> image::RgbImage {
     let (width, height) = img.dimensions();
-    let mut mask = RgbImage::new(width, height);
+    let mut result = image::RgbImage::new(width, height);
 
-    // Parameters for shadow detection (relaxed to detect more shadows)
-    let shadow_value_max = 0.50; // V < 0.50 (darker pixels - increased from 0.35)
-    let shadow_saturation_max = 0.35; // S < 0.35 (low saturation - increased from 0.25)
-    let shadow_brightness_max = 100.0; // Brightness < 100 (darker - increased from 90)
-
-    // Additional: check color consistency (shadows should be fairly uniform gray)
-    let color_variance_threshold = 35.0; // Low variance in RGB values (relaxed from 25)
-
+    // Convert RGB to HSV, enhance V channel, convert back
     for y in 0..height {
         for x in 0..width {
             let pixel = img.get_pixel(x, y);
-            let r = pixel[0] as f32 / 255.0;
-            let g = pixel[1] as f32 / 255.0;
-            let b = pixel[2] as f32 / 255.0;
+            let [r, g, b] = pixel.0;
 
-            // Convert RGB to HSV
-            let max_rgb = r.max(g).max(b);
-            let min_rgb = r.min(g).min(b);
-            let delta = max_rgb - min_rgb;
+            // RGB to HSV conversion
+            let r_f = r as f32 / 255.0;
+            let g_f = g as f32 / 255.0;
+            let b_f = b as f32 / 255.0;
 
-            // Value (brightness)
-            let v = max_rgb;
+            let max = r_f.max(g_f).max(b_f);
+            let min = r_f.min(g_f).min(b_f);
+            let delta = max - min;
 
-            // Saturation
-            let s = if max_rgb > 0.0 { delta / max_rgb } else { 0.0 };
+            // Calculate H (hue)
+            let h = if delta < 0.00001 {
+                0.0
+            } else if (max - r_f).abs() < 0.00001 {
+                60.0 * (((g_f - b_f) / delta) % 6.0)
+            } else if (max - g_f).abs() < 0.00001 {
+                60.0 * (((b_f - r_f) / delta) + 2.0)
+            } else {
+                60.0 * (((r_f - g_f) / delta) + 4.0)
+            };
 
-            // Brightness (perceived luminance)
-            let brightness =
-                0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32;
+            // Calculate S (saturation)
+            let s = if max < 0.00001 { 0.0 } else { delta / max };
 
-            // Color variance (difference between max and min RGB values)
-            let color_variance = (pixel[0] as f32 - pixel[1] as f32).abs()
-                + (pixel[1] as f32 - pixel[2] as f32).abs()
-                + (pixel[0] as f32 - pixel[2] as f32).abs();
+            // V (value/brightness)
+            let v = max;
 
-            // Detect shadow: dark AND low saturation AND low brightness AND low color variance
-            // This targets actual shadow regions, not dirt/stains which have more color variation
-            let is_shadow = v < shadow_value_max
-                && s < shadow_saturation_max
-                && brightness < shadow_brightness_max
-                && color_variance < color_variance_threshold;
+            // Enhance V channel for dark pixels (shadows)
+            // Increase brightness more for darker pixels
+            let v_enhanced = if v < 0.5 {
+                // Dark pixels: increase brightness significantly
+                (v + 0.3).min(1.0)
+            } else {
+                // Bright pixels: slight increase
+                (v + 0.1).min(1.0)
+            };
 
-            // Mask: white (255) for shadow regions, black (0) for non-shadow
-            let mask_value = if is_shadow { 255 } else { 0 };
-            mask.put_pixel(x, y, Rgb([mask_value, mask_value, mask_value]));
+            // HSV back to RGB
+            let c = v_enhanced * s;
+            let x_val = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+            let m = v_enhanced - c;
+
+            let (r_out, g_out, b_out) = if h < 60.0 {
+                (c, x_val, 0.0)
+            } else if h < 120.0 {
+                (x_val, c, 0.0)
+            } else if h < 180.0 {
+                (0.0, c, x_val)
+            } else if h < 240.0 {
+                (0.0, x_val, c)
+            } else if h < 300.0 {
+                (x_val, 0.0, c)
+            } else {
+                (c, 0.0, x_val)
+            };
+
+            let r_final = ((r_out + m) * 255.0).clamp(0.0, 255.0) as u8;
+            let g_final = ((g_out + m) * 255.0).clamp(0.0, 255.0) as u8;
+            let b_final = ((b_out + m) * 255.0).clamp(0.0, 255.0) as u8;
+
+            result.put_pixel(x, y, Rgb([r_final, g_final, b_final]));
         }
     }
 
-    mask
-}
-
-/// Apply CNN-based shadow removal using ONNX model
-/// Input: Already resized/letterboxed image
-fn remove_shadows_cnn(img: &RgbImage) -> Result<RgbImage, Box<dyn std::error::Error>> {
-    let model_size = img.width(); // Use input image size (should be 512x512)
-
-    // Step 1: Detect shadow mask on the input image
-    println!(
-        "  Detecting shadows on {}x{} image...",
-        model_size, model_size
-    );
-    let shadow_mask = detect_shadow_mask(img);
-
-    // Save shadow mask for inspection
-    if let Err(e) = shadow_mask.save("output_shadow_mask.jpg") {
-        println!("  ⚠️  Could not save shadow mask: {}", e);
-    } else {
-        println!("  💾 Saved shadow mask: output_shadow_mask.jpg");
-    }
-
-    // Load shadow removal model (5.6MB FP16 model with full architecture)
-    use ort::execution_providers::CoreMLExecutionProvider;
-
-    let mut session = Session::builder()?
-        .with_execution_providers([CoreMLExecutionProvider::default().build()])?
-        .commit_from_file("../models/shadowmaskformer_fp32.onnx")?;
-
-    println!("  Model loaded successfully");
-    println!(
-        "  Input names: {:?}",
-        session.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()
-    );
-    println!(
-        "  Output names: {:?}",
-        session.outputs.iter().map(|o| &o.name).collect::<Vec<_>>()
-    );
-
-    // Prepare input: convert RGB image to normalized float tensor [1, 3, H, W]
-    // IMPORTANT: Model requires [-1, 1] normalization, not [0, 1]!
-    let mut input_data = Vec::with_capacity((3 * model_size * model_size) as usize);
-
-    // Normalize to [-1, 1] and arrange as CHW format
-    for c in 0..3 {
-        for y in 0..model_size {
-            for x in 0..model_size {
-                let pixel = img.get_pixel(x, y);
-                let value = (pixel[c as usize] as f32 / 255.0) * 2.0 - 1.0; // [0,1] -> [-1,1]
-                input_data.push(value);
-            }
-        }
-    }
-
-    // Prepare mask from detected shadow regions (normalized to [-1, 1])
-    // Mask: 1.0 for shadow regions (white in mask), -1.0 for non-shadow (black in mask)
-    let mut mask_data = Vec::with_capacity((3 * model_size * model_size) as usize);
-
-    for _c in 0..3 {
-        // Same mask for all 3 channels
-        for y in 0..model_size {
-            for x in 0..model_size {
-                let pixel = shadow_mask.get_pixel(x, y);
-                // If shadow (white = 255), use 1.0, if non-shadow (black = 0), use -1.0
-                let is_shadow = pixel[0] > 128;
-                let value = if is_shadow { 1.0f32 } else { -1.0f32 };
-                mask_data.push(value);
-            }
-        }
-    }
-
-    // Create input tensors [1, 3, 512, 512]
-    let input_shape: Vec<usize> = vec![1, 3, model_size as usize, model_size as usize];
-    let input_tensor = ArrayD::from_shape_vec(IxDyn(&input_shape), input_data)?;
-    let mask_tensor = ArrayD::from_shape_vec(IxDyn(&input_shape), mask_data)?;
-
-    // Run inference with TWO inputs: image and mask
-    let outputs = session.run(ort::inputs![
-        "input" => Value::from_array(input_tensor)?,
-        "mask" => Value::from_array(mask_tensor)?
-    ])?;
-
-    // Extract output
-    let output = outputs["output"].try_extract_array::<f32>()?;
-    let output_data = output.view();
-
-    println!("  Output shape: {:?}", output_data.shape());
-    println!(
-        "  Output range: [{:.3}, {:.3}]",
-        output_data.iter().cloned().fold(f32::INFINITY, f32::min),
-        output_data
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max)
-    );
-
-    // Convert back to RGB image at 512x512
-    // IMPORTANT: Output is in [-1, 1] range, convert back to [0, 255]
-    let mut result_512 = RgbImage::new(model_size, model_size);
-    for y in 0..model_size {
-        for x in 0..model_size {
-            let r = ((output_data[[0, 0, y as usize, x as usize]] + 1.0) / 2.0 * 255.0)
-                .clamp(0.0, 255.0) as u8;
-            let g = ((output_data[[0, 1, y as usize, x as usize]] + 1.0) / 2.0 * 255.0)
-                .clamp(0.0, 255.0) as u8;
-            let b = ((output_data[[0, 2, y as usize, x as usize]] + 1.0) / 2.0 * 255.0)
-                .clamp(0.0, 255.0) as u8;
-            result_512.put_pixel(x, y, Rgb([r, g, b]));
-        }
-    }
-
-    // Return 512x512 image directly (no resizing back)
-    // The detector will use this size directly
-    Ok(result_512)
+    result
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -218,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Using 512x512 to match shadow removal output (no transformation)
     let config = DetectorConfig {
         model_path: "../models/yolov8m_world_detector.onnx".to_string(),
-        confidence_threshold: 0.10, // EXTREMELY low threshold (10%) to catch small objects
+        confidence_threshold: 0.30, // EXTREMELY low threshold (22%) to catch small objects
         nms_threshold: 0.45,
         input_size: (512, 512), // Match shadow removal output size
         use_gpu: true,
@@ -226,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("⚙️  Model: yolov8m_world_detector.onnx");
-    println!("⚙️  Confidence threshold: 10% (extreme diagnostic mode)");
+    println!("⚙️  Confidence threshold: 22% (extreme diagnostic mode)");
 
     // Load original image (for drawing output)
     print!("📷 Loading image... ");
@@ -245,29 +150,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("💾 Saved stage1 (resized): output_stage1_resized.jpg");
     }
 
-    // Preprocessing Stage 2: Apply CNN-based shadow removal on 512x512 image
-    print!("🌓 Preprocessing: Removing shadows... ");
+    // Preprocessing Stage 2: Apply HSV-based shadow removal (brightness enhancement)
+    print!("🌓 Preprocessing: Applying HSV brightness enhancement... ");
     let start_shadow = Instant::now();
-    let preprocessed_img = match remove_shadows_cnn(&stage1_img) {
-        Ok(img) => {
-            let elapsed = start_shadow.elapsed().as_secs_f32() * 1000.0;
-            println!("✓ ({:.0}ms)", elapsed);
+    let preprocessed_img = remove_shadows_hsv(&stage1_img);
+    let elapsed = start_shadow.elapsed().as_secs_f32() * 1000.0;
+    println!("✓ ({:.0}ms)", elapsed);
 
-            // Save shadow-removed image for inspection at fixed path
-            let shadow_output_path = "output_shadowremoved.jpg";
-            if let Err(e) = img.save(shadow_output_path) {
-                println!("⚠️  Could not save shadow-removed image: {}", e);
-            } else {
-                println!("💾 Saved shadow-removed image: {}", shadow_output_path);
-            }
-
-            img
-        }
-        Err(e) => {
-            println!("⚠️  Failed: {}, using original image", e);
-            original_img.clone()
-        }
-    };
+    // Save shadow-removed image for inspection at fixed path
+    let shadow_output_path = "output_shadowremoved.jpg";
+    if let Err(e) = preprocessed_img.save(shadow_output_path) {
+        println!("⚠️  Could not save enhanced image: {}", e);
+    } else {
+        println!("💾 Saved enhanced image: {}", shadow_output_path);
+    }
 
     // Convert image to ImageData for detection
     use military_target_detector::types::ImageFormat;
