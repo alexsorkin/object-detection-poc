@@ -35,9 +35,6 @@ pub enum DetectionError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
-    #[error("ONNX Runtime error: {0}")]
-    OnnxError(#[from] onnxruntime::OrtError),
-
     #[error("Image processing error: {0}")]
     ImageError(#[from] image::ImageError),
 
@@ -49,6 +46,10 @@ pub enum DetectionError {
 }
 
 impl DetectionError {
+    pub fn initialization<S: Into<String>>(msg: S) -> Self {
+        Self::ModelLoadError(msg.into())
+    }
+
     pub fn model_load<S: Into<String>>(msg: S) -> Self {
         Self::ModelLoadError(msg.into())
     }
@@ -59,6 +60,10 @@ impl DetectionError {
 
     pub fn preprocessing<S: Into<String>>(msg: S) -> Self {
         Self::PreprocessingError(msg.into())
+    }
+
+    pub fn postprocessing<S: Into<String>>(msg: S) -> Self {
+        Self::InferenceError(format!("Postprocessing error: {}", msg.into()))
     }
 
     pub fn config<S: Into<String>>(msg: S) -> Self {

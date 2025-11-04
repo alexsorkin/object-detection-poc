@@ -20,7 +20,7 @@ TANK_SERIES = {
 }
 
 class TankImageDownloader:
-    def __init__(self, output_dir: str = "../data/raw_images/tanks"):
+    def __init__(self, output_dir: str = "data/raw_images/tanks"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.output_dir / "download_metadata.json"
@@ -41,7 +41,6 @@ class TankImageDownloader:
     def download_from_wikimedia(self, tank_model: str, max_images: int = 20):
         """
         Download tank images from Wikimedia Commons
-        Note: This is a placeholder - actual implementation would use Wikimedia API
         """
         print(f"Downloading images for: {tank_model}")
         
@@ -52,48 +51,79 @@ class TankImageDownloader:
         # Wikimedia Commons API endpoint
         api_url = "https://commons.wikimedia.org/w/api.php"
         
-        # Search parameters
-        params = {
+        # Required headers for Wikimedia API
+        headers = {
+            'User-Agent': 'TankDetectionBot/1.0 (Educational/Research Purpose; Python/requests)'
+        }
+        
+        # Search for files in File namespace
+        search_params = {
             "action": "query",
             "format": "json",
-            "generator": "search",
-            "gsrsearch": f"{tank_model} tank",
-            "gsrlimit": max_images,
-            "prop": "imageinfo",
-            "iiprop": "url|size|mime",
-            "iiurlwidth": 1024,
+            "list": "search",
+            "srsearch": f"{tank_model} tank",
+            "srnamespace": "6",  # File namespace
+            "srlimit": str(max_images),
         }
         
         try:
-            response = requests.get(api_url, params=params, timeout=30)
+            # First, search for files
+            response = requests.get(api_url, params=search_params, headers=headers, timeout=30)
             if response.status_code == 200:
                 data = response.json()
                 
-                if "query" in data and "pages" in data["query"]:
-                    pages = data["query"]["pages"]
+                if "query" in data and "search" in data["query"]:
+                    search_results = data["query"]["search"]
                     downloaded = 0
                     
-                    for page_id, page in pages.items():
-                        if "imageinfo" in page:
-                            for img in page["imageinfo"]:
-                                if "url" in img:
-                                    img_url = img["url"]
-                                    self._download_image(img_url, tank_dir, tank_model, downloaded)
-                                    downloaded += 1
-                                    time.sleep(0.5)  # Be nice to the server
+                    for result in search_results:
+                        if downloaded >= max_images:
+                            break
+                        
+                        # Get image info for each file
+                        filename = result["title"]
+                        image_info_params = {
+                            "action": "query",
+                            "format": "json",
+                            "titles": filename,
+                            "prop": "imageinfo",
+                            "iiprop": "url",
+                        }
+                        
+                        img_response = requests.get(api_url, params=image_info_params, headers=headers, timeout=30)
+                        if img_response.status_code == 200:
+                            img_data = img_response.json()
+                            
+                            if "query" in img_data and "pages" in img_data["query"]:
+                                for page_id, page in img_data["query"]["pages"].items():
+                                    if "imageinfo" in page and len(page["imageinfo"]) > 0:
+                                        img_url = page["imageinfo"][0].get("url")
+                                        if img_url:
+                                            self._download_image(img_url, tank_dir, tank_model, downloaded)
+                                            downloaded += 1
+                                            time.sleep(1)  # Be nice to the server
                     
                     self.metadata["stats"][tank_model] = downloaded
-                    print(f"  Downloaded {downloaded} images")
+                    if downloaded > 0:
+                        print(f"  Downloaded {downloaded} images")
+                    else:
+                        print(f"  No images downloaded for {tank_model}")
                 else:
-                    print(f"  No images found for {tank_model}")
+                    print(f"  No search results for {tank_model}")
+            else:
+                print(f"  API returned status {response.status_code}: {response.text[:100]}")
                     
         except Exception as e:
             print(f"  Error downloading {tank_model}: {e}")
     
     def _download_image(self, url: str, output_dir: Path, tank_model: str, index: int):
         """Download a single image"""
+        headers = {
+            'User-Agent': 'TankDetectionBot/1.0 (Educational/Research Purpose; Python/requests)'
+        }
+        
         try:
-            response = requests.get(url, timeout=30, stream=True)
+            response = requests.get(url, headers=headers, timeout=30, stream=True)
             if response.status_code == 200:
                 # Determine file extension
                 content_type = response.headers.get('content-type', '')
@@ -171,7 +201,7 @@ class TankImageDownloader:
 
 def create_manual_download_list():
     """Generate a list of search queries for manual image collection"""
-    output_file = Path("../data/tank_image_sources.txt")
+    output_file = Path("data/tank_image_sources.txt")
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_file, 'w') as f:
@@ -208,12 +238,21 @@ def create_manual_download_list():
     print(f"\nManual download guide created: {output_file}")
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Download tank images for training')
+    parser.add_argument('--max-per-model', type=int, default=20,
+                       help='Maximum images to download per tank model (default: 20)')
+    parser.add_argument('--models', nargs='+',
+                       help='Specific tank models to download (e.g., T-72 T-80)')
+    args = parser.parse_args()
+    
     print("Tank Image Downloader for Military Target Detection")
     print("="*60)
     print()
     print("IMPORTANT NOTES:")
-    print("- This script provides a framework for downloading tank images")
-    print("- Actual downloads require appropriate API keys and permissions")
+    print("- This script downloads tank images from Wikimedia Commons")
+    print("- Images are under various Creative Commons licenses")
     print("- Always respect copyright and licensing requirements")
     print("- For training data, ensure diverse angles and conditions")
     print()
@@ -224,15 +263,30 @@ if __name__ == "__main__":
     # Initialize downloader
     downloader = TankImageDownloader()
     
-    print("\nREADY TO DOWNLOAD")
+    print("\nSTARTING DOWNLOAD")
     print("-"*60)
-    print("To proceed with automated download:")
-    print("  1. Ensure you have API credentials for image sources")
-    print("  2. Review and accept terms of service for each source")
-    print("  3. Uncomment the download line below")
+    
+    if args.models:
+        # Download specific models
+        print(f"Downloading {len(args.models)} specified models...")
+        for model in args.models:
+            downloader.download_from_wikimedia(model, args.max_per_model)
+            downloader._save_metadata()
+    else:
+        # Download all tanks
+        print(f"Downloading all tank models ({args.max_per_model} images each)...")
+        print("This may take several minutes...")
+        downloader.download_all_tanks(images_per_model=args.max_per_model)
+    
     print()
-    
-    # Uncomment to start downloading:
-    # downloader.download_all_tanks(images_per_model=20)
-    
-    print("Setup complete. Review tank_image_sources.txt for manual collection guide.")
+    print("="*60)
+    print("DOWNLOAD COMPLETE")
+    print("="*60)
+    total_downloaded = sum(downloader.metadata.get("stats", {}).values())
+    print(f"Total images downloaded: {total_downloaded}")
+    print(f"Output directory: {downloader.output_dir.absolute()}")
+    print()
+    print("Next steps:")
+    print("  python scripts/generate_battle_scenes.py  # Generate training scenes")
+    print("  python training/train.py --epochs 50      # Train the model")
+    print()

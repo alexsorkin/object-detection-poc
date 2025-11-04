@@ -3,7 +3,7 @@
 //! This module provides C-compatible functions that can be called from Unity C# scripts
 //! or other languages that support C interop.
 
-use crate::detector_stub::MilitaryTargetDetector;
+use crate::MilitaryTargetDetector;
 use crate::types::{DetectorConfig, ImageData, ImageFormat, TargetClass};
 
 use std::collections::HashMap;
@@ -13,8 +13,8 @@ use std::ptr;
 use std::slice;
 use std::sync::Mutex;
 
-// Global detector instance storage
-static mut DETECTORS: Option<Mutex<HashMap<u32, MilitaryTargetDetector>>> = None;
+// Global detector instance storage - each detector needs Mutex for mutable access
+static mut DETECTORS: Option<Mutex<HashMap<u32, Mutex<MilitaryTargetDetector>>>> = None;
 static mut NEXT_DETECTOR_ID: u32 = 1;
 
 /// Initialize the detection library
@@ -82,6 +82,7 @@ pub extern "C" fn mtd_create_detector(
         optimize_for_speed: true,
     };
 
+    // Create detector with new API (no device parameter)
     match MilitaryTargetDetector::new(config) {
         Ok(detector) => {
             let detector_id = unsafe {
@@ -90,7 +91,7 @@ pub extern "C" fn mtd_create_detector(
 
                 if let Some(ref detectors_mutex) = DETECTORS {
                     if let Ok(mut detectors) = detectors_mutex.lock() {
-                        detectors.insert(id, detector);
+                        detectors.insert(id, Mutex::new(detector));
                         id as c_int
                     } else {
                         -1
@@ -174,12 +175,16 @@ pub extern "C" fn mtd_detect_image(
         image_format,
     );
 
-    // Get detector and run inference
+    // Get detector and run inference (detector.detect() now requires &mut self)
     let result = unsafe {
         if let Some(ref detectors_mutex) = DETECTORS {
             if let Ok(detectors) = detectors_mutex.lock() {
-                if let Some(detector) = detectors.get(&(detector_id as u32)) {
-                    detector.detect(&image)
+                if let Some(detector_mutex) = detectors.get(&(detector_id as u32)) {
+                    if let Ok(mut detector) = detector_mutex.lock() {
+                        detector.detect(&image)
+                    } else {
+                        return ptr::null_mut();
+                    }
                 } else {
                     return ptr::null_mut();
                 }
@@ -192,14 +197,13 @@ pub extern "C" fn mtd_detect_image(
     };
 
     match result {
-        Ok(detection_result) => {
-            // Convert to C-compatible format
-            let count = detection_result.detections.len() as c_int;
-            let detections_vec: Vec<CDetection> = detection_result
-                .detections
+        Ok(detections) => {
+            // Convert Vec<Detection> to C-compatible format
+            let count = detections.len() as c_int;
+            let detections_vec: Vec<CDetection> = detections
                 .iter()
                 .map(|det| CDetection {
-                    class_id: det.class as u32 as c_int,
+                    class_id: det.class.id() as c_int,
                     confidence: det.confidence,
                     x: det.bbox.x,
                     y: det.bbox.y,
@@ -218,9 +222,9 @@ pub extern "C" fn mtd_detect_image(
                     ptr::null_mut()
                 },
                 count,
-                inference_time_ms: detection_result.inference_time_ms,
-                image_width: detection_result.image_width as c_int,
-                image_height: detection_result.image_height as c_int,
+                inference_time_ms: 0.0, // Timing not tracked in simplified API
+                image_width: width,
+                image_height: height,
             });
 
             Box::into_raw(c_result)
@@ -246,12 +250,22 @@ pub extern "C" fn mtd_detect_file(
         }
     };
 
+    // Load image from file
+    let image = match ImageData::from_file(path_str) {
+        Ok(img) => img,
+        Err(_) => return ptr::null_mut(),
+    };
+
     // Get detector and run inference
     let result = unsafe {
         if let Some(ref detectors_mutex) = DETECTORS {
             if let Ok(detectors) = detectors_mutex.lock() {
-                if let Some(detector) = detectors.get(&(detector_id as u32)) {
-                    detector.detect_file(path_str)
+                if let Some(detector_mutex) = detectors.get(&(detector_id as u32)) {
+                    if let Ok(mut detector) = detector_mutex.lock() {
+                        detector.detect(&image)
+                    } else {
+                        return ptr::null_mut();
+                    }
                 } else {
                     return ptr::null_mut();
                 }
@@ -264,14 +278,13 @@ pub extern "C" fn mtd_detect_file(
     };
 
     match result {
-        Ok(detection_result) => {
-            // Convert to C-compatible format (same as mtd_detect_image)
-            let count = detection_result.detections.len() as c_int;
-            let detections_vec: Vec<CDetection> = detection_result
-                .detections
+        Ok(detections) => {
+            // Convert Vec<Detection> to C-compatible format
+            let count = detections.len() as c_int;
+            let detections_vec: Vec<CDetection> = detections
                 .iter()
                 .map(|det| CDetection {
-                    class_id: det.class as u32 as c_int,
+                    class_id: det.class.id() as c_int,
                     confidence: det.confidence,
                     x: det.bbox.x,
                     y: det.bbox.y,
@@ -289,9 +302,9 @@ pub extern "C" fn mtd_detect_file(
                     ptr::null_mut()
                 },
                 count,
-                inference_time_ms: detection_result.inference_time_ms,
-                image_width: detection_result.image_width as c_int,
-                image_height: detection_result.image_height as c_int,
+                inference_time_ms: 0.0, // Timing not tracked in simplified API
+                image_width: image.width as c_int,
+                image_height: image.height as c_int,
             });
 
             Box::into_raw(c_result)
@@ -348,49 +361,27 @@ pub extern "C" fn mtd_get_class_color(class_id: c_int, rgb: *mut u8) {
 }
 
 /// Update detector configuration
+/// Note: Current ONNX Runtime implementation doesn't support runtime config updates.
+/// You need to recreate the detector with new config.
 #[no_mangle]
 pub extern "C" fn mtd_update_config(
-    detector_id: c_int,
-    confidence_threshold: c_float,
-    nms_threshold: c_float,
-    max_detections: c_int,
+    _detector_id: c_int,
+    _confidence_threshold: c_float,
+    _nms_threshold: c_float,
+    _max_detections: c_int,
 ) -> c_int {
-    unsafe {
-        if let Some(ref detectors_mutex) = DETECTORS {
-            if let Ok(mut detectors) = detectors_mutex.lock() {
-                if let Some(detector) = detectors.get_mut(&(detector_id as u32)) {
-                    let mut config = detector.config().clone();
-                    config.confidence_threshold = confidence_threshold;
-                    config.nms_threshold = nms_threshold;
-                    config.max_detections = max_detections as usize;
-
-                    match detector.update_config(config) {
-                        Ok(_) => return 0,
-                        Err(_) => return -1,
-                    }
-                }
-            }
-        }
-    }
-    -1
+    // Not supported in current implementation
+    // Return error code indicating feature not available
+    -2
 }
 
 /// Warm up detector (run dummy inference)
+/// Note: ONNX Runtime warms up automatically on first run.
 #[no_mangle]
-pub extern "C" fn mtd_warmup(detector_id: c_int) -> c_int {
-    unsafe {
-        if let Some(ref detectors_mutex) = DETECTORS {
-            if let Ok(detectors) = detectors_mutex.lock() {
-                if let Some(detector) = detectors.get(&(detector_id as u32)) {
-                    match detector.warmup() {
-                        Ok(_) => return 0,
-                        Err(_) => return -1,
-                    }
-                }
-            }
-        }
-    }
-    -1
+pub extern "C" fn mtd_warmup(_detector_id: c_int) -> c_int {
+    // ONNX Runtime/CoreML warm up automatically
+    // Return success since warmup is handled internally
+    0
 }
 
 /// Get number of available target classes

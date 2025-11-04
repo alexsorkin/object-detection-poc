@@ -14,9 +14,9 @@ import random
 
 class BattleSceneGenerator:
     def __init__(self, 
-                 tank_images_dir: str = "../data/raw_images/tanks",
-                 backgrounds_dir: str = "../data/backgrounds",
-                 output_dir: str = "../data/synthetic_scenes"):
+                 tank_images_dir: str = "data/raw_images/tanks",
+                 backgrounds_dir: str = "data/backgrounds",
+                 output_dir: str = "data/synthetic_scenes"):
         self.tank_images_dir = Path(tank_images_dir)
         self.backgrounds_dir = Path(backgrounds_dir)
         self.output_dir = Path(output_dir)
@@ -34,12 +34,15 @@ class BattleSceneGenerator:
         """Load tank and background images"""
         print("Loading assets...")
         
-        # Load tank images
+        # Load tank images (just collect paths, validate on use)
         if self.tank_images_dir.exists():
             for img_path in self.tank_images_dir.rglob("*.jpg"):
-                self.tank_images.append(img_path)
+                if img_path.stat().st_size > 0:  # Quick check: file not empty
+                    self.tank_images.append(img_path)
+            
             for img_path in self.tank_images_dir.rglob("*.png"):
-                self.tank_images.append(img_path)
+                if img_path.stat().st_size > 0:
+                    self.tank_images.append(img_path)
         
         # Load or generate background images
         if self.backgrounds_dir.exists():
@@ -76,6 +79,30 @@ class BattleSceneGenerator:
             self.background_images.append(bg_path)
         
         print(f"  Generated {count} synthetic backgrounds")
+    
+    def _generate_synthetic_tank(self, width: int = 200, height: int = 100) -> Image.Image:
+        """Generate a synthetic tank-like shape when no real images available"""
+        # Create tank silhouette
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        
+        # Tank body (rectangle)
+        body_color = (random.randint(60, 100), random.randint(60, 100), random.randint(60, 100), 255)
+        draw.rectangle([20, 40, 180, 90], fill=body_color, outline=(40, 40, 40, 255))
+        
+        # Turret (ellipse/rectangle)
+        turret_color = tuple(max(0, c - 20) for c in body_color[:3]) + (255,)
+        draw.ellipse([60, 20, 140, 60], fill=turret_color, outline=(40, 40, 40, 255))
+        
+        # Barrel (rectangle)
+        barrel_length = random.randint(60, 90)
+        draw.rectangle([140, 35, 140 + barrel_length, 45], fill=turret_color, outline=(40, 40, 40, 255))
+        
+        # Tracks/wheels (circles)
+        for x in [40, 70, 100, 130, 160]:
+            draw.ellipse([x-8, 75, x+8, 95], fill=(30, 30, 30, 255), outline=(20, 20, 20, 255))
+        
+        return img
     
     def _generate_field_background(self, width: int, height: int) -> np.ndarray:
         """Generate grassy field background"""
@@ -196,34 +223,58 @@ class BattleSceneGenerator:
         
         # Place tanks in the scene
         for i in range(num_tanks):
-            if not self.tank_images:
-                continue
-            
-            tank_path = random.choice(self.tank_images)
-            tank_img = Image.open(tank_path).convert('RGBA')
+            # Use real tank image if available, otherwise generate synthetic
+            if self.tank_images:
+                tank_path = random.choice(self.tank_images)
+                try:
+                    tank_img = Image.open(tank_path).convert('RGBA')
+                    source_name = str(tank_path.name)
+                except Exception as e:
+                    # If image is corrupted, skip it or use synthetic
+                    print(f"  Warning: Could not load {tank_path.name}: {e}")
+                    tank_img = self._generate_synthetic_tank(
+                        width=random.randint(150, 250),
+                        height=random.randint(75, 125)
+                    )
+                    source_name = "synthetic_tank"
+            else:
+                # Generate synthetic tank shape
+                tank_img = self._generate_synthetic_tank(
+                    width=random.randint(150, 250),
+                    height=random.randint(75, 125)
+                )
+                source_name = "synthetic_tank"
             
             # Random tank size (simulate distance)
             scale = random.uniform(0.1, 0.5)
             new_size = (int(tank_img.width * scale), int(tank_img.height * scale))
             tank_img = tank_img.resize(new_size, Image.Resampling.LANCZOS)
             
-            # Random position (avoid edges)
-            max_x = width - tank_img.width - 50
-            max_y = height - tank_img.height - 50
-            if max_x < 50 or max_y < 50:
-                continue
-            
-            x = random.randint(50, max_x)
-            y = random.randint(height // 3, max_y)  # Tanks on ground
-            
-            # Apply transformations
-            # Rotation
+            # Apply transformations BEFORE positioning
+            # Rotation (expand=True changes size, so do this first)
             angle = random.uniform(-30, 30)
             tank_img = tank_img.rotate(angle, expand=True, fillcolor=(0, 0, 0, 0))
             
             # Lighting adjustments
             enhancer = ImageEnhance.Brightness(tank_img)
             tank_img = enhancer.enhance(random.uniform(0.7, 1.3))
+            
+            # Now calculate position with final tank size
+            max_x = width - tank_img.width - 50
+            max_y = height - tank_img.height - 50
+            
+            # Skip if tank is too large for the scene
+            if max_x < 50 or max_y < 50:
+                continue
+            
+            # Ensure valid y range (tanks on ground, but check bounds)
+            min_y = max(50, height // 3)
+            if min_y > max_y:
+                # Tank is too large, skip it
+                continue
+            
+            x = random.randint(50, max_x)
+            y = random.randint(min_y, max_y)
             
             # Paste tank onto background
             bg_pil.paste(tank_img, (x, y), tank_img)
@@ -239,7 +290,7 @@ class BattleSceneGenerator:
                 "class_name": "military_vehicle",
                 "bbox": [tank_center_x, tank_center_y, tank_width, tank_height],
                 "bbox_pixels": [x, y, tank_img.width, tank_img.height],
-                "source_image": str(tank_path.name)
+                "source_image": source_name
             })
         
         # Convert back to OpenCV format
@@ -287,9 +338,14 @@ class BattleSceneGenerator:
         
         self.load_assets()
         
-        if not self.tank_images and not self.background_images:
-            print("\nWARNING: No tank or background images found!")
-            print("Generating demo scenes with synthetic assets only.\n")
+        if not self.tank_images:
+            print("\n" + "!"*60)
+            print("NOTE: No real tank images found!")
+            print("Generating scenes with SYNTHETIC tank shapes.")
+            print("For better results, add real tank images to:")
+            print(f"  {self.tank_images_dir.absolute()}")
+            print("Or run: python scripts/download_tank_images.py")
+            print("!"*60 + "\n")
         
         metadata = []
         

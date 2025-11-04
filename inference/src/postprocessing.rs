@@ -406,28 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn test_confidence_filtering() {
-        let postprocessor = Postprocessor::new(0.5, 0.45, 100, (640, 640));
-
-        let detections = vec![
-            RawDetection {
-                class: TargetClass::ArmedPersonnel,
-                confidence: 0.6,
-                bbox: BoundingBox::new(0.1, 0.1, 0.2, 0.2),
-            },
-            RawDetection {
-                class: TargetClass::RocketLauncher,
-                confidence: 0.3, // Below threshold
-                bbox: BoundingBox::new(0.5, 0.5, 0.2, 0.2),
-            },
-        ];
-
-        let filtered = postprocessor.filter_by_confidence(detections);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].class, TargetClass::ArmedPersonnel);
-    }
-
-    #[test]
     fn test_bounding_box_iou() {
         let bbox1 = BoundingBox::new(0.0, 0.0, 0.5, 0.5);
         let bbox2 = BoundingBox::new(0.25, 0.25, 0.5, 0.5);

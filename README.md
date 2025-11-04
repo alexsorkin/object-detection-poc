@@ -1,164 +1,171 @@
 # Military Target Detection Model
 
-A real-time computer vision system for detecting military targets in live video streams, optimized for deployment across various hardware platforms including VR headsets and Unity applications.
+High-performance computer vision system for detecting military targets using YOLOv8 and Rust inference.
 
-## 🎯 Quick Start - Tank Detection
+## 🚀 Quick Start
 
-Train a tank detection model in minutes:
-
+### 1. Setup Environment
 ```bash
-# Quick test run (5-10 minutes on Mac M1/M2)
-./quickstart.sh
-
-# Or run complete workflow
-python workflow.py --all --epochs 50
-
-# Test live video detection
-python tests/test_tank_detection.py --mode video
+cd scripts
+./setup.sh
+source ../venv/bin/activate
 ```
 
-See **[TANK_DETECTION_WORKFLOW.md](TANK_DETECTION_WORKFLOW.md)** for complete documentation.
+### 2. Export Models
+```bash
+# Export mini model (fast, 43MB, ~180ms)
+python export_mini.py
 
-## Target Classes
-- **Person with Rifle** (armed personnel)
-- **Person with Launcher** (RPG, anti-tank weapons)
-- **Military Vehicle** (Russian tanks: T-62, T-64, T-72, T-80, T-90 series)
+# Export full model (accurate, 99MB, ~490ms)
+python export_full.py
+```
+
+### 3. Run Detection (Rust)
+```bash
+cd ../inference
+
+# Fast detection (recommended)
+cargo run --release --features metal --example detect_mini
+
+# Accurate detection
+cargo run --release --features metal --example detect_full
+
+# Benchmark both models
+cargo run --release --features metal --example benchmark_all
+```
+
+## 📦 Models
+
+| Model | Size | Speed | FPS | Use Case |
+|-------|------|-------|-----|----------|
+| **Mini** (YOLOv8s) ⭐ | 43MB | 180ms | 5.6 | Real-time, recommended |
+| **Full** (YOLOv8m) | 99MB | 496ms | 2.0 | Maximum accuracy |
+
+*Benchmarked on AMD Radeon Pro 5500M with CoreML/Metal*
 
 ## Architecture
-- **Model**: YOLOv8 for real-time object detection
-- **Training**: Python with PyTorch/Ultralytics
-- **Inference**: Rust library with ONNX Runtime
-- **Integration**: C# bindings for Unity/VR applications
+
+- **Training**: Python with PyTorch/Ultralytics (YOLOv8)
+- **Inference**: Rust with ONNX Runtime + CoreML/Metal GPU
+- **Integration**: C/C# bindings for Unity applications
+- **Platform**: macOS (Metal), iOS, visionOS (Apple Vision Pro)
 
 ## Project Structure
 ```
-├── training/               # Python training pipeline
-│   └── train.py           # YOLOv8 training with Mac GPU
-├── scripts/               # Data collection and generation
-│   ├── download_tank_images.py     # Tank image collection
-│   └── generate_battle_scenes.py   # Synthetic data generation
-├── tests/                 # Testing suite
-│   └── test_tank_detection.py     # Complete testing pipeline
-├── inference/            # Rust inference library  
-│   ├── src/             # Core library
-│   ├── examples/        # Usage examples
-│   └── bindings/        # Unity C# bindings
-├── models/              # Trained models and ONNX exports
-├── data/                # Training data and annotations
-│   ├── raw_images/tanks/        # Downloaded tank images
-│   ├── backgrounds/             # Battlefield backgrounds
-│   └── synthetic_scenes/        # Generated training data
-├── workflow.py          # Complete workflow orchestration
-├── quickstart.sh        # Quick start script
-└── TANK_DETECTION_WORKFLOW.md   # Detailed documentation
+model/
+├── README.md              # This file
+├── requirements.txt       # Python dependencies
+├── models/                # Deployed ONNX models
+│   ├── military_target_detector_mini.onnx  # 43MB, fast
+│   └── military_target_detector.onnx       # 99MB, accurate
+├── inference/             # 🦀 Rust inference library
+│   ├── src/              # Core detection engine
+│   ├── examples/         # Usage examples
+│   │   ├── detect_mini.rs        # Fast detection
+│   │   ├── detect_full.rs        # Accurate detection
+│   │   └── benchmark_all.rs      # Performance testing
+│   └── Cargo.toml        # Rust dependencies
+├── scripts/               # Utility scripts
+│   ├── export_mini.py    # Export mini model
+│   ├── export_full.py    # Export full model
+│   └── setup.sh          # Environment setup
+├── training/              # Training pipeline
+│   ├── train.py          # YOLOv8 training
+│   └── export.py         # Model export
+├── data/                  # Training datasets
+├── bindings/              # C/Unity bindings
+└── pretrained_models/     # Base YOLO models
 ```
 
-## Requirements
-- Real-time video processing (>30 FPS)
-- Cross-platform compatibility
-- Low memory footprint for mobile/VR devices
-- GPU acceleration support (CUDA, MPS, DirectML)
-- Unity engine integration
+## GPU Acceleration 🚀
 
-## Mac GPU Support 🍎
-✅ **Apple Silicon Macs (M1/M2/M3/M4)** - Full GPU acceleration via Metal Performance Shaders
-- **10.5x faster training** than CPU (tested on Mac M1/M2)
-- **89.5 FPS** training speed
-- 50 epochs in ~15-20 minutes
-- Unified memory architecture
-- See `MAC_GPU_SETUP.md` for detailed setup instructions
-- Test your system: `python test_mac_gpu.py`
+### Apple Silicon (M1/M2/M3/M4) - CoreML/Metal
+- **Automatic GPU selection** - Uses AMD Radeon Pro or integrated GPU
+- **Fast inference** - 180ms (Mini), 496ms (Full)
+- **Build with GPU**: `cargo build --release --features metal`
+- **Platforms supported**: macOS, iOS, visionOS (Apple Vision Pro)
 
-## Performance Metrics
-
-### Training (Mac M1/M2 with MPS)
-- **Speed**: 89.5 FPS
-- **Speedup vs CPU**: 10.5x
-- **50 epochs**: ~15-20 minutes
-- **Model size**: ~6 MB
-
-### Inference
-- **Latency**: 15-30 ms per frame
-- **Real-time FPS**: 30-60 FPS
-- **Memory usage**: <2GB RAM
-- **Expected mAP@0.5**: >0.85
-
-## Complete Workflows
-
-### Tank Detection Workflow
-```bash
-# 1. Generate synthetic training data
-python scripts/generate_battle_scenes.py
-
-# 2. Train model with Mac GPU
-python training/train.py --epochs 50 --device mps
-
-# 3. Test on synthetic scenes
-python tests/test_tank_detection.py --mode dataset
-
-# 4. Test on live video
-python tests/test_tank_detection.py --mode video
-
-# 5. Export to ONNX for Rust integration
-python workflow.py --export
-```
-
-See **[TANK_DETECTION_WORKFLOW.md](TANK_DETECTION_WORKFLOW.md)** for detailed documentation.
+### Performance Metrics
+- **Mini Model**: 180ms avg, 5.6 FPS (recommended)
+- **Full Model**: 496ms avg, 2.0 FPS (accurate)
+- **GPU**: AMD Radeon Pro 5500M (8GB) / Intel UHD 630
+- **API**: ONNX Runtime 2.0.0-rc.10 with CoreML backend
 
 ## Key Features
 
-### 🎨 Synthetic Data Generation
-- Realistic battlefield scenes with tanks
-- 5 background types (field, urban, forest, desert, mountain)
-- Automatic YOLO format annotations
-- Random augmentation (rotation, scaling, lighting)
-
-### 🚀 High-Performance Training
-- YOLOv8 real-time detection
-- Mac GPU acceleration (MPS)
-- Automatic device detection
-- Real-time training metrics
-
-### 🧪 Comprehensive Testing
-- Batch evaluation with metrics
-- Single image testing
-- Live video stream inference
-- Precision, Recall, F1 scores
-
 ### 🦀 Rust Inference Library
-- Cross-platform ONNX Runtime
-- C API for Unity/VR integration
-- C# bindings for Unity
-- Hardware-agnostic design
+- Fast ONNX Runtime integration
+- CoreML/Metal GPU acceleration  
+- Thread-safe detection API
+- C/Unity bindings included
+- Cross-platform support
 
-## Performance Targets
-- Inference: <33ms per frame (30+ FPS)
-- Memory usage: <2GB RAM
-- Model size: <100MB for deployment
+### 📦 Optimized Models
+- Two deployment sizes (Mini/Full)
+- Pre-trained YOLOv8 models
+- ONNX format for portability
+- Efficient memory usage
 
-## Quick Setup & Dependency Management
+### 🎯 Real-time Detection
+- Video processing support (OpenCV)
+- Batch detection capability
+- Configurable confidence thresholds
+- Non-maximum suppression
 
-### Option 1: Automated Setup (Recommended)
-```bash
-# Full setup with latest dependencies
-./setup.sh
+## Examples
 
-# Or upgrade existing installation
-./upgrade_dependencies.sh
+### Rust Detection
+```rust
+use military_target_detector::{DetectorConfig, MilitaryTargetDetector, ImageData};
+
+let config = DetectorConfig {
+    model_path: "../models/military_target_detector_mini.onnx".to_string(),
+    ..Default::default()
+};
+
+let mut detector = MilitaryTargetDetector::new(config)?;
+let image = ImageData::from_file("test.jpg")?;
+let detections = detector.detect(&image)?;
 ```
 
-### Option 2: Manual Setup
+### Command Line
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Fast detection
+cargo run --release --features metal --example detect_mini image.jpg
 
-# Choose appropriate requirements file:
-pip install -r requirements.txt              # Latest versions (recommended)
-pip install -r requirements-conservative.txt # Compatible with older systems
+# Video processing (requires opencv feature)
+cargo run --release --features metal,opencv --example video_stream
+
+# Performance benchmark
+cargo run --release --features metal --example benchmark_all
 ```
 
-### Requirements Files
-- **`requirements.txt`** - Latest stable versions with newest features
-- **`requirements-conservative.txt`** - Conservative versions for compatibility
-- **`requirements-lock.txt`** - Exact versions (generated after setup)
+## Unity Integration
+
+1. **Copy bindings**: `bindings/MilitaryTargetDetector.cs` → Unity project
+2. **Copy library**: Compiled `.dylib`/`.dll` → `Assets/Plugins/`
+3. **Copy model**: ONNX model → `Assets/StreamingAssets/Models/`
+4. **Use in Unity**:
+```csharp
+var detector = new MilitaryTargetDetector(config);
+var detections = detector.Detect(imageBytes, width, height);
+```
+
+## Development
+
+### Build
+```bash
+cd inference
+cargo build --release --features metal
+```
+
+### Test
+```bash
+cargo test --features metal
+cargo run --example detect_mini
+```
+
+### Benchmark
+```bash
+cargo run --release --features metal --example benchmark_all
+```

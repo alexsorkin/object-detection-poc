@@ -1,13 +1,34 @@
 //! Military Target Detection Library
 //!
 //! A high-performance, cross-platform library for real-time military target detection
-//! in video streams. Designed for integration with game engines, VR/AR applications,
-//! and embedded systems.
+//! in video streams. Uses ONNX Runtime with GPU acceleration (CoreML/Metal on macOS).
+//!
+//! ## GPU Acceleration
+//!
+//! This library uses the official ONNX Runtime with:
+//! - **macOS**: CoreML (Metal backend) for GPU acceleration
+//! - **CUDA**: Nvidia GPUs (Linux/Windows)
+//! - **CPU**: Fallback for all platforms
+//!
+//! ### Performance
+//!
+//! - **AMD Radeon Pro 5500M (CoreML)**: ~80-100ms inference
+//! - **CPU fallback**: ~2,500ms inference
+//!
+//! ## Usage
+//!
+//! ```bash
+//! cargo build --release
+//! cargo run --release --example detect
+//! ```
 
-// pub mod detector;  // Temporarily disabled due to ONNX Runtime API compatibility issues
-pub mod detector_stub; // Temporary stub implementation
+// Detector implementation
+pub mod detector_onnx;
+
+// Core modules
 pub mod error;
-pub mod ffi;
+pub mod ffi; // Unity/C# integration
+pub mod image_utils; // Image manipulation utilities
 pub mod postprocessing;
 pub mod preprocessing;
 pub mod types;
@@ -15,7 +36,9 @@ pub mod types;
 #[cfg(feature = "opencv")]
 pub mod video;
 
-pub use detector_stub::MilitaryTargetDetector; // Use stub temporarily
+// Export the detector
+pub use detector_onnx::MilitaryTargetDetector;
+
 pub use error::{DetectionError, Result};
 pub use types::{
     BoundingBox, Detection, DetectionResult, DetectorConfig, ImageData, ImageFormat, ModelInfo,
@@ -23,10 +46,8 @@ pub use types::{
 };
 
 /// Initialize the detection library
-/// This function should be called once before using the detector
 pub fn init() -> Result<()> {
-    // ONNX Runtime initialization is now automatic in newer versions
-    log::info!("Military target detection library initialized");
+    log::info!("Military target detection library initialized (ONNX Runtime)");
     Ok(())
 }
 
@@ -37,10 +58,5 @@ pub fn version() -> &'static str {
 
 /// Get supported target classes
 pub fn get_target_classes() -> Vec<TargetClass> {
-    vec![
-        TargetClass::ArmedPersonnel,
-        TargetClass::RocketLauncher,
-        TargetClass::MilitaryVehicle,
-        TargetClass::HeavyWeapon,
-    ]
+    TargetClass::all()
 }

@@ -2,55 +2,165 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Target classes for military detection
+/// Target classes for detection (supports multiple model types)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u32)]
 pub enum TargetClass {
-    ArmedPersonnel = 0,
-    RocketLauncher = 1,
-    MilitaryVehicle = 2,
-    HeavyWeapon = 3,
+    // Generic class with ID
+    Class(u32),
 }
 
 impl TargetClass {
+    /// COCO class names (80 classes)
+    const COCO_CLASSES: &'static [&'static str] = &[
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus",
+        "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+        "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
+        "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+        "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+        "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+        "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
+        "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+        "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+        "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+        "scissors", "teddy bear", "hair drier", "toothbrush"
+    ];
+
+    /// Objects365 class names (365 classes)
+    const OBJECTS365_CLASSES: &'static [&'static str] = &[
+        "person", "sneakers", "chair", "hat", "lamp", "bottle", "cabinet",
+        "cup", "car", "glasses", "picture", "desk", "handbag", "street lights",
+        "book", "plate", "helmet", "leather shoes", "pillow", "glove", "potted plant",
+        "bracelet", "flower", "tv", "storage box", "vase", "bench", "wine glass",
+        "boots", "bowl", "dining table", "umbrella", "boat", "flag", "speaker",
+        "trash bin", "stool", "backpack", "couch", "belt", "carpet", "basket",
+        "towel", "slippers", "barrel", "coffee table", "suv", "toy", "tie", "bed",
+        "traffic light", "pen", "microphone", "sandals", "canned", "necklace",
+        "mirror", "faucet", "bicycle", "bread", "high heels", "ring", "van",
+        "watch", "sink", "horse", "fish", "apple", "camera", "candle", "teddy bear",
+        "cake", "motorcycle", "wild bird", "laptop", "knife", "traffic sign",
+        "cell phone", "paddle", "truck", "cow", "power outlet", "clock", "drum",
+        "fork", "bus", "hanger", "nightstand", "pot", "sheep", "guitar",
+        "traffic cone", "tea pot", "keyboard", "tripod", "hockey", "fan", "dog",
+        "spoon", "blackboard", "balloon", "air conditioner", "cymbal", "mouse",
+        "telephone", "pickup truck", "orange", "banana", "airplane", "luggage",
+        "skis", "soccer", "trolley", "oven", "remote", "baseball glove", "paper towel",
+        "refrigerator", "train", "tomato", "machinery vehicle", "tent", "shampoo",
+        "head phone", "lantern", "donut", "cleaning products", "sailboat", "tangerine",
+        "pizza", "kite", "computer box", "elephant", "toiletries", "gas stove",
+        "broccoli", "toilet", "stroller", "shovel", "baseball bat", "microwave",
+        "skateboard", "surfboard", "surveillance camera", "gun", "life saver", "cat",
+        "lemon", "liquid soap", "zebra", "duck", "sports car", "giraffe", "pumpkin",
+        "piano", "stop sign", "radiator", "converter", "tissue", "carrot",
+        "washing machine", "vent", "cookies", "cutting board", "tennis racket",
+        "candy", "skating shoes", "scissors", "folder", "baseball", "strawberry",
+        "bow tie", "pigeon", "pepper", "coffee machine", "bathtub", "snowboard",
+        "suitcase", "grapes", "ladder", "pear", "american football", "basketball",
+        "potato", "paint brush", "printer", "billiards", "fire hydrant", "goose",
+        "projector", "sausage", "fire extinguisher", "extension cord", "facial mask",
+        "tennis ball", "chopsticks", "electronic stove", "pie", "frisbee", "kettle",
+        "hamburger", "golf club", "cucumber", "clutch", "blender", "tong", "slide",
+        "hot dog", "toothbrush", "facial cleanser", "mango", "deer", "egg",
+        "violin", "marker", "ship", "chicken", "onion", "ice cream", "tape",
+        "wheelchair", "plum", "bar soap", "scale", "watermelon", "cabbage", "router",
+        "golf ball", "pine apple", "crane", "fire truck", "peach", "cello",
+        "notepaper", "tricycle", "toaster", "helicopter", "green beans", "brush",
+        "carriage", "cigar", "earphone", "penguin", "hurdle", "swing", "radio",
+        "cd", "parking meter", "swan", "garlic", "french fries", "horn", "avocado",
+        "saxophone", "trumpet", "sandwich", "cue", "kiwi fruit", "bear", "fishing rod",
+        "cherry", "tablet", "green vegetables", "nuts", "corn", "key", "screwdriver",
+        "globe", "broom", "pliers", "volleyball", "hammer", "eggplant", "trophy",
+        "dates", "board eraser", "rice", "tape measure", "dumbbell", "hamimelon",
+        "stapler", "camel", "lettuce", "goldfish", "meat balls", "medal",
+        "toothpaste", "antelope", "shrimp", "rickshaw", "trombone", "pomegranate",
+        "coconut", "jellyfish", "mushroom", "calculator", "treadmill", "butterfly",
+        "egg tart", "cheese", "pig", "pomelo", "race car", "rice cooker", "tuba",
+        "crosswalk sign", "papaya", "hair drier", "green onion", "chips", "dolphin",
+        "sushi", "urinal", "donkey", "electric drill", "spring rolls", "tortoise",
+        "parrot", "flute", "measuring cup", "shark", "steak", "poker card",
+        "binoculars", "llama", "radish", "noodles", "yak", "mop", "crab",
+        "microscope", "barbell", "bread", "baozi", "lion", "red cabbage",
+        "polar bear", "lighter", "seal", "mangosteen", "comb", "eraser", "pitaya",
+        "scallop", "pencil case", "saw", "table tennis paddle", "okra", "starfish",
+        "eagle", "monkey", "durian", "game board", "rabbit", "french horn",
+        "ambulance", "asparagus", "hoverboard", "pasta", "target", "hotair balloon",
+        "chainsaw", "lobster", "iron", "flashlight"
+    ];
+
     /// Get class name as string
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Self::ArmedPersonnel => "armed_personnel",
-            Self::RocketLauncher => "rocket_launcher",
-            Self::MilitaryVehicle => "military_vehicle",
-            Self::HeavyWeapon => "heavy_weapon",
+            Self::Class(id) => {
+                let id = *id as usize;
+                
+                // Try COCO classes first (most common)
+                if id < Self::COCO_CLASSES.len() {
+                    return Self::COCO_CLASSES[id].to_string();
+                }
+                
+                // Try Objects365 classes
+                if id < Self::OBJECTS365_CLASSES.len() {
+                    return Self::OBJECTS365_CLASSES[id].to_string();
+                }
+                
+                // Fallback to class_N
+                format!("class_{}", id)
+            }
         }
     }
 
-    /// Get class color for visualization (RGB)
+    /// Get class color for visualization (RGB) - deterministic color based on class ID
     pub fn color(&self) -> [u8; 3] {
         match self {
-            Self::ArmedPersonnel => [255, 0, 0],  // Red
-            Self::RocketLauncher => [0, 255, 0],  // Green
-            Self::MilitaryVehicle => [0, 0, 255], // Blue
-            Self::HeavyWeapon => [255, 255, 0],   // Yellow
+            Self::Class(id) => {
+                // Generate consistent colors based on class ID
+                let hue = (id * 137) % 360; // Golden angle for better color distribution
+                let saturation = 0.7;
+                let value = 0.9;
+                
+                // Simple HSV to RGB conversion
+                let c = value * saturation;
+                let x = c * (1.0 - ((hue as f32 / 60.0) % 2.0 - 1.0).abs());
+                let m = value - c;
+                
+                let (r, g, b) = match hue / 60 {
+                    0 => (c, x, 0.0),
+                    1 => (x, c, 0.0),
+                    2 => (0.0, c, x),
+                    3 => (0.0, x, c),
+                    4 => (x, 0.0, c),
+                    _ => (c, 0.0, x),
+                };
+                
+                [
+                    ((r + m) * 255.0) as u8,
+                    ((g + m) * 255.0) as u8,
+                    ((b + m) * 255.0) as u8,
+                ]
+            }
         }
     }
 
-    /// Create from class ID
+    /// Create from class ID (always succeeds)
     pub fn from_id(id: u32) -> Option<Self> {
-        match id {
-            0 => Some(Self::ArmedPersonnel),
-            1 => Some(Self::RocketLauncher),
-            2 => Some(Self::MilitaryVehicle),
-            3 => Some(Self::HeavyWeapon),
-            _ => None,
+        Some(Self::Class(id))
+    }
+
+    /// Get the numeric class ID
+    pub fn id(&self) -> u32 {
+        match self {
+            Self::Class(id) => *id,
         }
     }
 
-    /// Get all target classes
+    /// Get all military target classes (for backwards compatibility)
     pub fn all() -> Vec<Self> {
         vec![
-            Self::ArmedPersonnel,
-            Self::RocketLauncher,
-            Self::MilitaryVehicle,
-            Self::HeavyWeapon,
+            Self::Class(0),  // ArmedPersonnel
+            Self::Class(1),  // RocketLauncher
+            Self::Class(2),  // MilitaryVehicle
+            Self::Class(3),  // HeavyWeapon
         ]
     }
 }
@@ -334,6 +444,46 @@ impl ImageData {
             height,
             format,
         }
+    }
+
+    /// Load image from file path
+    pub fn from_file(path: &str) -> crate::Result<Self> {
+        use image::GenericImageView;
+
+        let img = image::open(path).map_err(|e| {
+            crate::DetectionError::preprocessing(format!("Failed to load image: {}", e))
+        })?;
+
+        let (width, height) = img.dimensions();
+        let img_rgb = img.to_rgb8();
+        let data = img_rgb.into_raw();
+
+        Ok(Self {
+            data,
+            width,
+            height,
+            format: ImageFormat::RGB,
+        })
+    }
+
+    /// Load image from bytes
+    pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
+        use image::GenericImageView;
+
+        let img = image::load_from_memory(bytes).map_err(|e| {
+            crate::DetectionError::preprocessing(format!("Failed to decode image: {}", e))
+        })?;
+
+        let (width, height) = img.dimensions();
+        let img_rgb = img.to_rgb8();
+        let data = img_rgb.into_raw();
+
+        Ok(Self {
+            data,
+            width,
+            height,
+            format: ImageFormat::RGB,
+        })
     }
 
     /// Get number of channels

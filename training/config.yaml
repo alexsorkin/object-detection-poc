@@ -1,19 +1,7 @@
 # Military Target Detection Configuration
 
 # Dataset configuration
-data:
-  path: "../data"
-  train: "images/train"
-  val: "images/val" 
-  test: "images/test"
-
-# Class definitions for military targets
-nc: 4  # number of classes
-names:
-  0: "armed_personnel"    # Soldiers with rifles/weapons
-  1: "rocket_launcher"    # RPGs, anti-tank weapons
-  2: "military_vehicle"   # Tanks, armored vehicles, military trucks
-  3: "heavy_weapon"       # Mounted guns, artillery pieces
+data: "data.yaml"  # Path to dataset YAML file
 
 # Model configuration
 model: "yolov8n.pt"  # Start with nano model for speed, can upgrade to yolov8s/m/l/x

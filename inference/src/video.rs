@@ -11,8 +11,8 @@ use opencv::{
 };
 
 use crate::error::{DetectionError, Result};
-use crate::types::{ImageData, ImageFormat, DetectionResult};
-use crate::detector::MilitaryTargetDetector;
+use crate::types::{ImageData, ImageFormat, DetectionResult, DetectorConfig};
+use crate::MilitaryTargetDetector;
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -21,22 +21,19 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "opencv")]
 /// Real-time video processor for military target detection
 pub struct VideoProcessor {
-    detector: Arc<MilitaryTargetDetector>,
+    detector: Arc<Mutex<MilitaryTargetDetector>>,
     input_size: (u32, u32),
     target_fps: f64,
-    enable_gpu: bool,
 }
 
 #[cfg(feature = "opencv")]
 impl VideoProcessor {
     /// Create new video processor
-    pub fn new(detector: Arc<MilitaryTargetDetector>, target_fps: f64) -> Self {
-        let config = detector.config();
+    pub fn new(detector: MilitaryTargetDetector, target_fps: f64, input_size: (u32, u32)) -> Self {
         Self {
-            detector,
-            input_size: config.input_size,
+            detector: Arc::new(Mutex::new(detector)),
+            input_size,
             target_fps,
-            enable_gpu: config.use_gpu,
         }
     }
 
@@ -83,18 +80,40 @@ impl VideoProcessor {
     }
 }
 
+    /// Process video from file
+    pub fn process_file(&self, file_path: &str) -> Result<VideoStream> {
+        let cap = VideoCapture::from_file(file_path, CAP_ANY)
+            .map_err(|e| DetectionError::other(format!("Failed to open video file: {}", e)))?;
+
+        if !cap.is_opened()
+            .map_err(|e| DetectionError::other(format!("Video file check failed: {}", e)))? 
+        {
+            return Err(DetectionError::other("Video file is not opened".to_string()));
+        }
+
+        log::info!("Video file opened: {}", file_path);
+
+        Ok(VideoStream::new(cap, self.detector.clone(), self.target_fps))
+    }
+
+    /// Create batch processor for multiple video streams
+    pub fn create_batch_processor(&self, max_concurrent: usize) -> BatchVideoProcessor {
+        BatchVideoProcessor::new(self.detector.clone(), max_concurrent, self.target_fps)
+    }
+}
+
 #[cfg(feature = "opencv")]
 /// Video stream processor
 pub struct VideoStream {
     cap: VideoCapture,
-    detector: Arc<MilitaryTargetDetector>,
+    detector: Arc<Mutex<MilitaryTargetDetector>>,
     target_fps: f64,
     frame_interval: Duration,
 }
 
 #[cfg(feature = "opencv")]
 impl VideoStream {
-    fn new(cap: VideoCapture, detector: Arc<MilitaryTargetDetector>, target_fps: f64) -> Self {
+    fn new(cap: VideoCapture, detector: Arc<Mutex<MilitaryTargetDetector>>, target_fps: f64) -> Self {
         let frame_interval = Duration::from_secs_f64(1.0 / target_fps);
         
         Self {
@@ -134,9 +153,12 @@ impl VideoStream {
             // Convert frame to detection format
             let image_data = self.mat_to_image_data(&frame)?;
             
-            // Run detection
+            // Run detection (need to lock mutex)
             let detection_start = Instant::now();
-            let result = self.detector.detect(&image_data)?;
+            let result = {
+                let mut detector = self.detector.lock().unwrap();
+                detector.detect(&image_data)?
+            };
             let detection_time = detection_start.elapsed();
 
             stats.total_detections += result.count();
@@ -198,14 +220,14 @@ impl VideoStream {
 #[cfg(feature = "opencv")]
 /// Batch video processor for multiple concurrent streams
 pub struct BatchVideoProcessor {
-    detector: Arc<MilitaryTargetDetector>,
+    detector: Arc<Mutex<MilitaryTargetDetector>>,
     max_concurrent: usize,
     target_fps: f64,
 }
 
 #[cfg(feature = "opencv")]
 impl BatchVideoProcessor {
-    fn new(detector: Arc<MilitaryTargetDetector>, max_concurrent: usize, target_fps: f64) -> Self {
+    fn new(detector: Arc<Mutex<MilitaryTargetDetector>>, max_concurrent: usize, target_fps: f64) -> Self {
         Self {
             detector,
             max_concurrent,
@@ -255,16 +277,18 @@ impl BatchVideoProcessor {
 #[cfg(feature = "opencv")]
 fn process_single_source(
     source: VideoSource,
-    detector: Arc<MilitaryTargetDetector>,
+    detector: Arc<Mutex<MilitaryTargetDetector>>,
     target_fps: f64,
 ) -> Result<(VideoStats, Vec<DetectionResult>)> {
-    let processor = VideoProcessor::new(detector, target_fps);
-    
-    let mut stream = match source {
-        VideoSource::Camera(id) => processor.process_camera(id)?,
-        VideoSource::File(path) => processor.process_file(&path)?,
+    // Create a temporary VideoStream directly
+    let cap = match &source {
+        VideoSource::Camera(id) => VideoCapture::new(*id, CAP_ANY)
+            .map_err(|e| DetectionError::other(format!("Failed to open camera: {}", e)))?,
+        VideoSource::File(path) => VideoCapture::from_file(path, CAP_ANY)
+            .map_err(|e| DetectionError::other(format!("Failed to open video file: {}", e)))?,
     };
-
+    
+    let mut stream = VideoStream::new(cap, detector, target_fps);
     stream.process_all()
 }
 
