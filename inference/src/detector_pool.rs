@@ -1,6 +1,7 @@
 /// Thread-safe detector pool with worker threads submitting to batch executor
 /// Workers receive commands and forward them to the batch executor for efficient parallel processing
 use crate::batch_executor::{BatchCommand, BatchConfig, BatchExecutor};
+use crate::detector_trait::DetectorType;
 use crate::types::{Detection, DetectorConfig, ImageData};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -22,12 +23,14 @@ pub struct DetectorPool {
     executor: Option<BatchExecutor>,
     command_tx: Sender<DetectorCommand>,
     batch_tx: Sender<BatchCommand>,
+    detector_type: DetectorType,
 }
 
 impl DetectorPool {
     /// Create a new detector pool with worker threads and batch executor
     pub fn new(
         num_workers: usize,
+        detector_type: DetectorType,
         detector_config: DetectorConfig,
         batch_config: BatchConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -36,18 +39,14 @@ impl DetectorPool {
         let (batch_tx, batch_rx) = std::sync::mpsc::channel::<BatchCommand>();
 
         // Create batch executor (single thread, processes batches)
-        let executor = BatchExecutor::new(batch_rx, detector_config, batch_config)?;
+        let executor = BatchExecutor::new(batch_rx, detector_type, detector_config, batch_config)?;
 
         // Create worker threads (forward commands to batch executor)
         let command_rx = std::sync::Arc::new(std::sync::Mutex::new(command_rx));
         let mut workers = Vec::with_capacity(num_workers);
 
         for id in 0..num_workers {
-            let worker = Worker::new(
-                id,
-                std::sync::Arc::clone(&command_rx),
-                batch_tx.clone(),
-            )?;
+            let worker = Worker::new(id, std::sync::Arc::clone(&command_rx), batch_tx.clone())?;
             workers.push(worker);
         }
 
@@ -56,14 +55,20 @@ impl DetectorPool {
             executor: Some(executor),
             command_tx,
             batch_tx,
+            detector_type,
         })
     }
 
+    /// Get the input size expected by the detector (width, height)
+    pub fn input_size(&self) -> (u32, u32) {
+        match self.detector_type {
+            DetectorType::YOLOV8 => (640, 640),
+            DetectorType::RTDETR => (640, 640),  // RT-DETR now uses 640×640 (same as YOLO)
+        }
+    }
+
     /// Submit an image for detection (non-blocking)
-    pub fn detect_async(
-        &self,
-        image: ImageData,
-    ) -> Receiver<Result<Vec<Detection>, String>> {
+    pub fn detect_async(&self, image: ImageData) -> Receiver<Result<Vec<Detection>, String>> {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
 
         self.command_tx

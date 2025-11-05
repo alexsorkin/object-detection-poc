@@ -1,62 +1,232 @@
-//! GPU-accelerated military target detector using ONNX Runtime
+//! GPU-accelerated YOLOv8 detector using ONNX Runtime
 //!
 //! This implementation uses the official ONNX Runtime with CoreML/Metal backend
 //! for GPU acceleration on macOS. Provides high-performance inference.
 
 use crate::error::DetectionError;
 use crate::types::{BoundingBox, Detection, DetectorConfig, ImageData, TargetClass};
-#[cfg(feature = "metal")]
-use log::warn;
-use log::{debug, info};
+use log::{debug, info, warn};
 use ndarray::{Array, ArrayView, IxDyn};
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::TensorRef,
 };
 
-/// GPU-accelerated military target detector
-pub struct MilitaryTargetDetector {
+/// GPU-accelerated YOLOv8 detector
+pub struct YoloV8Detector {
     session: Session,
     config: DetectorConfig,
 }
 
-impl MilitaryTargetDetector {
-    /// Create a new detector with GPU acceleration
+impl YoloV8Detector {
+    /// Create a new detector with automatic FP16/FP32 model selection
+    ///
+    /// Selection logic:
+    /// 1. If use_gpu=true and CoreML available: Use FP16 model with GPU
+    /// 2. If use_gpu=true but CoreML fails: Fallback to FP32 model with CPU
+    /// 3. If use_gpu=false: Use FP32 model with CPU
     pub fn new(config: DetectorConfig) -> Result<Self, DetectionError> {
         info!("Initializing ONNX Runtime detector");
-        info!("Model: {}", config.model_path);
 
-        // Configure session with GPU support (v2.0 API)
-        let builder = Session::builder()
-            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?;
+        // Determine which model to use
+        let (model_path, use_gpu_backend) = Self::select_model(&config)?;
+        info!("Selected model: {}", model_path);
 
-        // Try to use CoreML (Metal backend) on Apple platforms when metal feature is enabled
-        #[cfg(feature = "metal")]
-        let builder = {
-            use ort::execution_providers::CoreMLExecutionProvider;
-            info!("Attempting to use CoreML (Metal) backend...");
+        // Try GPU path first if requested
+        if config.use_gpu && use_gpu_backend {
+            // Try CUDA first (NVIDIA GPUs)
+            #[cfg(feature = "cuda")]
+            {
+                match Self::try_create_cuda_session(&model_path, &config) {
+                    Ok(session) => {
+                        info!("✓ Model loaded successfully with CUDA (NVIDIA GPU)");
+                        return Ok(Self { session, config });
+                    }
+                    Err(e) => {
+                        warn!("CUDA initialization failed: {}", e);
+                        warn!("Trying TensorRT fallback...");
+                    }
+                }
+            }
 
-            builder
-                .with_execution_providers([CoreMLExecutionProvider::default().build()])
-                .unwrap_or_else(|e| {
-                    warn!("CoreML not available: {}, using CPU", e);
-                    Session::builder()
-                        .expect("Failed to create fallback session builder")
-                        .with_optimization_level(GraphOptimizationLevel::Level3)
-                        .expect("Failed to set optimization level")
-                })
-        };
+            // Try TensorRT (NVIDIA GPUs - optimized)
+            #[cfg(feature = "tensorrt")]
+            {
+                match Self::try_create_tensorrt_session(&model_path, &config) {
+                    Ok(session) => {
+                        info!("✓ Model loaded successfully with TensorRT (NVIDIA GPU)");
+                        return Ok(Self { session, config });
+                    }
+                    Err(e) => {
+                        warn!("TensorRT initialization failed: {}", e);
+                    }
+                }
+            }
 
-        // Load the model
-        let session = builder
-            .commit_from_file(&config.model_path)
-            .map_err(|e| DetectionError::ModelLoadError(format!("Failed to load model: {}", e)))?;
+            // Try CoreML (Apple Metal GPUs)
+            #[cfg(feature = "metal")]
+            {
+                match Self::try_create_gpu_session(&model_path, &config) {
+                    Ok(session) => {
+                        info!("✓ Model loaded successfully with CoreML (GPU/Metal)");
+                        return Ok(Self { session, config });
+                    }
+                    Err(e) => {
+                        warn!("CoreML initialization failed: {}", e);
+                        warn!("Falling back to CPU with FP32 model...");
+                    }
+                }
+            }
 
-        info!("✓ Model loaded successfully");
+            #[cfg(not(any(feature = "metal", feature = "cuda", feature = "tensorrt")))]
+            {
+                warn!("No GPU backend feature enabled (metal/cuda/tensorrt), falling back to CPU");
+            }
+        }
+
+        // CPU fallback path
+        let fallback_model = Self::get_fallback_model(&config)?;
+        info!("Using CPU fallback model: {}", fallback_model);
+
+        let session = Self::create_cpu_session(&fallback_model)?;
+        info!("✓ Model loaded successfully with CPU");
 
         Ok(Self { session, config })
+    }
+
+    /// Select appropriate model based on config
+    fn select_model(config: &DetectorConfig) -> Result<(String, bool), DetectionError> {
+        // If new fields are set, use them
+        if let Some(ref fp16_path) = config.fp16_model_path {
+            if config.use_gpu {
+                return Ok((fp16_path.clone(), true));
+            }
+        }
+
+        if let Some(ref fp32_path) = config.fp32_model_path {
+            if !config.use_gpu {
+                return Ok((fp32_path.clone(), false));
+            }
+        }
+
+        // Fallback to old model_path for backward compatibility
+        #[allow(deprecated)]
+        if !config.model_path.is_empty() {
+            return Ok((config.model_path.clone(), config.use_gpu));
+        }
+
+        Err(DetectionError::ModelLoadError(
+            "No model path specified. Set fp16_model_path/fp32_model_path or model_path"
+                .to_string(),
+        ))
+    }
+
+    /// Get fallback model path (FP32 for CPU)
+    fn get_fallback_model(config: &DetectorConfig) -> Result<String, DetectionError> {
+        if let Some(ref fp32_path) = config.fp32_model_path {
+            return Ok(fp32_path.clone());
+        }
+
+        #[allow(deprecated)]
+        if !config.model_path.is_empty() {
+            return Ok(config.model_path.clone());
+        }
+
+        Err(DetectionError::ModelLoadError(
+            "No fallback model path (fp32_model_path) specified".to_string(),
+        ))
+    }
+
+    /// Try to create a GPU-accelerated session with CUDA (NVIDIA)
+    #[cfg(feature = "cuda")]
+    fn try_create_cuda_session(
+        model_path: &str,
+        config: &DetectorConfig,
+    ) -> Result<Session, DetectionError> {
+        use ort::execution_providers::CUDAExecutionProvider;
+
+        info!("Attempting to use CUDA backend (NVIDIA GPU)...");
+
+        let session = Session::builder()
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_execution_providers([CUDAExecutionProvider::default()
+                .with_device_id(config.gpu_device_id)
+                .build()])
+            .map_err(|e| DetectionError::ModelLoadError(format!("CUDA provider failed: {}", e)))?
+            .commit_from_file(model_path)
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("Failed to load model with CUDA: {}", e))
+            })?;
+
+        Ok(session)
+    }
+
+    /// Try to create a GPU-accelerated session with TensorRT (NVIDIA - optimized)
+    #[cfg(feature = "tensorrt")]
+    fn try_create_tensorrt_session(
+        model_path: &str,
+        config: &DetectorConfig,
+    ) -> Result<Session, DetectionError> {
+        use ort::execution_providers::TensorRTExecutionProvider;
+
+        info!("Attempting to use TensorRT backend (NVIDIA GPU - optimized)...");
+
+        let session = Session::builder()
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_execution_providers([TensorRTExecutionProvider::default()
+                .with_device_id(config.gpu_device_id)
+                // TensorRT will automatically use FP16 if the model is FP16
+                .with_fp16(true) // Enable FP16 optimization
+                .build()])
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("TensorRT provider failed: {}", e))
+            })?
+            .commit_from_file(model_path)
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("Failed to load model with TensorRT: {}", e))
+            })?;
+
+        Ok(session)
+    }
+
+    /// Try to create a GPU-accelerated session with CoreML
+    #[cfg(feature = "metal")]
+    fn try_create_gpu_session(
+        model_path: &str,
+        _config: &DetectorConfig,
+    ) -> Result<Session, DetectionError> {
+        use ort::execution_providers::CoreMLExecutionProvider;
+
+        info!("Attempting to use CoreML (Metal) backend...");
+
+        let session = Session::builder()
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_execution_providers([CoreMLExecutionProvider::default().build()])
+            .map_err(|e| DetectionError::ModelLoadError(format!("CoreML provider failed: {}", e)))?
+            .commit_from_file(model_path)
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("Failed to load FP16 model: {}", e))
+            })?;
+
+        Ok(session)
+    }
+
+    /// Create a CPU-only session
+    fn create_cpu_session(model_path: &str) -> Result<Session, DetectionError> {
+        let session = Session::builder()
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .commit_from_file(model_path)
+            .map_err(|e| DetectionError::ModelLoadError(format!("Failed to load model: {}", e)))?;
+
+        Ok(session)
     }
 
     /// Detect targets in an image

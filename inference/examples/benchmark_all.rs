@@ -1,19 +1,25 @@
-/// Performance benchmark for military target detection with ONNX Runtime + GPU
+/// Performance benchmark for YOLOv8 detection with ONNX Runtime + GPU
 ///
 /// Usage:
 ///   cargo run --release --features metal --example benchmark_new
-
 use military_target_detector::types::{DetectorConfig, ImageData};
-use military_target_detector::MilitaryTargetDetector;
+use military_target_detector::YoloV8Detector;
 use std::time::Instant;
 
-fn benchmark_model(name: &str, model_path: &str, image: &ImageData) -> Result<(), Box<dyn std::error::Error>> {
+fn benchmark_model(
+    name: &str,
+    model_path: &str,
+    image: &ImageData,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("═══════════════════════════════════════════════════════");
     println!("Testing: {}", name);
     println!("═══════════════════════════════════════════════════════\n");
 
     let config = DetectorConfig {
+        #[allow(deprecated)]
         model_path: model_path.to_string(),
+        fp16_model_path: Some(model_path.to_string()),
+        fp32_model_path: Some(model_path.to_string()),
         confidence_threshold: 0.25,
         nms_threshold: 0.45,
         input_size: (640, 640),
@@ -24,7 +30,7 @@ fn benchmark_model(name: &str, model_path: &str, image: &ImageData) -> Result<()
     // Load model
     print!("📦 Loading model... ");
     let start = Instant::now();
-    let mut detector = MilitaryTargetDetector::new(config)?;
+    let mut detector = YoloV8Detector::new(config)?;
     println!("✓ ({:.2}s)", start.elapsed().as_secs_f32());
 
     // Warmup runs (CoreML/Metal needs compilation time)
@@ -34,7 +40,8 @@ fn benchmark_model(name: &str, model_path: &str, image: &ImageData) -> Result<()
         let _ = detector.detect(image)?;
     }
     let warmup_time = warmup_start.elapsed();
-    println!("✓ ({:.2}s total, {:.0}ms avg)", 
+    println!(
+        "✓ ({:.2}s total, {:.0}ms avg)",
         warmup_time.as_secs_f32(),
         warmup_time.as_millis() as f32 / 10.0
     );
@@ -75,26 +82,27 @@ fn main() {
     println!("═══════════════════════════════════════════════════════\n");
 
     // Load test image once
-    let image = ImageData::from_file("test_data/test_tank.jpg")
-        .expect("Failed to load test image");
-    
+    let image = ImageData::from_file("test_data/test_tank.jpg").expect("Failed to load test image");
+
     println!("✓ Test image loaded: {}x{}\n", image.width, image.height);
 
     // Test both models
     benchmark_model(
         "YOLOv8s (Mini - Fast) ⭐",
         "../models/military_target_detector_mini.onnx",
-        &image
-    ).expect("Benchmark failed");
-    
+        &image,
+    )
+    .expect("Benchmark failed");
+
     println!("\n");
-    
+
     benchmark_model(
         "YOLOv8m (Full - Accurate)",
         "../models/military_target_detector.onnx",
-        &image
-    ).expect("Benchmark failed");
-    
+        &image,
+    )
+    .expect("Benchmark failed");
+
     println!("\n✅ Benchmark complete!");
     println!("\n💡 Recommendation: Use Mini model for real-time performance!");
 }

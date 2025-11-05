@@ -1,6 +1,6 @@
 /// Batch executor that collects detection commands and executes them in batches
 /// based on configurable batch size and timeout thresholds.
-use crate::detector_onnx::MilitaryTargetDetector;
+use crate::detector_trait::{Detector, DetectorType};
 use crate::types::{Detection, DetectorConfig, ImageData};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -50,11 +50,12 @@ impl BatchExecutor {
     /// Create a new batch executor
     pub fn new(
         command_rx: Receiver<BatchCommand>,
+        detector_type: DetectorType,
         detector_config: DetectorConfig,
         batch_config: BatchConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create detector instance
-        let mut detector = MilitaryTargetDetector::new(detector_config)?;
+        // Create detector instance based on type
+        let mut detector = detector_type.create(detector_config)?;
 
         let thread = thread::spawn(move || {
             let mut batch: Vec<BatchItem> = Vec::with_capacity(batch_config.batch_size);
@@ -131,10 +132,13 @@ impl BatchExecutor {
     }
 
     /// Execute a batch of detections using true batch inference (if batch_size=1) or sequential
-    fn execute_batch(detector: &mut MilitaryTargetDetector, batch: &mut Vec<BatchItem>) {
+    fn execute_batch(detector: &mut Box<dyn Detector>, batch: &mut Vec<BatchItem>) {
         if batch.is_empty() {
             return;
         }
+
+        let batch_start = Instant::now();
+        let batch_size = batch.len();
 
         // Check if we can do true batch inference
         if batch.len() == 1 {
@@ -144,6 +148,12 @@ impl BatchExecutor {
                 .detect(&item.image)
                 .map_err(|e| format!("Detection error: {}", e));
             let _ = item.response_tx.send(result);
+            let duration = batch_start.elapsed();
+            log::info!("🔥 GPU Batch Execution: {} image in {:.1}ms ({:.1} FPS)", 
+                batch_size, 
+                duration.as_secs_f32() * 1000.0,
+                1000.0 / (duration.as_secs_f32() * 1000.0)
+            );
             return;
         }
 
@@ -154,6 +164,13 @@ impl BatchExecutor {
 
         match results {
             Ok(all_detections) => {
+                let duration = batch_start.elapsed();
+                log::info!("🔥 GPU Batch Execution: {} images in {:.1}ms ({:.1} FPS per image)", 
+                    batch_size,
+                    duration.as_secs_f32() * 1000.0,
+                    1000.0 / (duration.as_secs_f32() * 1000.0 / batch_size as f32)
+                );
+                
                 // Send individual results back to each requester
                 for (item, detections) in batch.drain(..).zip(all_detections.into_iter()) {
                     let _ = item.response_tx.send(Ok(detections));
@@ -165,6 +182,8 @@ impl BatchExecutor {
                 if e.to_string().contains("Got invalid dimensions")
                     || e.to_string().contains("Expected: 1")
                 {
+                    log::warn!("⚠️  Batch inference not supported, falling back to sequential processing");
+                    let sequential_start = Instant::now();
                     // Model requires batch_size=1, process sequentially
                     for item in batch.drain(..) {
                         let result = detector
@@ -172,6 +191,12 @@ impl BatchExecutor {
                             .map_err(|e| format!("Detection error: {}", e));
                         let _ = item.response_tx.send(result);
                     }
+                    let duration = sequential_start.elapsed();
+                    log::info!("🔥 Sequential Execution: {} images in {:.1}ms ({:.1} FPS per image)", 
+                        batch_size,
+                        duration.as_secs_f32() * 1000.0,
+                        1000.0 / (duration.as_secs_f32() * 1000.0 / batch_size as f32)
+                    );
                 } else {
                     // Other error, send to all requesters
                     let error_msg = format!("Batch detection error: {}", e);

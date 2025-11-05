@@ -3,8 +3,8 @@
 //! This module provides C-compatible functions that can be called from Unity C# scripts
 //! or other languages that support C interop.
 
-use crate::MilitaryTargetDetector;
 use crate::types::{DetectorConfig, ImageData, ImageFormat, TargetClass};
+use crate::YoloV8Detector;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -14,7 +14,7 @@ use std::slice;
 use std::sync::Mutex;
 
 // Global detector instance storage - each detector needs Mutex for mutable access
-static mut DETECTORS: Option<Mutex<HashMap<u32, Mutex<MilitaryTargetDetector>>>> = None;
+static mut DETECTORS: Option<Mutex<HashMap<u32, Mutex<YoloV8Detector>>>> = None;
 static mut NEXT_DETECTOR_ID: u32 = 1;
 
 /// Initialize the detection library
@@ -70,8 +70,13 @@ pub extern "C" fn mtd_create_detector(
         }
     };
 
+    // For FFI backward compatibility, use the same model path for both variants
+    // The detector will use whichever one exists based on use_gpu setting
     let config = DetectorConfig {
-        model_path: model_path_str,
+        #[allow(deprecated)]
+        model_path: model_path_str.clone(),
+        fp16_model_path: Some(model_path_str.clone()),
+        fp32_model_path: Some(model_path_str),
         input_size: (input_width as u32, input_height as u32),
         confidence_threshold,
         nms_threshold,
@@ -83,7 +88,7 @@ pub extern "C" fn mtd_create_detector(
     };
 
     // Create detector with new API (no device parameter)
-    match MilitaryTargetDetector::new(config) {
+    match YoloV8Detector::new(config) {
         Ok(detector) => {
             let detector_id = unsafe {
                 let id = NEXT_DETECTOR_ID;

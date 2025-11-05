@@ -1,18 +1,25 @@
-/// Detection Pipeline Example
+/// Detection Pipeline Example - Unified for YOLOv8 and RT-DETR
 ///
-/// Demonstrates single-image pipeline with shared detector pool:
-/// 1. Pre-processing: Tile extraction + shadow removal
-/// 2. Execution: Batch detection via shared detector pool
+/// Demonstrates the complete detection pipeline with tiled batch processing:
+/// 1. Pre-processing: Tile extraction (auto-sized 640×640) + shadow removal
+/// 2. Execution: Parallel batch detection via shared detector pool
 /// 3. Post-processing: NMS + nested detection filtering + coordinate merging
 ///
-/// The detector pool (with its model session) is shared and can be reused
-/// across multiple pipeline executions.
+/// The detector pool is shared and can be reused across multiple images.
+/// Workers forward tiles to a single BatchExecutor which batches them for GPU.
 ///
 /// Usage:
-///   cargo run --release --features metal --example detect_pipeline <image_path> [output_path]
+///   cargo run --release --features metal --example detect_pipeline [--detector yolov8|rtdetr] [--confidence %%] <image_path> [output_path]
+///
+/// Examples:
+///   cargo run --release --features metal --example detect_pipeline
+///   cargo run --release --features metal --example detect_pipeline -- --detector yolov8
+///   cargo run --release --features metal --example detect_pipeline -- --detector rtdetr --confidence 35 test_data/my_image.jpg output.jpg
+///   cargo run --release --features metal --example detect_pipeline -- --confidence 50
 use image::ImageReader;
 use military_target_detector::batch_executor::BatchConfig;
 use military_target_detector::detector_pool::DetectorPool;
+use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
 use military_target_detector::pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::types::DetectorConfig;
@@ -23,20 +30,69 @@ use std::time::Instant;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    println!("🎯 YOLO Detection Pipeline - Single Image Processing\n");
-
     // Parse arguments
     let args: Vec<String> = env::args().collect();
-    let image_path = if args.len() > 1 {
-        args[1].clone()
+
+    // Parse detector type
+    let mut detector_type = DetectorType::RTDETR; // Default to RT-DETR
+    let mut confidence_threshold = 0.45; // Default 45%
+    let mut arg_idx = 1;
+
+    if args.len() > arg_idx && args[arg_idx] == "--detector" {
+        arg_idx += 1;
+        if args.len() > arg_idx {
+            detector_type = match args[arg_idx].to_lowercase().as_str() {
+                "rtdetr" | "rt-detr" => DetectorType::RTDETR,
+                "yolo" | "yolov8" => DetectorType::YOLOV8,
+                _ => {
+                    eprintln!("Invalid detector type. Use 'yolov8' or 'rtdetr'");
+                    return Ok(());
+                }
+            };
+            arg_idx += 1;
+        }
+    }
+
+    // Parse confidence threshold
+    if args.len() > arg_idx && args[arg_idx] == "--confidence" {
+        arg_idx += 1;
+        if args.len() > arg_idx {
+            match args[arg_idx].parse::<f32>() {
+                Ok(val) => {
+                    confidence_threshold = (val / 100.0).clamp(0.0, 1.0); // Convert % to 0.0-1.0
+                }
+                Err(_) => {
+                    eprintln!("Invalid confidence threshold. Use a number between 0-100");
+                    return Ok(());
+                }
+            }
+            arg_idx += 1;
+        }
+    }
+
+    let detector_name = match detector_type {
+        DetectorType::YOLOV8 => "YOLOv8",
+        DetectorType::RTDETR => "RT-DETR",
+    };
+
+    println!(
+        "🎯 {} Detection Pipeline - Single Image Processing\n",
+        detector_name
+    );
+
+    let image_path = if args.len() > arg_idx {
+        args[arg_idx].clone()
     } else {
         "test_data/yolo_airport.jpg".to_string()
     };
 
-    let output_path = if args.len() > 2 {
-        args[2].clone()
+    let output_path = if args.len() > arg_idx + 1 {
+        args[arg_idx + 1].clone()
     } else {
-        "output_pipeline_annotated.jpg".to_string()
+        format!(
+            "output_{}.jpg",
+            detector_name.to_lowercase().replace("-", "")
+        )
     };
 
     let start_total = Instant::now();
@@ -53,29 +109,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_load = Instant::now();
 
     let num_workers = 2;
+    let batch_size = 4;
     let batch_config = BatchConfig {
-        batch_size: 4,
+        batch_size,
         timeout_ms: 50,
     };
 
+    // Platform-specific model selection:
+    // - NVIDIA (CUDA/TensorRT): Use FP16 for 2-3x speedup
+    // - Apple (CoreML/Metal): Use FP32 (CoreML optimizes internally)
+    // - CPU: Use FP32
+    let (fp16_path, fp32_path) = match detector_type {
+        DetectorType::YOLOV8 => {
+            #[cfg(any(feature = "cuda", feature = "tensorrt"))]
+            let paths = (
+                "../models/yolov8m_batch_fp16.onnx",
+                "../models/yolov8m_batch_fp32.onnx",
+            );
+
+            #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "tensorrt"))))]
+            let paths = (
+                "../models/yolov8m_batch_fp32.onnx",
+                "../models/yolov8m_batch_fp32.onnx",
+            );
+
+            #[cfg(not(any(feature = "metal", feature = "cuda", feature = "tensorrt")))]
+            let paths = (
+                "../models/yolov8m_batch_fp32.onnx",
+                "../models/yolov8m_batch_fp32.onnx",
+            );
+
+            paths
+        }
+        DetectorType::RTDETR => (
+            "../models/rtdetr_v2_r18vd_batch.onnx",
+            "../models/rtdetr_v2_r18vd_batch.onnx",
+        ),
+    };
+
+    let (input_width, input_height) = match detector_type {
+        DetectorType::YOLOV8 => (640, 640),
+        DetectorType::RTDETR => (640, 640),  // RT-DETR now uses 640×640 (same as YOLO)
+    };
+
     let detector_config = DetectorConfig {
-        model_path: "../models/yolov8m_batch_fp16.onnx".to_string(),
-        confidence_threshold: 0.22,
+        fp16_model_path: Some(fp16_path.to_string()),
+        fp32_model_path: Some(fp32_path.to_string()),
+        confidence_threshold,
         nms_threshold: 0.45,
-        input_size: (640, 640),
+        input_size: (input_width, input_height),
         use_gpu: true,
         ..Default::default()
     };
 
     let detector_pool = Arc::new(DetectorPool::new(
         num_workers,
+        detector_type,
         detector_config,
         batch_config,
     )?);
     println!("✓ ({:.2}s)", start_load.elapsed().as_secs_f32());
 
-    println!("\n💡 Note: Detector pool is shared and can process multiple images");
-    println!("   Each pipeline execution reuses the same model session\n");
+    let (tile_width, tile_height) = detector_pool.input_size();
+    
+    // Calculate expected tiles with detector-specific overlap
+    let overlap = match detector_type {
+        DetectorType::YOLOV8 => 64,
+        DetectorType::RTDETR => 64,
+    };
+    let stride = tile_width - overlap;
+    
+    // Use same logic as pipeline: don't create extra tiles for small overhangs (< 20% of tile size)
+    let tiles_x = if img_width <= tile_width {
+        1
+    } else {
+        let remaining = img_width - tile_width;
+        let num_strides = (remaining as f32 / stride as f32).ceil() as usize;
+        let last_overhang = (remaining as i32) - ((num_strides - 1) * stride as usize) as i32;
+        if last_overhang < (tile_width / 5) as i32 {
+            num_strides
+        } else {
+            num_strides + 1
+        }
+    };
+    
+    let tiles_y = if img_height <= tile_height {
+        1
+    } else {
+        let remaining = img_height - tile_height;
+        let num_strides = (remaining as f32 / stride as f32).ceil() as usize;
+        let last_overhang = (remaining as i32) - ((num_strides - 1) * stride as usize) as i32;
+        if last_overhang < (tile_height / 5) as i32 {
+            num_strides
+        } else {
+            num_strides + 1
+        }
+    };
+    
+    let total_tiles = tiles_x * tiles_y;
+    
+    println!("\n💡 Pipeline Configuration:");
+    println!("   • Detector: {}", detector_name);
+    println!(
+        "   • Tile size: {}x{} (auto-detected from model)",
+        tile_width, tile_height
+    );
+    println!("   • Expected tiles: {} ({}×{}) with {}px overlap", total_tiles, tiles_x, tiles_y, overlap);
+    println!("   • Workers: {} (forward tiles to batch executor)", num_workers);
+    println!("   • Batch size: {} (GPU processes {} tiles in parallel)", batch_size, batch_size.min(total_tiles));
+    println!("   • Confidence threshold: {:.0}%", confidence_threshold * 100.0);
+    println!("   • Architecture: {} tiles → {} workers → BatchExecutor → GPU batch inference", total_tiles, num_workers);
+    println!("   • Detector pool is shared and can process multiple images\n");
 
     // Create pipeline with shared detector pool
     println!("🔧 Building detection pipeline:");
@@ -84,9 +228,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  • Stage 3: Postprocess (NMS + nested filtering + coordinate merging)");
 
     let pipeline_config = PipelineConfig {
-        tile_size: 640,
-        overlap: 64,
-        allowed_classes: vec![2, 3, 4, 7], // car, motorcycle, airplane, truck
+        overlap,
+        allowed_classes: vec![0, 2, 4, 5, 7], // person, car, airplane, bus, truck
         iou_threshold: 0.5,
     };
 
@@ -137,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("🎨 Drawing bounding boxes... ");
     let mut annotated_img = original_img;
 
-    for det in &result.detections {
+    for (detection_num, det) in result.detections.iter().enumerate() {
         let color = generate_class_color(det.class_id);
 
         draw_rect(
@@ -150,7 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             2,
         );
 
-        let label = format!("{} {:.0}%", det.class_name, det.confidence * 100.0);
+        let label = format!("{}#{} {:.0}%", det.class_name, detection_num + 1, det.confidence * 100.0);
         let padding = 3;
         let text_x = (det.x as i32 + padding).max(0);
         let text_y = (det.y as i32 + padding).max(0);

@@ -164,17 +164,37 @@ impl PreprocessStage {
         }
 
         let stride = self.tile_size.saturating_sub(self.overlap);
-
+        
+        // Calculate number of tiles needed, but don't create extra tiles for small overhangs
+        // If remaining pixels are < 20% of tile size, just extend the last tile
         let tiles_x = if img_width <= self.tile_size {
             1
         } else {
-            ((img_width - self.tile_size) as f32 / stride as f32).ceil() as u32 + 1
+            let remaining = img_width - self.tile_size;
+            let num_strides = (remaining as f32 / stride as f32).ceil() as u32;
+            // Check if last stride would create a small overhang
+            let last_overhang = (remaining as i32) - ((num_strides - 1) * stride) as i32;
+            if last_overhang < (self.tile_size / 5) as i32 {
+                // Overhang is < 20% of tile size, don't create extra tile
+                num_strides
+            } else {
+                num_strides + 1
+            }
         };
 
         let tiles_y = if img_height <= self.tile_size {
             1
         } else {
-            ((img_height - self.tile_size) as f32 / stride as f32).ceil() as u32 + 1
+            let remaining = img_height - self.tile_size;
+            let num_strides = (remaining as f32 / stride as f32).ceil() as u32;
+            // Check if last stride would create a small overhang
+            let last_overhang = (remaining as i32) - ((num_strides - 1) * stride) as i32;
+            if last_overhang < (self.tile_size / 5) as i32 {
+                // Overhang is < 20% of tile size, don't create extra tile
+                num_strides
+            } else {
+                num_strides + 1
+            }
         };
 
         for ty in 0..tiles_y {
@@ -286,6 +306,7 @@ impl ExecutionStage {
 
         // Submit all tiles to shared detector pool
         let mut responses = Vec::new();
+        let submit_start = Instant::now();
         for tile in &input.tiles {
             let mut tile_data = Vec::new();
             for pixel in tile.image.pixels() {
@@ -301,17 +322,25 @@ impl ExecutionStage {
                 ImageFormat::RGB,
             );
 
+            let tile_start = Instant::now();
             let response_rx = self.detector_pool.detect_async(image_data);
-            responses.push((tile.tile_idx, tile.offset_x, tile.offset_y, response_rx));
+            responses.push((tile.tile_idx, tile.offset_x, tile.offset_y, response_rx, tile_start));
         }
+        let submit_time = submit_start.elapsed();
 
-        // Collect results
-        for (tile_idx, offset_x, offset_y, response_rx) in responses {
+        // Collect results and track per-tile timing
+        let mut tile_times = Vec::new();
+        for (tile_idx, offset_x, offset_y, response_rx, tile_start) in responses {
             if let Ok(Ok(detections)) = response_rx.recv() {
+                let tile_time = tile_start.elapsed();
+                tile_times.push((tile_idx, tile_time, detections.len()));
+                
                 for det in detections {
                     let class_id = det.class.id();
 
-                    if !self.allowed_classes.contains(&class_id) {
+                    // Filter by allowed classes (empty list = allow all)
+                    if !self.allowed_classes.is_empty() && !self.allowed_classes.contains(&class_id)
+                    {
                         continue;
                     }
 
@@ -325,6 +354,18 @@ impl ExecutionStage {
                     let x_final = x_tile_px + offset_x as f32;
                     let y_final = y_tile_px + offset_y as f32;
 
+                    // Get class name and capitalize first letter
+                    let class_name = det.class.name();
+                    let capitalized_name = if !class_name.is_empty() {
+                        let mut chars = class_name.chars();
+                        match chars.next() {
+                            None => String::new(),
+                            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                        }
+                    } else {
+                        class_name
+                    };
+                    
                     all_detections.push(TileDetection {
                         x: x_final,
                         y: y_final,
@@ -332,11 +373,26 @@ impl ExecutionStage {
                         h: h_tile_px,
                         confidence: det.confidence,
                         class_id,
-                        class_name: format!("{:?}", det.class),
+                        class_name: capitalized_name,
                         tile_idx,
                     });
                 }
             }
+        }
+        
+        // Log per-tile performance
+        if !tile_times.is_empty() {
+            log::info!("📊 Per-Tile End-to-End Latency (submission → response):");
+            for (idx, time, det_count) in &tile_times {
+                let ms = time.as_secs_f32() * 1000.0;
+                let fps = 1000.0 / ms;
+                log::info!("  Tile #{}: {:.1}ms ({:.1} FPS) - {} detections", idx, ms, fps, det_count);
+            }
+            let total_ms: f32 = tile_times.iter().map(|(_, t, _)| t.as_secs_f32() * 1000.0).sum();
+            let avg_ms = total_ms / tile_times.len() as f32;
+            let avg_fps = 1000.0 / avg_ms;
+            log::info!("  Average latency: {:.1}ms ({:.1} FPS)", avg_ms, avg_fps);
+            log::info!("  Submit time: {:.1}ms", submit_time.as_secs_f32() * 1000.0);
         }
 
         let output = ExecutionOutput {
@@ -383,30 +439,37 @@ impl PostprocessStage {
     }
 
     /// Check if detection `inner` is fully contained within detection `outer`
-    fn is_fully_contained(inner: &TileDetection, outer: &TileDetection) -> bool {
+    /// with optional padding applied to outer detection boundaries
+    fn is_fully_contained(inner: &TileDetection, outer: &TileDetection, padding: f32) -> bool {
         let inner_x1 = inner.x;
         let inner_y1 = inner.y;
         let inner_x2 = inner.x + inner.w;
         let inner_y2 = inner.y + inner.h;
 
-        let outer_x1 = outer.x;
-        let outer_y1 = outer.y;
-        let outer_x2 = outer.x + outer.w;
-        let outer_y2 = outer.y + outer.h;
+        // Expand outer detection boundaries by padding (10px on each side = 20px total added to width/height)
+        let outer_x1 = (outer.x - padding).max(0.0);
+        let outer_y1 = (outer.y - padding).max(0.0);
+        let outer_x2 = outer.x + outer.w + padding;
+        let outer_y2 = outer.y + outer.h + padding;
 
         inner_x1 >= outer_x1 && inner_y1 >= outer_y1 && inner_x2 <= outer_x2 && inner_y2 <= outer_y2
     }
 
     /// Filter out detections that are fully contained within other detections
+    /// Only removes nested detections if they are of the same class as the parent
     fn filter_nested_detections(&self, detections: Vec<TileDetection>) -> Vec<TileDetection> {
         let mut filtered = Vec::new();
+        const NESTED_PADDING: f32 = 10.0; // Add 10px padding to nested detection boundaries
 
         for (i, det) in detections.iter().enumerate() {
             let mut is_contained = false;
 
             // Check if this detection is contained in any other detection
             for (j, other) in detections.iter().enumerate() {
-                if i != j && Self::is_fully_contained(det, other) {
+                if i != j 
+                    && det.class_id == other.class_id  // Only remove if same class
+                    && Self::is_fully_contained(det, other, NESTED_PADDING) 
+                {
                     is_contained = true;
                     break;
                 }
@@ -484,7 +547,6 @@ impl PostprocessStage {
 
 /// Detection pipeline configuration
 pub struct PipelineConfig {
-    pub tile_size: u32,
     pub overlap: u32,
     pub allowed_classes: Vec<u32>,
     pub iou_threshold: f32,
@@ -493,7 +555,6 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            tile_size: 640,
             overlap: 64,
             allowed_classes: vec![2, 3, 4, 7], // car, motorcycle, airplane, truck
             iou_threshold: 0.5,
@@ -512,9 +573,11 @@ pub struct DetectionPipeline {
 impl DetectionPipeline {
     /// Create a new detection pipeline with shared detector pool
     pub fn new(detector_pool: Arc<DetectorPool>, config: PipelineConfig) -> Self {
-        let preprocess = PreprocessStage::new(config.tile_size, config.overlap);
-        let execution =
-            ExecutionStage::new(detector_pool, config.tile_size, config.allowed_classes);
+        // Get tile size from detector's input size
+        let (tile_size, _) = detector_pool.input_size();
+
+        let preprocess = PreprocessStage::new(tile_size, config.overlap);
+        let execution = ExecutionStage::new(detector_pool, tile_size, config.allowed_classes);
         let postprocess = PostprocessStage::new(config.iou_threshold);
 
         Self {

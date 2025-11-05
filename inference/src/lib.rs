@@ -24,8 +24,10 @@
 
 // Detector implementation
 pub mod batch_executor;
-pub mod detector_onnx;
 pub mod detector_pool;
+pub mod detector_rtdetr;
+pub mod detector_trait;
+pub mod detector_yolov8;
 pub mod pipeline;
 
 // Core modules
@@ -36,8 +38,10 @@ pub mod postprocessing;
 pub mod preprocessing;
 pub mod types;
 
-// Export the detector
-pub use detector_onnx::MilitaryTargetDetector;
+// Export the detectors
+pub use detector_rtdetr::RTDETRDetector;
+pub use detector_trait::{Detector, DetectorType};
+pub use detector_yolov8::YoloV8Detector;
 
 pub use error::{DetectionError, Result};
 pub use types::{

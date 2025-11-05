@@ -36,7 +36,9 @@ env_logger = "0.11"
 
 [features]
 default = []
-metal = []  # Enable CoreML/Metal GPU acceleration on Apple platforms
+metal = []      # Enable CoreML/Metal GPU acceleration on Apple platforms
+cuda = []       # Enable CUDA GPU acceleration on NVIDIA platforms
+tensorrt = []   # Enable TensorRT GPU acceleration on NVIDIA platforms (optimized)
 
 [profile.release]
 opt-level = 3
