@@ -107,17 +107,26 @@ fn extract_tiles(img: &RgbImage, config: &TileConfig) -> Vec<Tile> {
     positions
         .iter()
         .map(|&(x, y)| {
-            // Crop tile
-            let tile = image::imageops::crop_imm(
-                img,
-                x,
-                y,
-                config.tile_size.min(img.width() - x),
-                config.tile_size.min(img.height() - y),
-            )
-            .to_image();
+            let crop_width = config.tile_size.min(img.width() - x);
+            let crop_height = config.tile_size.min(img.height() - y);
 
-            // No upscaling - use native tile size
+            // Crop tile
+            let cropped = image::imageops::crop_imm(img, x, y, crop_width, crop_height).to_image();
+
+            // If tile is smaller than expected size, pad it to 640x640
+            let tile = if crop_width < config.tile_size || crop_height < config.tile_size {
+                let mut padded = RgbImage::new(config.tile_size, config.tile_size);
+                // Fill with gray background
+                for pixel in padded.pixels_mut() {
+                    *pixel = Rgb([114, 114, 114]); // Gray padding (YOLO standard)
+                }
+                // Copy cropped image to top-left corner
+                image::imageops::overlay(&mut padded, &cropped, 0, 0);
+                padded
+            } else {
+                cropped
+            };
+
             Tile {
                 image: tile,
                 offset_x: x,
