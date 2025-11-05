@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse detector type
     let mut detector_type = DetectorType::RTDETR; // Default to RT-DETR
-    let mut confidence_threshold = 0.45; // Default 45%
+    let mut confidence_threshold = 0.50; // Default 50%
     let mut arg_idx = 1;
 
     if args.len() > arg_idx && args[arg_idx] == "--detector" {
@@ -277,8 +277,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Draw results on resized image (annotations match computation space)
-    print!("🎨 Drawing bounding boxes... ");
     let mut annotated_img = result.resized_image.clone();
+    print!("🎨 Drawing bounding boxes on {}x{} image... ", annotated_img.width(), annotated_img.height());
 
     for (detection_num, det) in result.detections.iter().enumerate() {
         let color = generate_class_color(det.class_id);

@@ -34,12 +34,12 @@ pub struct Tile {
 /// Pre-processing output: tiles extracted from original image
 #[derive(Clone)]
 pub struct PreprocessOutput {
-    pub tiles: Vec<Tile>,
+    pub tiles: Vec<Tile>,  // Tiles extracted from deshadowed image (used for detection)
     pub original_width: u32,
     pub original_height: u32,
     pub resized_width: u32,
     pub resized_height: u32,
-    pub resized_image: RgbImage,  // Store resized image before shadow removal for annotation
+    pub resized_image: RgbImage,  // Original resized image (for annotation/visualization)
 }
 
 /// Detection result with tile information
@@ -90,19 +90,23 @@ impl PreprocessStage {
         Self { tile_size, overlap }
     }
 
-    /// Resize image to fit tile_size width while preserving aspect ratio
+    /// Resize image so the shorter dimension fits tile_size while preserving aspect ratio
     fn resize_to_fit(&self, img: &RgbImage) -> RgbImage {
         let (width, height) = img.dimensions();
         
-        // If width is already <= tile_size, no need to resize
-        if width <= self.tile_size {
+        // If both dimensions are already <= tile_size, no need to resize
+        if width <= self.tile_size && height <= self.tile_size {
             return img.clone();
         }
 
-        // Calculate scale factor based on width
-        let scale = self.tile_size as f32 / width as f32;
+        // Calculate scale factor based on the SHORTER dimension
+        let scale = if width < height {
+            self.tile_size as f32 / width as f32
+        } else {
+            self.tile_size as f32 / height as f32
+        };
 
-        let new_width = self.tile_size;
+        let new_width = (width as f32 * scale) as u32;
         let new_height = (height as f32 * scale) as u32;
 
         image::imageops::resize(
@@ -241,7 +245,7 @@ impl PreprocessStage {
         positions
     }
 
-    /// Extract tiles from image with shadow removal
+    /// Extract tiles from image (shadow removal already applied to full image)
     pub fn extract_tiles(&self, img: &RgbImage) -> Vec<Tile> {
         let positions = self.get_tile_positions(img.width(), img.height());
 
@@ -256,7 +260,7 @@ impl PreprocessStage {
                     image::imageops::crop_imm(img, x, y, crop_width, crop_height).to_image();
 
                 // Pad if necessary
-                let mut tile = if crop_width < self.tile_size || crop_height < self.tile_size {
+                let tile = if crop_width < self.tile_size || crop_height < self.tile_size {
                     let mut padded = RgbImage::new(self.tile_size, self.tile_size);
                     for pixel in padded.pixels_mut() {
                         *pixel = Rgb([114, 114, 114]);
@@ -266,9 +270,6 @@ impl PreprocessStage {
                 } else {
                     cropped
                 };
-
-                // Apply shadow removal
-                tile = self.remove_shadows_hsv(&tile);
 
                 Tile {
                     image: tile,
@@ -287,13 +288,16 @@ impl PreprocessStage {
         let original_width = img.width();
         let original_height = img.height();
 
-        // Resize image to fit tile_size width while preserving aspect ratio
+        // Resize image to fit tile_size on shorter dimension while preserving aspect ratio
         let resized_img = self.resize_to_fit(img);
         let resized_width = resized_img.width();
         let resized_height = resized_img.height();
 
-        // Extract tiles from resized image (with shadow removal applied to tiles)
-        let tiles = self.extract_tiles(&resized_img);
+        // Apply shadow removal to entire resized image once (more efficient than per-tile)
+        let deshadowed_img = self.remove_shadows_hsv(&resized_img);
+
+        // Extract tiles from shadow-removed image (tiles will be used for detection)
+        let tiles = self.extract_tiles(&deshadowed_img);
         
         let output = PreprocessOutput {
             tiles,
@@ -301,7 +305,7 @@ impl PreprocessStage {
             original_height,
             resized_width,
             resized_height,
-            resized_image: resized_img,  // Store for annotation
+            resized_image: resized_img,  // Keep original resized for annotation
         };
 
         StageResult {
