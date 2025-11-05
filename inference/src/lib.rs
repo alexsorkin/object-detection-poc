@@ -26,6 +26,7 @@
 pub mod batch_executor;
 pub mod detector_onnx;
 pub mod detector_pool;
+pub mod pipeline;
 
 // Core modules
 pub mod error;
