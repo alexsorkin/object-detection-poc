@@ -108,8 +108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("📦 Creating shared detector pool... ");
     let start_load = Instant::now();
 
-    let num_workers = 2;
-    let batch_size = 4;
+    let num_workers = 10;
+    let batch_size = 5;
     let batch_config = BatchConfig {
         batch_size,
         timeout_ms: 50,
@@ -174,8 +174,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Calculate expected tiles with detector-specific overlap
     let overlap = match detector_type {
-        DetectorType::YOLOV8 => 64,
-        DetectorType::RTDETR => 64,
+        DetectorType::YOLOV8 => 32,
+        DetectorType::RTDETR => 32,  // RT-DETR uses smaller overlap for faster processing
     };
     let stride = tile_width - overlap;
     
@@ -276,13 +276,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Draw results on original image
+    // Draw results on resized image (annotations match computation space)
     print!("🎨 Drawing bounding boxes... ");
-    let mut annotated_img = original_img;
+    let mut annotated_img = result.resized_image.clone();
 
     for (detection_num, det) in result.detections.iter().enumerate() {
         let color = generate_class_color(det.class_id);
 
+        // Use detection coordinates directly (already in resized image space)
         draw_rect(
             &mut annotated_img,
             det.x as i32,

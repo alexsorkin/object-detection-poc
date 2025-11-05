@@ -18,7 +18,7 @@ pub struct BatchConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         BatchConfig {
-            batch_size: 4,  // Process up to 4 tiles at once
+            batch_size: 4, // Process up to 4 tiles at once
             timeout_ms: 50, // Wait max 50ms for batch to fill
         }
     }

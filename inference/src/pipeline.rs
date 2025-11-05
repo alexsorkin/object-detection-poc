@@ -37,6 +37,9 @@ pub struct PreprocessOutput {
     pub tiles: Vec<Tile>,
     pub original_width: u32,
     pub original_height: u32,
+    pub resized_width: u32,
+    pub resized_height: u32,
+    pub resized_image: RgbImage,  // Store resized image before shadow removal for annotation
 }
 
 /// Detection result with tile information
@@ -58,6 +61,9 @@ pub struct ExecutionOutput {
     pub detections: Vec<TileDetection>,
     pub original_width: u32,
     pub original_height: u32,
+    pub resized_width: u32,
+    pub resized_height: u32,
+    pub resized_image: RgbImage,
 }
 
 /// Final output after post-processing
@@ -66,6 +72,9 @@ pub struct PostprocessOutput {
     pub detections: Vec<TileDetection>,
     pub original_width: u32,
     pub original_height: u32,
+    pub resized_width: u32,
+    pub resized_height: u32,
+    pub resized_image: RgbImage,
     pub duplicates_removed: usize,
     pub nested_removed: usize,
 }
@@ -79,6 +88,29 @@ pub struct PreprocessStage {
 impl PreprocessStage {
     pub fn new(tile_size: u32, overlap: u32) -> Self {
         Self { tile_size, overlap }
+    }
+
+    /// Resize image to fit tile_size width while preserving aspect ratio
+    fn resize_to_fit(&self, img: &RgbImage) -> RgbImage {
+        let (width, height) = img.dimensions();
+        
+        // If width is already <= tile_size, no need to resize
+        if width <= self.tile_size {
+            return img.clone();
+        }
+
+        // Calculate scale factor based on width
+        let scale = self.tile_size as f32 / width as f32;
+
+        let new_width = self.tile_size;
+        let new_height = (height as f32 * scale) as u32;
+
+        image::imageops::resize(
+            img,
+            new_width,
+            new_height,
+            image::imageops::FilterType::Lanczos3,
+        )
     }
 
     /// Apply HSV-based shadow removal (brightness enhancement)
@@ -165,36 +197,25 @@ impl PreprocessStage {
 
         let stride = self.tile_size.saturating_sub(self.overlap);
         
-        // Calculate number of tiles needed, but don't create extra tiles for small overhangs
-        // If remaining pixels are < 20% of tile size, just extend the last tile
+        // Calculate number of tiles needed to cover the entire image
         let tiles_x = if img_width <= self.tile_size {
             1
         } else {
-            let remaining = img_width - self.tile_size;
-            let num_strides = (remaining as f32 / stride as f32).ceil() as u32;
-            // Check if last stride would create a small overhang
-            let last_overhang = (remaining as i32) - ((num_strides - 1) * stride) as i32;
-            if last_overhang < (self.tile_size / 5) as i32 {
-                // Overhang is < 20% of tile size, don't create extra tile
-                num_strides
-            } else {
-                num_strides + 1
-            }
+            // Calculate how many tiles we need
+            // First tile covers [0, tile_size]
+            // Each subsequent tile covers [i*stride, i*stride + tile_size]
+            let remaining_after_first = img_width.saturating_sub(self.tile_size);
+            let additional_tiles = (remaining_after_first as f32 / stride as f32).ceil() as u32;
+            1 + additional_tiles
         };
 
         let tiles_y = if img_height <= self.tile_size {
             1
         } else {
-            let remaining = img_height - self.tile_size;
-            let num_strides = (remaining as f32 / stride as f32).ceil() as u32;
-            // Check if last stride would create a small overhang
-            let last_overhang = (remaining as i32) - ((num_strides - 1) * stride) as i32;
-            if last_overhang < (self.tile_size / 5) as i32 {
-                // Overhang is < 20% of tile size, don't create extra tile
-                num_strides
-            } else {
-                num_strides + 1
-            }
+            // Calculate how many tiles we need
+            let remaining_after_first = img_height.saturating_sub(self.tile_size);
+            let additional_tiles = (remaining_after_first as f32 / stride as f32).ceil() as u32;
+            1 + additional_tiles
         };
 
         for ty in 0..tiles_y {
@@ -263,11 +284,24 @@ impl PreprocessStage {
     pub fn process(&self, img: &RgbImage) -> StageResult<PreprocessOutput> {
         let start = Instant::now();
 
-        let tiles = self.extract_tiles(img);
+        let original_width = img.width();
+        let original_height = img.height();
+
+        // Resize image to fit tile_size width while preserving aspect ratio
+        let resized_img = self.resize_to_fit(img);
+        let resized_width = resized_img.width();
+        let resized_height = resized_img.height();
+
+        // Extract tiles from resized image (with shadow removal applied to tiles)
+        let tiles = self.extract_tiles(&resized_img);
+        
         let output = PreprocessOutput {
             tiles,
-            original_width: img.width(),
-            original_height: img.height(),
+            original_width,
+            original_height,
+            resized_width,
+            resized_height,
+            resized_image: resized_img,  // Store for annotation
         };
 
         StageResult {
@@ -399,6 +433,9 @@ impl ExecutionStage {
             detections: all_detections,
             original_width: input.original_width,
             original_height: input.original_height,
+            resized_width: input.resized_width,
+            resized_height: input.resized_height,
+            resized_image: input.resized_image,
         };
 
         StageResult {
@@ -533,6 +570,9 @@ impl PostprocessStage {
             detections: filtered_detections,
             original_width: input.original_width,
             original_height: input.original_height,
+            resized_width: input.resized_width,
+            resized_height: input.resized_height,
+            resized_image: input.resized_image,
             duplicates_removed,
             nested_removed,
         };
