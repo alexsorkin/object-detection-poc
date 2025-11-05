@@ -94,6 +94,80 @@ impl MilitaryTargetDetector {
         Ok(detections)
     }
 
+    /// Detect targets in multiple images using batch inference (parallel GPU execution)
+    pub fn detect_batch(
+        &mut self,
+        images: &[ImageData],
+    ) -> Result<Vec<Vec<Detection>>, DetectionError> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug!("Starting batch detection on {} images", images.len());
+        let batch_size = images.len();
+
+        // Preprocess all images into a single batch tensor [N, 3, 640, 640]
+        let mut batch_tensor = Array::zeros((batch_size, 3, 640, 640));
+
+        for (batch_idx, image) in images.iter().enumerate() {
+            let preprocessed = self.preprocess(image)?;
+            // Copy from [1, 3, 640, 640] to batch position [batch_idx, 3, 640, 640]
+            for c in 0..3 {
+                for y in 0..640 {
+                    for x in 0..640 {
+                        batch_tensor[[batch_idx, c, y, x]] = preprocessed[[0, c, y, x]];
+                    }
+                }
+            }
+        }
+
+        // Run batch inference
+        let batch_tensor_dyn = batch_tensor.into_dyn();
+        let tensor_ref = TensorRef::from_array_view(&batch_tensor_dyn)
+            .map_err(|e| DetectionError::InferenceError(e.to_string()))?;
+
+        let outputs = self
+            .session
+            .run(ort::inputs![tensor_ref])
+            .map_err(|e| DetectionError::InferenceError(e.to_string()))?;
+
+        // Extract batch output
+        let output_array = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| DetectionError::postprocessing(e.to_string()))?
+            .into_owned();
+
+        drop(outputs);
+
+        // Process each image's detections from batch output
+        let mut all_detections = Vec::with_capacity(batch_size);
+
+        for (batch_idx, image) in images.iter().enumerate() {
+            // Extract output for this image from batch
+            // YOLOv8 batch output shape: [batch_size, num_channels, num_boxes]
+            let shape = output_array.shape();
+            if shape.len() != 3 {
+                return Err(DetectionError::postprocessing(format!(
+                    "Unexpected batch output shape: {:?}",
+                    shape
+                )));
+            }
+
+            // Create view for this image's output: [1, num_channels, num_boxes]
+            let image_output = output_array.slice(ndarray::s![batch_idx, .., ..]);
+            let image_output = image_output.insert_axis(ndarray::Axis(0));
+
+            // Postprocess this image's detections
+            let detections =
+                self.postprocess(image_output.view().into_dyn(), image.width, image.height)?;
+
+            all_detections.push(detections);
+        }
+
+        info!("Batch detection complete: {} images processed", batch_size);
+        Ok(all_detections)
+    }
+
     /// Preprocess image: resize to 640x640, normalize, convert to CHW format
     fn preprocess(&self, image: &ImageData) -> Result<Array<f32, IxDyn>, DetectionError> {
         use image::imageops::FilterType;

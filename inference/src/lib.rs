@@ -23,7 +23,9 @@
 //! ```
 
 // Detector implementation
+pub mod batch_executor;
 pub mod detector_onnx;
+pub mod detector_pool;
 
 // Core modules
 pub mod error;

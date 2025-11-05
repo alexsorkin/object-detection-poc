@@ -1,21 +1,104 @@
-/// Tiled Detection with Overlapping Patches
+/// Tiled Detection with Overlapping Patches and Batch Processing
 ///
-/// This example demonstrates detection on overlapping image tiles for better
-/// small object detection. The approach:
-/// 1. Take original image (any size)
+/// This example demonstrates detection on overlapping image tiles with efficient
+/// batch processing for parallel GPU execution. The approach:
+/// 1. Take original image (any size) - NO preprocessing
 /// 2. Split into 640x640 overlapping tiles (64px overlap) covering the entire image
-/// 3. Run detection on each tile sequentially at YOLO's native 640x640 resolution
-/// 4. Merge detections with NMS to remove duplicates
-/// 5. Map coordinates back to original image space
+/// 3. Apply HSV-based shadow removal to each tile (minimalistic brightness enhancement)
+/// 4. Submit tiles to worker pool -> batch executor collects them
+/// 5. Batch executor processes multiple tiles in parallel (single GPU call with batch size)
+/// 6. Merge detections with NMS to remove duplicates (postprocessing on whole image)
+/// 7. Map coordinates back to original image space
+///
+/// Architecture: Workers -> Batch Executor (configurable batch_size & timeout_ms)
 ///
 /// Usage:
 ///   cargo run --release --features metal --example detect_tile_overlap <image_path> [output_path]
 use image::{Rgb, RgbImage};
+use military_target_detector::batch_executor::BatchConfig;
+use military_target_detector::detector_pool::DetectorPool;
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
 use military_target_detector::types::{DetectorConfig, ImageData, ImageFormat};
-use military_target_detector::MilitaryTargetDetector;
 use std::env;
 use std::time::Instant;
+
+/// Apply simple HSV-based shadow removal (brightness enhancement)
+/// Increases V channel for darker pixels (shadows) more than bright pixels
+fn remove_shadows_hsv(img: &RgbImage) -> RgbImage {
+    let (width, height) = img.dimensions();
+    let mut result = RgbImage::new(width, height);
+
+    // Convert RGB to HSV, enhance V channel, convert back
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel(x, y);
+            let [r, g, b] = pixel.0;
+
+            // RGB to HSV conversion
+            let r_f = r as f32 / 255.0;
+            let g_f = g as f32 / 255.0;
+            let b_f = b as f32 / 255.0;
+
+            let max = r_f.max(g_f).max(b_f);
+            let min = r_f.min(g_f).min(b_f);
+            let delta = max - min;
+
+            // Calculate H (hue)
+            let h = if delta < 0.00001 {
+                0.0
+            } else if (max - r_f).abs() < 0.00001 {
+                60.0 * (((g_f - b_f) / delta) % 6.0)
+            } else if (max - g_f).abs() < 0.00001 {
+                60.0 * (((b_f - r_f) / delta) + 2.0)
+            } else {
+                60.0 * (((r_f - g_f) / delta) + 4.0)
+            };
+
+            // Calculate S (saturation)
+            let s = if max < 0.00001 { 0.0 } else { delta / max };
+
+            // V (value/brightness)
+            let v = max;
+
+            // Enhance V channel for dark pixels (shadows)
+            // Increase brightness more for darker pixels
+            let v_enhanced = if v < 0.5 {
+                // Dark pixels: increase brightness significantly
+                (v + 0.3).min(1.0)
+            } else {
+                // Bright pixels: slight increase
+                (v + 0.1).min(1.0)
+            };
+
+            // HSV back to RGB
+            let c = v_enhanced * s;
+            let x_val = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+            let m = v_enhanced - c;
+
+            let (r_out, g_out, b_out) = if h < 60.0 {
+                (c, x_val, 0.0)
+            } else if h < 120.0 {
+                (x_val, c, 0.0)
+            } else if h < 180.0 {
+                (0.0, c, x_val)
+            } else if h < 240.0 {
+                (0.0, x_val, c)
+            } else if h < 300.0 {
+                (x_val, 0.0, c)
+            } else {
+                (c, 0.0, x_val)
+            };
+
+            let r_final = ((r_out + m) * 255.0).clamp(0.0, 255.0) as u8;
+            let g_final = ((g_out + m) * 255.0).clamp(0.0, 255.0) as u8;
+            let b_final = ((b_out + m) * 255.0).clamp(0.0, 255.0) as u8;
+
+            result.put_pixel(x, y, Rgb([r_final, g_final, b_final]));
+        }
+    }
+
+    result
+}
 
 /// Configuration for tiled detection
 struct TileConfig {
@@ -114,7 +197,7 @@ fn extract_tiles(img: &RgbImage, config: &TileConfig) -> Vec<Tile> {
             let cropped = image::imageops::crop_imm(img, x, y, crop_width, crop_height).to_image();
 
             // If tile is smaller than expected size, pad it to 640x640
-            let tile = if crop_width < config.tile_size || crop_height < config.tile_size {
+            let mut tile = if crop_width < config.tile_size || crop_height < config.tile_size {
                 let mut padded = RgbImage::new(config.tile_size, config.tile_size);
                 // Fill with gray background
                 for pixel in padded.pixels_mut() {
@@ -126,6 +209,9 @@ fn extract_tiles(img: &RgbImage, config: &TileConfig) -> Vec<Tile> {
             } else {
                 cropped
             };
+
+            // Apply shadow removal to the tile
+            tile = remove_shadows_hsv(&tile);
 
             Tile {
                 image: tile,
@@ -229,15 +315,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let img_height = original_img.height();
     println!("✓ ({}x{})", img_width, img_height);
 
-    // Stage 2: Extract overlapping 640x640 tiles
-    print!("🔲 Extracting overlapping tiles... ");
+    // Stage 2: Extract overlapping 640x640 tiles with shadow removal
+    print!("🔲 Extracting overlapping tiles (with HSV shadow removal)... ");
+    let start_tiles = Instant::now();
     let tile_config = TileConfig::new(img_width, img_height, 64); // 64px overlap
     let tiles = extract_tiles(&original_img, &tile_config);
     println!(
-        "✓ ({} tiles, {}x{} YOLO native resolution)",
+        "✓ ({} tiles, {}x{} YOLO native resolution, {:.1}ms)",
         tiles.len(),
         tile_config.tile_size,
-        tile_config.tile_size
+        tile_config.tile_size,
+        start_tiles.elapsed().as_secs_f32() * 1000.0
     );
 
     // Save tiles for inspection
@@ -245,12 +333,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tile.image.save(format!("output_tile_{}.jpg", idx))?;
     }
 
-    // Stage 3: Load detector
-    print!("📦 Loading YOLO model on GPU... ");
+    // Stage 3: Create detector pool with workers and batch executor
+    print!("📦 Creating detector pool with batch executor on GPU... ");
     let start_load = Instant::now();
 
-    let config = DetectorConfig {
-        model_path: "../models/yolov8m_world_detector.onnx".to_string(),
+    let num_workers = 2; // Number of worker threads submitting commands
+    let batch_config = BatchConfig {
+        batch_size: 4,  // Process up to 4 tiles in parallel
+        timeout_ms: 50, // Wait max 50ms for batch to fill
+    };
+
+    let detector_config = DetectorConfig {
+        model_path: "../models/yolov8m_batch_fp16.onnx".to_string(),
         confidence_threshold: 0.22, // 22% confidence threshold
         nms_threshold: 0.45,
         input_size: (tile_config.tile_size, tile_config.tile_size), // 640x640
@@ -258,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let mut detector = MilitaryTargetDetector::new(config)?;
+    let pool = DetectorPool::new(num_workers, detector_config, batch_config.clone())?;
     println!("✓ ({:.2}s)", start_load.elapsed().as_secs_f32());
 
     // Define allowed classes: car(2), motorcycle(3), airplane(4), truck(7)
@@ -275,17 +369,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  • Overlap: {}px", tile_config.overlap);
     println!("  • Total tiles: {}", tiles.len());
+    println!("  • Workers: {}", num_workers);
+    println!("  • Batch size: {}", batch_config.batch_size);
+    println!("  • Batch timeout: {}ms", batch_config.timeout_ms);
 
-    // Stage 4: Run detection on each tile sequentially
-    println!("\n🚀 Running detection on tiles...");
+    // Stage 4: Run detection on all tiles using batch executor (parallel GPU execution)
+    println!("\n🚀 Running detection on tiles (batch processing)...");
     let start_detect = Instant::now();
 
     let mut all_detections: Vec<TileDetection> = Vec::new();
 
-    for (tile_idx, tile) in tiles.iter().enumerate() {
-        print!("  Tile {}/{}... ", tile_idx + 1, tiles.len());
-        let tile_start = Instant::now();
+    // Submit all tiles to worker pool and collect response receivers
+    let mut responses = Vec::new();
 
+    for (tile_idx, tile) in tiles.iter().enumerate() {
         // Convert tile to ImageData
         let mut tile_data = Vec::new();
         for pixel in tile.image.pixels() {
@@ -301,8 +398,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ImageFormat::RGB,
         );
 
-        // Run detection
-        let detections = detector.detect(&image_data)?;
+        // Submit to pool (non-blocking)
+        let response_rx = pool.detect_async(image_data);
+        responses.push((tile_idx, response_rx, Instant::now()));
+    }
+
+    println!("  ✓ Submitted {} tiles to worker pool", tiles.len());
+
+    // Collect results as they complete
+    for (tile_idx, response_rx, tile_start) in responses {
+        print!("  Tile {}/{}... ", tile_idx + 1, tiles.len());
+
+        let detections = response_rx
+            .recv()
+            .map_err(|e| format!("Failed to receive: {}", e))?
+            .map_err(|e| format!("Detection failed: {}", e))?;
+
         let tile_time = tile_start.elapsed().as_secs_f32();
         let tile_fps = 1.0 / tile_time;
         println!(
@@ -314,6 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Transform coordinates from tile space to original image space
         // Filter by allowed classes
+        let tile = &tiles[tile_idx];
         for det in detections {
             let class_id = det.class.id();
 
@@ -393,7 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Stage 8: Draw bounding boxes on the original image
-    print!("🎨 Drawing bounding boxes... ");
+    print!("🎨 Drawing bounding boxes... \n");
     let mut annotated_img = original_img.clone();
 
     for (i, det) in merged_detections.iter().enumerate() {
