@@ -198,6 +198,23 @@ impl TrackedObject {
 
     /// Update with new detection
     pub fn update(&mut self, detection: &TileDetection) {
+        // Compute velocity from position change if we have a previous detection
+        let dt = self.last_seen.elapsed().as_secs_f32();
+
+        if dt > 0.001 {
+            // Manually compute and set velocity in Kalman state from position difference
+            let dx = (detection.x + detection.w / 2.0)
+                - (self.last_detection.x + self.last_detection.w / 2.0);
+            let dy = (detection.y + detection.h / 2.0)
+                - (self.last_detection.y + self.last_detection.h / 2.0);
+            let vx = dx / dt;
+            let vy = dy / dt;
+
+            // Directly set velocity in Kalman state (indices 4 and 5)
+            self.kalman.state[4] = vx;
+            self.kalman.state[5] = vy;
+        }
+
         self.kalman.update(detection);
         self.last_detection = detection.clone();
         self.last_seen = Instant::now();

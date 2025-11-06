@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse confidence threshold and class filter
     let mut confidence_threshold = 0.50; // Default 50%
-    let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 5, 7]; // person, car, motorcycle, airplane, bus, truck
+    let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, bus, truck
     let mut arg_idx = 1;
 
     // Parse --confidence parameter
@@ -150,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     io::stderr().flush()?;
     let detector_type = DetectorType::RTDETR;
     let num_workers = 4;
-    let batch_size = 2;
+    let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
     let detector_config = DetectorConfig {
         fp16_model_path: Some("../models/rtdetr_v2_r18vd_batch.onnx".to_string()),
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let batch_config = BatchConfig {
         batch_size,
-        timeout_ms: 50,
+        timeout_ms: 5, // Very short timeout since frames arrive ~400ms apart (no batching possible)
     };
 
     let detector_pool = Arc::new(DetectorPool::new(
@@ -196,8 +196,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rt_pipeline = RealtimePipeline::new(Arc::clone(&pipeline), rt_config);
 
-    // Create single shared Kalman tracker (simple, synchronous approach)
-    let mut kalman_tracker = MultiObjectTracker::new(KalmanConfig::default());
+    // Create single shared Kalman tracker with 500ms track timeout
+    let kalman_config = KalmanConfig {
+        max_age_ms: 500, // Keep tracks for 500ms without real detections
+        ..Default::default()
+    };
+    let mut kalman_tracker = MultiObjectTracker::new(kalman_config);
 
     eprintln!("  ✓ Pipeline ready");
     eprintln!("\n💡 Configuration:");
@@ -206,7 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  • Batch size: {}", batch_size);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
     eprintln!("  • Classes: {:?}", allowed_classes);
-    eprintln!("  • Kalman tracker: Single synchronous tracker");
+    eprintln!("  • Kalman tracker: 0.5s track timeout");
     eprintln!("  • Output FPS: {:.1} (matching input)", fps);
     eprintln!("  • Max latency for extrapolation: 500ms");
 
@@ -224,8 +228,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
     highgui::resize_window("Detection", 1280, 720)?;
 
-    // Display update interval: update window every N frames to maintain real-time speed
-    let display_interval = 5; // Update display every 5 frames
+    // Display update interval: update window every frame for smooth playback
+    let display_interval = 1; // Update display every frame
 
     let mut frame_id = 0_u64;
     let mut paused = false;
@@ -245,7 +249,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_kalman_update = Instant::now();
 
     eprintln!(
-        "📝 Simple strategy: RT-DETR every 40th frame, Kalman predictions for smooth output\n",
+        "📝 Detection strategy: Submit frames whenever pipeline has capacity (max {} pending)\n",
+        max_pending
     );
     io::stderr().flush()?;
 
@@ -322,10 +327,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 stats_processed += 1;
 
-                // Update Kalman tracker with real detections (synchronous)
-                let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
+                // Update Kalman tracker with real detections
+                // Use dt since last real detection update (not last frame)
+                let dt = result
+                    .timestamp
+                    .duration_since(last_kalman_update)
+                    .as_secs_f32();
                 kalman_tracker.update(&result.detections, dt);
-                last_kalman_update = frame_start;
+                last_kalman_update = result.timestamp;
             }
             stats_latency_sum += result.latency_ms;
 
@@ -334,18 +343,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pending_count = pending_count.saturating_sub(1);
         }
 
-        // Predict Kalman tracker forward for current frame (even without new detections)
-        let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
-        if dt > 0.001 {
-            // Only predict if time has passed
-            kalman_tracker.update(&[], dt); // Empty detections = prediction only
-            last_kalman_update = frame_start;
-        }
-
-        // Submit detection for every 40th frame (RT-DETR on CPU is ~0.3-0.4 FPS)
-        let should_detect = frame_id % 40 == 0;
-
-        if should_detect && pending_count < max_pending {
+        // Submit detection whenever we have available pipeline capacity
+        // The pending_count mechanism prevents queue buildup automatically
+        if pending_count < max_pending {
             let frame = Frame {
                 frame_id,
                 image: rgb_image.clone(),
@@ -357,6 +357,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Get current Kalman predictions for display (synchronous read)
+        // Predict forward to current frame time just before getting predictions
+        let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
+        if dt > 0.001 {
+            kalman_tracker.update(&[], dt);
+            last_kalman_update = frame_start;
+        }
         let kalman_predictions = kalman_tracker.get_predictions();
 
         // Annotate current frame with Kalman predictions

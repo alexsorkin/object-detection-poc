@@ -272,12 +272,12 @@ impl RTDETRDetector {
                 .try_extract_array::<f32>()
                 .map_err(|e| DetectionError::postprocessing(e.to_string()))?
                 .into_owned();
-            
+
             let boxes = outputs[1]
                 .try_extract_array::<f32>()
                 .map_err(|e| DetectionError::postprocessing(e.to_string()))?
                 .into_owned();
-            
+
             (boxes, logits)
         } else {
             // Ultralytics format: combined [1, 300, 84] where 84 = 4 (bbox) + 80 (classes)
@@ -291,10 +291,10 @@ impl RTDETRDetector {
             let num_queries = shape[1];
             let total_dim = shape[2];
             let num_classes = total_dim - 4;
-            
+
             let mut pred_boxes = Array::zeros((batch_size, num_queries, 4));
             let mut pred_logits = Array::zeros((batch_size, num_queries, num_classes));
-            
+
             for b in 0..batch_size {
                 for q in 0..num_queries {
                     for i in 0..4 {
@@ -305,7 +305,7 @@ impl RTDETRDetector {
                     }
                 }
             }
-            
+
             (pred_boxes.into_dyn(), pred_logits.into_dyn())
         };
 
@@ -375,12 +375,12 @@ impl RTDETRDetector {
                 .try_extract_array::<f32>()
                 .map_err(|e| DetectionError::postprocessing(e.to_string()))?
                 .into_owned();
-            
+
             let boxes = outputs[1]
                 .try_extract_array::<f32>()
                 .map_err(|e| DetectionError::postprocessing(e.to_string()))?
                 .into_owned();
-            
+
             (boxes, logits)
         } else {
             // Ultralytics format: combined [batch, 300, 84]
@@ -394,10 +394,10 @@ impl RTDETRDetector {
             let num_queries = shape[1];
             let total_dim = shape[2];
             let num_classes = total_dim - 4;
-            
+
             let mut pred_boxes = Array::zeros((actual_batch_size, num_queries, 4));
             let mut pred_logits = Array::zeros((actual_batch_size, num_queries, num_classes));
-            
+
             for b in 0..actual_batch_size {
                 for q in 0..num_queries {
                     for i in 0..4 {
@@ -408,7 +408,7 @@ impl RTDETRDetector {
                     }
                 }
             }
-            
+
             (pred_boxes.into_dyn(), pred_logits.into_dyn())
         };
 
@@ -523,25 +523,52 @@ impl RTDETRDetector {
             let w = pred_boxes[[0, i, 2]];
             let h = pred_boxes[[0, i, 3]];
 
-            // Find class with highest score (apply softmax to logits)
-            let mut max_score = f32::NEG_INFINITY;
-            let mut max_class = 0;
+            // Find class with highest score and apply softmax to convert logits to probabilities
+            let mut logits = Vec::with_capacity(num_classes);
+            let mut max_logit = f32::NEG_INFINITY;
 
+            // Collect logits and find max for numerical stability
             for c in 0..num_classes {
                 let logit = pred_logits[[0, i, c]];
-                if logit > max_score {
-                    max_score = logit;
+                logits.push(logit);
+                if logit > max_logit {
+                    max_logit = logit;
+                }
+            }
+
+            // Apply softmax: exp(logit - max_logit) / sum(exp(logit - max_logit))
+            let mut exp_sum = 0.0_f32;
+            for logit in &logits {
+                exp_sum += (logit - max_logit).exp();
+            }
+
+            // Find class with highest probability
+            let mut max_score = f32::NEG_INFINITY;
+            let mut max_class = 0;
+            for c in 0..num_classes {
+                let prob = (logits[c] - max_logit).exp() / exp_sum;
+                if prob > max_score {
+                    max_score = prob;
                     max_class = c;
                 }
             }
 
-            // Convert logit to probability (simplified - just use sigmoid)
-            let confidence = 1.0 / (1.0 + (-max_score).exp());
+            // max_score is now a proper probability (0-1) after softmax
+            let confidence = max_score;
 
             // Filter by confidence threshold
             if confidence < self.config.confidence_threshold {
+                debug!(
+                    "Filtered detection: class={}, conf={:.3}, threshold={:.3}",
+                    max_class, confidence, self.config.confidence_threshold
+                );
                 continue;
             }
+
+            debug!(
+                "Accepted detection: class={}, conf={:.3}, threshold={:.3}",
+                max_class, confidence, self.config.confidence_threshold
+            );
 
             // Convert from (cx, cy, w, h) normalized to absolute pixels
             let x_center = cx * orig_w as f32;
