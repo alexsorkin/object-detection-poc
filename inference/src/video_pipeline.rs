@@ -1,11 +1,11 @@
+use crate::frame_pipeline::{DetectionPipeline, TileDetection};
 /// Video processing pipeline with async detection and Kalman filter extrapolation
-/// 
+///
 /// Handles real-time video streams with:
 /// - Async frame detection with backpressure
 /// - Kalman filter for temporal tracking
 /// - Extrapolation when detection latency is high
 use crate::kalman_tracker::{KalmanConfig, MultiObjectTracker};
-use crate::frame_pipeline::{DetectionPipeline, TileDetection};
 use crossbeam::channel::{bounded, Receiver, Sender};
 use image::RgbImage;
 use std::sync::Arc;
@@ -236,8 +236,8 @@ impl VideoPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch_executor::{BatchConfig, BatchExecutor};
     use crate::detector_trait::DetectorType;
+    use crate::frame_executor::{ExecutorConfig, FrameExecutor};
     use crate::frame_pipeline::{DetectionPipeline, PipelineConfig};
     use crate::types::DetectorConfig;
     use std::sync::Arc;
@@ -247,21 +247,17 @@ mod tests {
     fn test_realtime_pipeline() {
         env_logger::init();
 
-        // Create batch executor
+        // Create frame executor
         let detector_config = DetectorConfig::default();
-        let batch_config = BatchConfig {
-            batch_size: 1,
-            timeout_ms: 50,
-            max_queue_depth: 2,
-        };
+        let executor_config = ExecutorConfig { max_queue_depth: 2 };
 
-        let batch_executor = Arc::new(
-            BatchExecutor::new(DetectorType::RTDETR, detector_config, batch_config).unwrap(),
+        let frame_executor = Arc::new(
+            FrameExecutor::new(DetectorType::RTDETR, detector_config, executor_config).unwrap(),
         );
 
         // Create pipeline
         let pipeline_config = PipelineConfig::default();
-        let pipeline = Arc::new(DetectionPipeline::new(batch_executor, pipeline_config));
+        let pipeline = Arc::new(DetectionPipeline::new(frame_executor, pipeline_config));
 
         // Create video pipeline
         let config = VideoPipelineConfig::default();

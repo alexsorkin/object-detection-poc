@@ -18,8 +18,8 @@
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --classes 0,2,5,7 test_data/airport.mp4
 use image::{Rgb, RgbImage};
-use military_target_detector::batch_executor::{BatchConfig, BatchExecutor};
 use military_target_detector::detector_trait::DetectorType;
+use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
 use military_target_detector::kalman_tracker::{KalmanConfig, MultiObjectTracker};
@@ -154,17 +154,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let batch_config = BatchConfig {
-        batch_size,
-        timeout_ms: 5, // Very short timeout since frames arrive ~400ms apart (no batching possible)
+    let executor_config = ExecutorConfig {
         max_queue_depth: 2, // Drop frames if more than 2 pending (backpressure control)
     };
-    let max_queue_depth = batch_config.max_queue_depth; // Save before move
+    let max_queue_depth = executor_config.max_queue_depth; // Save before move
 
-    let batch_executor = Arc::new(BatchExecutor::new(
+    let frame_executor = Arc::new(FrameExecutor::new(
         detector_type,
         detector_config,
-        batch_config,
+        executor_config,
     )?);
 
     // Create detection pipeline
@@ -175,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pipeline = Arc::new(DetectionPipeline::new(
-        Arc::clone(&batch_executor),
+        Arc::clone(&frame_executor),
         pipeline_config,
     ));
 
@@ -235,11 +233,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stats_extrapolated = 0_u32;
     let mut stats_latency_sum = 0.0_f32;
     let stats_start = Instant::now();
-
-    // Strategy: Only submit if result queue is not backed up
-    // This prevents overwhelming the pipeline and allows Kalman to work
-    let max_pending = 2; // Only allow 2 frames in flight at a time
-    let mut pending_count = 0_usize;
     let mut last_kalman_update = Instant::now();
 
     // FPS pacing: Calculate target frame duration to match video's native FPS
@@ -247,8 +240,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut next_frame_time = Instant::now();
 
     eprintln!(
-        "📝 Detection strategy: Submit frames whenever pipeline has capacity (max {} pending)\n",
-        max_pending
+        "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})\n",
+        max_queue_depth
     );
     io::stderr().flush()?;
 
@@ -342,29 +335,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_kalman_update = current_time;
             }
             stats_latency_sum += result.latency_ms;
-
-            pending_count = pending_count.saturating_sub(1);
         }
 
-        // Submit detection whenever we have available pipeline capacity
-        // The pending_count mechanism prevents queue buildup automatically
-        if pending_count < max_pending {
-            let frame = Frame {
-                frame_id,
-                image: rgb_image.clone(),
-                timestamp: frame_start,
-            };
-            if video_pipeline.try_submit_frame(frame) {
-                pending_count += 1;
-            }
-        }
-
-        // ALWAYS predict Kalman forward to current frame time (moving window)
-        let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
-        if dt > 0.001 {
-            kalman_tracker.update(&[], dt);
-            last_kalman_update = frame_start;
-        }
+        // Submit frame - executor handles backpressure internally
+        let frame = Frame {
+            frame_id,
+            image: rgb_image.clone(),
+            timestamp: frame_start,
+        };
+        video_pipeline.try_submit_frame(frame);
 
         // Get current Kalman predictions (may be empty if no tracks yet)
         let detections_to_display = kalman_tracker.get_predictions();

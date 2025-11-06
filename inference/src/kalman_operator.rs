@@ -1,6 +1,6 @@
-/// Singleton Kalman tracker with command queue
+/// Kalman Operator - Singleton tracker with command queue
 ///
-/// Provides a global singleton tracker instance with:
+/// Provides a global operator instance with:
 /// - Command queue for async updates from detector
 /// - Query interface for predictions
 /// - Single thread processing updates
@@ -9,7 +9,8 @@ use crate::kalman_tracker::MultiObjectTracker;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-/// Commands that can be sent to the Kalman tracker
+
+/// Commands that can be sent to the Kalman operator
 #[derive(Debug)]
 pub enum KalmanCommand {
     /// Update tracker with new detections
@@ -23,17 +24,17 @@ pub enum KalmanCommand {
     Shutdown,
 }
 
-/// Singleton Kalman tracker instance
-pub struct KalmanSingleton {
+/// Kalman Operator - manages tracking state with async command processing
+pub struct KalmanOperator {
     command_tx: Sender<KalmanCommand>,
     tracker: Arc<Mutex<MultiObjectTracker>>,
     _worker_handle: Option<thread::JoinHandle<()>>,
 }
 
-static KALMAN_INSTANCE: OnceLock<Arc<Mutex<KalmanSingleton>>> = OnceLock::new();
+static KALMAN_INSTANCE: OnceLock<Arc<Mutex<KalmanOperator>>> = OnceLock::new();
 
-impl KalmanSingleton {
-    /// Initialize the global singleton tracker
+impl KalmanOperator {
+    /// Initialize the global operator instance
     pub fn init(tracker_config: crate::kalman_tracker::KalmanConfig) -> Arc<Mutex<Self>> {
         KALMAN_INSTANCE
             .get_or_init(|| {
@@ -130,7 +131,7 @@ impl KalmanSingleton {
     }
 }
 
-impl Drop for KalmanSingleton {
+impl Drop for KalmanOperator {
     fn drop(&mut self) {
         self.shutdown();
         if let Some(handle) = self._worker_handle.take() {

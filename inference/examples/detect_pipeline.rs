@@ -6,7 +6,7 @@
 /// 3. Post-processing: NMS + nested detection filtering + coordinate merging
 ///
 /// The batch executor is shared and can be reused across multiple images.
-/// Frames are enqueued directly to the BatchExecutor which batches them for GPU.
+/// Frames are enqueued directly to the FrameExecutor which processes them one at a time.
 ///
 /// Usage:
 ///   cargo run --release --features metal --example detect_pipeline [--detector yolov8|rtdetr] [--confidence %%] <image_path> [output_path]
@@ -17,8 +17,8 @@
 ///   cargo run --release --features metal --example detect_pipeline -- --detector rtdetr --confidence 35 test_data/my_image.jpg output.jpg
 ///   cargo run --release --features metal --example detect_pipeline -- --confidence 50
 use image::ImageReader;
-use military_target_detector::batch_executor::{BatchConfig, BatchExecutor};
 use military_target_detector::detector_trait::DetectorType;
+use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
 use military_target_detector::types::DetectorConfig;
@@ -103,17 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let img_height = original_img.height();
     println!("✓ ({}x{})", img_width, img_height);
 
-    // Create SHARED batch executor (can be reused for many images)
-    print!("📦 Creating batch executor... ");
+    // Create SHARED frame executor (can be reused for many images)
+    print!("📦 Creating frame executor... ");
     let start_load = Instant::now();
 
-    let batch_size = 5;
-    let batch_config = BatchConfig {
-        batch_size,
-        timeout_ms: 50,
+    let executor_config = ExecutorConfig {
         max_queue_depth: 10, // Allow more queued tiles for single image processing
     };
-    let max_queue_depth = batch_config.max_queue_depth; // Save before move
+    let max_queue_depth = executor_config.max_queue_depth; // Save before move
 
     // Platform-specific model selection:
     // - NVIDIA (CUDA/TensorRT): Use FP16 for 2-3x speedup
@@ -162,14 +159,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let detector_pool = Arc::new(BatchExecutor::new(
+    let frame_executor = Arc::new(FrameExecutor::new(
         detector_type,
         detector_config,
-        batch_config,
+        executor_config,
     )?);
     println!("✓ ({:.2}s)", start_load.elapsed().as_secs_f32());
 
-    let (tile_width, tile_height) = detector_pool.input_size();
+    let (tile_width, tile_height) = frame_executor.input_size();
 
     // Calculate expected tiles with detector-specific overlap
     let overlap = match detector_type {
@@ -218,11 +215,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_tiles, tiles_x, tiles_y, overlap
     );
     println!(
-        "   • Batch size: {} (GPU processes {} tiles in parallel)",
-        batch_size,
-        batch_size.min(total_tiles)
-    );
-    println!(
         "   • Queue depth: {} (backpressure control)",
         max_queue_depth
     );
@@ -231,15 +223,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         confidence_threshold * 100.0
     );
     println!(
-        "   • Architecture: {} tiles → BatchExecutor → GPU batch inference",
+        "   • Architecture: {} tiles → FrameExecutor → GPU inference",
         total_tiles
     );
-    println!("   • Batch executor is shared and can process multiple images\n");
+    println!("   • Frame executor is shared and can process multiple images\n");
 
-    // Create pipeline with shared detector pool
+    // Create pipeline with shared frame executor
     println!("🔧 Building detection pipeline:");
     println!("  • Stage 1: Preprocess (tile extraction + shadow removal)");
-    println!("  • Stage 2: Execution (batch detection via batch executor)");
+    println!("  • Stage 2: Execution (frame detection via frame executor)");
     println!("  • Stage 3: Postprocess (NMS + nested filtering + coordinate merging)");
 
     let pipeline_config = PipelineConfig {
@@ -248,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         iou_threshold: 0.5,
     };
 
-    let pipeline = DetectionPipeline::new(Arc::clone(&detector_pool), pipeline_config);
+    let pipeline = DetectionPipeline::new(Arc::clone(&frame_executor), pipeline_config);
     println!("  ✓ Pipeline ready\n");
 
     // Process single image through pipeline

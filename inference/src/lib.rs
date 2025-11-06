@@ -23,13 +23,12 @@
 //! ```
 
 // Detector implementation
-pub mod batch_executor;
-// pub mod detector_pool; // Removed: frames now enqueue directly to batch_executor
 pub mod detector_rtdetr;
 pub mod detector_trait;
 pub mod detector_yolov8;
+pub mod frame_executor;
 pub mod frame_pipeline;
-pub mod kalman_pool;
+pub mod kalman_operator;
 pub mod kalman_tracker;
 pub mod video_pipeline;
 

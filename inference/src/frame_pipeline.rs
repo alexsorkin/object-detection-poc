@@ -2,9 +2,9 @@
 /// 
 /// Processes single frames through:
 /// 1. Pre-processing: Tile extraction + shadow removal
-/// 2. Execution: Batch detection via BatchExecutor
+/// 2. Execution: Frame-by-frame detection via FrameExecutor
 /// 3. Post-processing: NMS + coordinate merging
-use crate::batch_executor::BatchExecutor;
+use crate::frame_executor::FrameExecutor;
 use crate::types::{ImageData, ImageFormat};
 use image::{Rgb, RgbImage};
 use opencv::{
@@ -400,21 +400,21 @@ impl PreprocessStage {
     }
 }
 
-/// Execution stage: Run detection on tiles using batch executor
+/// Execution stage: Run detection on tiles using frame executor
 pub struct ExecutionStage {
-    batch_executor: Arc<BatchExecutor>,
+    frame_executor: Arc<FrameExecutor>,
     tile_size: u32,
     allowed_classes: Vec<u32>,
 }
 
 impl ExecutionStage {
     pub fn new(
-        batch_executor: Arc<BatchExecutor>,
+        frame_executor: Arc<FrameExecutor>,
         tile_size: u32,
         allowed_classes: Vec<u32>,
     ) -> Self {
         Self {
-            batch_executor,
+            frame_executor,
             tile_size,
             allowed_classes,
         }
@@ -445,7 +445,7 @@ impl ExecutionStage {
             );
 
             let tile_start = Instant::now();
-            let response_rx = self.batch_executor.detect_async(image_data);
+            let response_rx = self.frame_executor.detect_async(image_data);
             
             // Only add to responses if frame wasn't dropped due to backpressure
             if let Some(rx) = response_rx {
@@ -708,13 +708,13 @@ pub struct DetectionPipeline {
 }
 
 impl DetectionPipeline {
-    /// Create a new detection pipeline with batch executor
-    pub fn new(batch_executor: Arc<BatchExecutor>, config: PipelineConfig) -> Self {
+    /// Create a new detection pipeline with frame executor
+    pub fn new(frame_executor: Arc<FrameExecutor>, config: PipelineConfig) -> Self {
         // Get tile size from detector's input size
-        let (tile_size, _) = batch_executor.input_size();
+        let (tile_size, _) = frame_executor.input_size();
 
         let preprocess = PreprocessStage::new(tile_size, config.overlap);
-        let execution = ExecutionStage::new(batch_executor, tile_size, config.allowed_classes);
+        let execution = ExecutionStage::new(frame_executor, tile_size, config.allowed_classes);
         let postprocess = PostprocessStage::new(config.iou_threshold);
 
         Self {
