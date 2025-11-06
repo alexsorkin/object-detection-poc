@@ -1,5 +1,10 @@
-/// Detection pipeline with pre-processing, execution, and post-processing stages
-use crate::detector_pool::DetectorPool;
+/// Frame detection pipeline with pre-processing, execution, and post-processing stages
+/// 
+/// Processes single frames through:
+/// 1. Pre-processing: Tile extraction + shadow removal
+/// 2. Execution: Batch detection via BatchExecutor
+/// 3. Post-processing: NMS + coordinate merging
+use crate::batch_executor::BatchExecutor;
 use crate::types::{ImageData, ImageFormat};
 use image::{Rgb, RgbImage};
 use opencv::{
@@ -395,21 +400,21 @@ impl PreprocessStage {
     }
 }
 
-/// Execution stage: Run detection on tiles using shared detector pool
+/// Execution stage: Run detection on tiles using batch executor
 pub struct ExecutionStage {
-    detector_pool: Arc<DetectorPool>,
+    batch_executor: Arc<BatchExecutor>,
     tile_size: u32,
     allowed_classes: Vec<u32>,
 }
 
 impl ExecutionStage {
     pub fn new(
-        detector_pool: Arc<DetectorPool>,
+        batch_executor: Arc<BatchExecutor>,
         tile_size: u32,
         allowed_classes: Vec<u32>,
     ) -> Self {
         Self {
-            detector_pool,
+            batch_executor,
             tile_size,
             allowed_classes,
         }
@@ -421,7 +426,7 @@ impl ExecutionStage {
 
         let mut all_detections = Vec::new();
 
-        // Submit all tiles to shared detector pool
+        // Submit all tiles to batch executor
         let mut responses = Vec::new();
         let submit_start = Instant::now();
         for tile in &input.tiles {
@@ -440,8 +445,14 @@ impl ExecutionStage {
             );
 
             let tile_start = Instant::now();
-            let response_rx = self.detector_pool.detect_async(image_data);
-            responses.push((tile.tile_idx, tile.offset_x, tile.offset_y, response_rx, tile_start));
+            let response_rx = self.batch_executor.detect_async(image_data);
+            
+            // Only add to responses if frame wasn't dropped due to backpressure
+            if let Some(rx) = response_rx {
+                responses.push((tile.tile_idx, tile.offset_x, tile.offset_y, rx, tile_start));
+            } else {
+                log::warn!("⚠️  Tile {} dropped due to detector backpressure", tile.tile_idx);
+            }
         }
         let submit_time = submit_start.elapsed();
 
@@ -697,13 +708,13 @@ pub struct DetectionPipeline {
 }
 
 impl DetectionPipeline {
-    /// Create a new detection pipeline with shared detector pool
-    pub fn new(detector_pool: Arc<DetectorPool>, config: PipelineConfig) -> Self {
+    /// Create a new detection pipeline with batch executor
+    pub fn new(batch_executor: Arc<BatchExecutor>, config: PipelineConfig) -> Self {
         // Get tile size from detector's input size
-        let (tile_size, _) = detector_pool.input_size();
+        let (tile_size, _) = batch_executor.input_size();
 
         let preprocess = PreprocessStage::new(tile_size, config.overlap);
-        let execution = ExecutionStage::new(detector_pool, tile_size, config.allowed_classes);
+        let execution = ExecutionStage::new(batch_executor, tile_size, config.allowed_classes);
         let postprocess = PostprocessStage::new(config.iou_threshold);
 
         Self {

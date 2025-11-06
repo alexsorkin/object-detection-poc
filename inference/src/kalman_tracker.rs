@@ -1,5 +1,5 @@
-/// Kalman filter-based object tracking for temporal prediction and extrapolation
-use crate::pipeline::TileDetection;
+/// Kalman filter-based multi-object tracker with Hungarian matching
+use crate::frame_pipeline::TileDetection;
 use nalgebra::{Matrix4, Matrix4x6, Matrix6, Vector4, Vector6};
 use std::time::Instant;
 

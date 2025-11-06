@@ -1,98 +1,140 @@
-/// Dedicated worker pool for Kalman filter predictions
-/// This allows fast parallel extrapolation without blocking on slow detection pipeline
+/// Singleton Kalman tracker with command queue
+///
+/// Provides a global singleton tracker instance with:
+/// - Command queue for async updates from detector
+/// - Query interface for predictions
+/// - Single thread processing updates
+use crate::frame_pipeline::TileDetection;
 use crate::kalman_tracker::MultiObjectTracker;
-use crate::pipeline::TileDetection;
-use crossbeam::channel::{bounded, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
-
-pub struct KalmanJob {
-    pub frame_id: u64,
-    pub timestamp: Instant,
-    pub dt: f32, // Time delta for prediction
+/// Commands that can be sent to the Kalman tracker
+#[derive(Debug)]
+pub enum KalmanCommand {
+    /// Update tracker with new detections
+    Update {
+        detections: Vec<TileDetection>,
+        dt: f32,
+    },
+    /// Predict forward in time without detections
+    Predict { dt: f32 },
+    /// Shutdown the tracker thread
+    Shutdown,
 }
 
-pub struct KalmanResult {
-    pub frame_id: u64,
-    pub timestamp: Instant,
-    pub detections: Vec<TileDetection>,
-    pub latency_ms: f32,
+/// Singleton Kalman tracker instance
+pub struct KalmanSingleton {
+    command_tx: Sender<KalmanCommand>,
+    tracker: Arc<Mutex<MultiObjectTracker>>,
+    _worker_handle: Option<thread::JoinHandle<()>>,
 }
 
-/// Pool of workers for fast Kalman predictions
-pub struct KalmanPool {
-    job_tx: Sender<KalmanJob>,
-    result_rx: Receiver<KalmanResult>,
-    _workers: Vec<thread::JoinHandle<()>>,
-}
+static KALMAN_INSTANCE: OnceLock<Arc<Mutex<KalmanSingleton>>> = OnceLock::new();
 
-impl KalmanPool {
-    /// Create a new Kalman worker pool
-    pub fn new(num_workers: usize, tracker: Arc<Mutex<MultiObjectTracker>>) -> Self {
-        let (job_tx, job_rx) = bounded::<KalmanJob>(num_workers * 2);
-        let (result_tx, result_rx) = bounded::<KalmanResult>(num_workers * 2);
+impl KalmanSingleton {
+    /// Initialize the global singleton tracker
+    pub fn init(tracker_config: crate::kalman_tracker::KalmanConfig) -> Arc<Mutex<Self>> {
+        KALMAN_INSTANCE
+            .get_or_init(|| {
+                let tracker = Arc::new(Mutex::new(MultiObjectTracker::new(tracker_config)));
+                let (command_tx, command_rx) = channel::<KalmanCommand>();
 
-        let mut workers = Vec::new();
+                let tracker_clone = Arc::clone(&tracker);
+                let worker_handle = thread::spawn(move || {
+                    Self::command_processor(tracker_clone, command_rx);
+                });
 
-        for worker_id in 0..num_workers {
-            let job_rx = job_rx.clone();
-            let result_tx = result_tx.clone();
-            let tracker = Arc::clone(&tracker);
+                Arc::new(Mutex::new(Self {
+                    command_tx,
+                    tracker,
+                    _worker_handle: Some(worker_handle),
+                }))
+            })
+            .clone()
+    }
 
-            let handle = thread::spawn(move || {
-                log::debug!("Kalman worker {} started", worker_id);
+    /// Get the global singleton instance (must be initialized first)
+    pub fn instance() -> Option<Arc<Mutex<Self>>> {
+        KALMAN_INSTANCE.get().cloned()
+    }
 
-                while let Ok(job) = job_rx.recv() {
-                    let start = Instant::now();
+    /// Send update command (non-blocking)
+    pub fn send_update(&self, detections: Vec<TileDetection>, dt: f32) -> Result<(), String> {
+        self.command_tx
+            .send(KalmanCommand::Update { detections, dt })
+            .map_err(|e| format!("Failed to send update: {}", e))
+    }
 
-                    // Lock tracker, get predictions
-                    let detections = {
-                        let mut tracker = tracker.lock().unwrap();
-                        // Update tracker time-based prediction
-                        tracker.update(&[], job.dt);
-                        tracker.get_predictions()
-                    };
+    /// Send predict command (non-blocking)
+    pub fn send_predict(&self, dt: f32) -> Result<(), String> {
+        self.command_tx
+            .send(KalmanCommand::Predict { dt })
+            .map_err(|e| format!("Failed to send predict: {}", e))
+    }
 
-                    let latency = start.elapsed().as_secs_f32() * 1000.0;
+    /// Get current predictions (synchronous query, fast)
+    pub fn get_predictions(&self) -> Vec<TileDetection> {
+        let tracker = self.tracker.lock().unwrap();
+        tracker.get_predictions()
+    }
 
-                    let result = KalmanResult {
-                        frame_id: job.frame_id,
-                        timestamp: job.timestamp,
-                        detections,
-                        latency_ms: latency,
-                    };
+    /// Shutdown the tracker thread
+    pub fn shutdown(&self) {
+        let _ = self.command_tx.send(KalmanCommand::Shutdown);
+    }
 
-                    if result_tx.send(result).is_err() {
-                        break;
+    /// Command processor thread - subscribes to queue and updates tracker
+    fn command_processor(
+        tracker: Arc<Mutex<MultiObjectTracker>>,
+        command_rx: Receiver<KalmanCommand>,
+    ) {
+        log::info!("Kalman tracker command processor started");
+        let mut commands_processed = 0_u64;
+
+        loop {
+            match command_rx.recv() {
+                Ok(KalmanCommand::Update { detections, dt }) => {
+                    let mut tracker = tracker.lock().unwrap();
+                    tracker.update(&detections, dt);
+                    commands_processed += 1;
+
+                    if commands_processed % 100 == 0 {
+                        log::debug!(
+                            "Kalman processed {} updates, {} active tracks",
+                            commands_processed,
+                            tracker.get_predictions().len()
+                        );
                     }
                 }
-
-                log::debug!("Kalman worker {} stopped", worker_id);
-            });
-
-            workers.push(handle);
+                Ok(KalmanCommand::Predict { dt }) => {
+                    let mut tracker = tracker.lock().unwrap();
+                    tracker.update(&[], dt); // Predict without measurements
+                    commands_processed += 1;
+                }
+                Ok(KalmanCommand::Shutdown) => {
+                    log::info!(
+                        "Kalman tracker shutting down after {} commands",
+                        commands_processed
+                    );
+                    break;
+                }
+                Err(_) => {
+                    log::warn!("Kalman command channel disconnected");
+                    break;
+                }
+            }
         }
 
-        Self {
-            job_tx,
-            result_rx,
-            _workers: workers,
+        log::info!("Kalman tracker command processor stopped");
+    }
+}
+
+impl Drop for KalmanSingleton {
+    fn drop(&mut self) {
+        self.shutdown();
+        if let Some(handle) = self._worker_handle.take() {
+            let _ = handle.join();
         }
-    }
-
-    /// Submit a Kalman prediction job (non-blocking)
-    pub fn try_submit(&self, job: KalmanJob) -> bool {
-        self.job_tx.try_send(job).is_ok()
-    }
-
-    /// Get next result (non-blocking)
-    pub fn try_get_result(&self) -> Option<KalmanResult> {
-        self.result_rx.try_recv().ok()
-    }
-
-    /// Get available capacity (approximate)
-    pub fn has_capacity(&self) -> bool {
-        self.job_tx.len() < self.job_tx.capacity().unwrap_or(0) / 2
     }
 }

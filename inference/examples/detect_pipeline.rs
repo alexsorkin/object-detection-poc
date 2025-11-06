@@ -2,11 +2,11 @@
 ///
 /// Demonstrates the complete detection pipeline with tiled batch processing:
 /// 1. Pre-processing: Tile extraction (auto-sized 640×640) + shadow removal
-/// 2. Execution: Parallel batch detection via shared detector pool
+/// 2. Execution: Parallel batch detection via batch executor
 /// 3. Post-processing: NMS + nested detection filtering + coordinate merging
 ///
-/// The detector pool is shared and can be reused across multiple images.
-/// Workers forward tiles to a single BatchExecutor which batches them for GPU.
+/// The batch executor is shared and can be reused across multiple images.
+/// Frames are enqueued directly to the BatchExecutor which batches them for GPU.
 ///
 /// Usage:
 ///   cargo run --release --features metal --example detect_pipeline [--detector yolov8|rtdetr] [--confidence %%] <image_path> [output_path]
@@ -17,11 +17,10 @@
 ///   cargo run --release --features metal --example detect_pipeline -- --detector rtdetr --confidence 35 test_data/my_image.jpg output.jpg
 ///   cargo run --release --features metal --example detect_pipeline -- --confidence 50
 use image::ImageReader;
-use military_target_detector::batch_executor::BatchConfig;
-use military_target_detector::detector_pool::DetectorPool;
+use military_target_detector::batch_executor::{BatchConfig, BatchExecutor};
 use military_target_detector::detector_trait::DetectorType;
+use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
-use military_target_detector::pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::types::DetectorConfig;
 use std::env;
 use std::sync::Arc;
@@ -104,16 +103,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let img_height = original_img.height();
     println!("✓ ({}x{})", img_width, img_height);
 
-    // Create SHARED detector pool (can be reused for many images)
-    print!("📦 Creating shared detector pool... ");
+    // Create SHARED batch executor (can be reused for many images)
+    print!("📦 Creating batch executor... ");
     let start_load = Instant::now();
 
-    let num_workers = 10;
     let batch_size = 5;
     let batch_config = BatchConfig {
         batch_size,
         timeout_ms: 50,
+        max_queue_depth: 10, // Allow more queued tiles for single image processing
     };
+    let max_queue_depth = batch_config.max_queue_depth; // Save before move
 
     // Platform-specific model selection:
     // - NVIDIA (CUDA/TensorRT): Use FP16 for 2-3x speedup
@@ -149,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (input_width, input_height) = match detector_type {
         DetectorType::YOLOV8 => (640, 640),
-        DetectorType::RTDETR => (640, 640),  // RT-DETR now uses 640×640 (same as YOLO)
+        DetectorType::RTDETR => (640, 640), // RT-DETR now uses 640×640 (same as YOLO)
     };
 
     let detector_config = DetectorConfig {
@@ -162,8 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let detector_pool = Arc::new(DetectorPool::new(
-        num_workers,
+    let detector_pool = Arc::new(BatchExecutor::new(
         detector_type,
         detector_config,
         batch_config,
@@ -171,14 +170,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ ({:.2}s)", start_load.elapsed().as_secs_f32());
 
     let (tile_width, tile_height) = detector_pool.input_size();
-    
+
     // Calculate expected tiles with detector-specific overlap
     let overlap = match detector_type {
         DetectorType::YOLOV8 => 32,
-        DetectorType::RTDETR => 32,  // RT-DETR uses smaller overlap for faster processing
+        DetectorType::RTDETR => 32, // RT-DETR uses smaller overlap for faster processing
     };
     let stride = tile_width - overlap;
-    
+
     // Use same logic as pipeline: don't create extra tiles for small overhangs (< 20% of tile size)
     let tiles_x = if img_width <= tile_width {
         1
@@ -192,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_strides + 1
         }
     };
-    
+
     let tiles_y = if img_height <= tile_height {
         1
     } else {
@@ -205,26 +204,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_strides + 1
         }
     };
-    
+
     let total_tiles = tiles_x * tiles_y;
-    
+
     println!("\n💡 Pipeline Configuration:");
     println!("   • Detector: {}", detector_name);
     println!(
         "   • Tile size: {}x{} (auto-detected from model)",
         tile_width, tile_height
     );
-    println!("   • Expected tiles: {} ({}×{}) with {}px overlap", total_tiles, tiles_x, tiles_y, overlap);
-    println!("   • Workers: {} (forward tiles to batch executor)", num_workers);
-    println!("   • Batch size: {} (GPU processes {} tiles in parallel)", batch_size, batch_size.min(total_tiles));
-    println!("   • Confidence threshold: {:.0}%", confidence_threshold * 100.0);
-    println!("   • Architecture: {} tiles → {} workers → BatchExecutor → GPU batch inference", total_tiles, num_workers);
-    println!("   • Detector pool is shared and can process multiple images\n");
+    println!(
+        "   • Expected tiles: {} ({}×{}) with {}px overlap",
+        total_tiles, tiles_x, tiles_y, overlap
+    );
+    println!(
+        "   • Batch size: {} (GPU processes {} tiles in parallel)",
+        batch_size,
+        batch_size.min(total_tiles)
+    );
+    println!(
+        "   • Queue depth: {} (backpressure control)",
+        max_queue_depth
+    );
+    println!(
+        "   • Confidence threshold: {:.0}%",
+        confidence_threshold * 100.0
+    );
+    println!(
+        "   • Architecture: {} tiles → BatchExecutor → GPU batch inference",
+        total_tiles
+    );
+    println!("   • Batch executor is shared and can process multiple images\n");
 
     // Create pipeline with shared detector pool
     println!("🔧 Building detection pipeline:");
     println!("  • Stage 1: Preprocess (tile extraction + shadow removal)");
-    println!("  • Stage 2: Execution (batch detection via shared pool)");
+    println!("  • Stage 2: Execution (batch detection via batch executor)");
     println!("  • Stage 3: Postprocess (NMS + nested filtering + coordinate merging)");
 
     let pipeline_config = PipelineConfig {
@@ -278,7 +293,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Draw results on resized image (annotations match computation space)
     let mut annotated_img = result.resized_image.clone();
-    print!("🎨 Drawing bounding boxes on {}x{} image... ", annotated_img.width(), annotated_img.height());
+    print!(
+        "🎨 Drawing bounding boxes on {}x{} image... ",
+        annotated_img.width(),
+        annotated_img.height()
+    );
 
     for (detection_num, det) in result.detections.iter().enumerate() {
         let color = generate_class_color(det.class_id);
@@ -294,7 +313,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             2,
         );
 
-        let label = format!("{}#{} {:.0}%", det.class_name, detection_num + 1, det.confidence * 100.0);
+        let label = format!(
+            "{}#{} {:.0}%",
+            det.class_name,
+            detection_num + 1,
+            det.confidence * 100.0
+        );
         let padding = 3;
         let text_x = (det.x as i32 + padding).max(0);
         let text_y = (det.y as i32 + padding).max(0);
@@ -321,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_total.elapsed().as_secs_f32()
     );
 
-    println!("\n💡 The detector pool can now be reused for more images!");
+    println!("\n💡 The batch executor can now be reused for more images!");
     println!("   Example: pipeline.process(&another_image)?;");
 
     Ok(())

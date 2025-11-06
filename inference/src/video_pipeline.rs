@@ -1,6 +1,11 @@
-/// Real-time video processing pipeline with Kalman filter extrapolation
+/// Video processing pipeline with async detection and Kalman filter extrapolation
+/// 
+/// Handles real-time video streams with:
+/// - Async frame detection with backpressure
+/// - Kalman filter for temporal tracking
+/// - Extrapolation when detection latency is high
 use crate::kalman_tracker::{KalmanConfig, MultiObjectTracker};
-use crate::pipeline::{DetectionPipeline, TileDetection};
+use crate::frame_pipeline::{DetectionPipeline, TileDetection};
 use crossbeam::channel::{bounded, Receiver, Sender};
 use image::RgbImage;
 use std::sync::Arc;
@@ -26,8 +31,8 @@ pub struct FrameResult {
     pub latency_ms: f32,
 }
 
-/// Real-time pipeline configuration
-pub struct RealtimePipelineConfig {
+/// Video pipeline configuration
+pub struct VideoPipelineConfig {
     /// Maximum latency before switching to extrapolation-only mode (ms)
     pub max_latency_ms: u64,
     /// Kalman filter configuration
@@ -36,7 +41,7 @@ pub struct RealtimePipelineConfig {
     pub buffer_size: usize,
 }
 
-impl Default for RealtimePipelineConfig {
+impl Default for VideoPipelineConfig {
     fn default() -> Self {
         Self {
             max_latency_ms: 500,
@@ -46,16 +51,16 @@ impl Default for RealtimePipelineConfig {
     }
 }
 
-/// Real-time video processing pipeline with tracking and extrapolation
-pub struct RealtimePipeline {
+/// Video processing pipeline with async detection and temporal tracking
+pub struct VideoPipeline {
     frame_tx: Sender<Frame>,
     result_rx: Receiver<FrameResult>,
     _worker_handle: thread::JoinHandle<()>,
 }
 
-impl RealtimePipeline {
-    /// Create new real-time pipeline
-    pub fn new(detection_pipeline: Arc<DetectionPipeline>, config: RealtimePipelineConfig) -> Self {
+impl VideoPipeline {
+    /// Create new video processing pipeline
+    pub fn new(detection_pipeline: Arc<DetectionPipeline>, config: VideoPipelineConfig) -> Self {
         let (frame_tx, frame_rx) = bounded::<Frame>(config.buffer_size);
         let (result_tx, result_rx) = bounded::<FrameResult>(config.buffer_size * 2);
 
@@ -75,14 +80,14 @@ impl RealtimePipeline {
         pipeline: Arc<DetectionPipeline>,
         frame_rx: Receiver<Frame>,
         result_tx: Sender<FrameResult>,
-        config: RealtimePipelineConfig,
+        config: VideoPipelineConfig,
     ) {
         let mut tracker = MultiObjectTracker::new(config.kalman_config.clone());
         let mut last_process_time = Instant::now();
         let mut frames_processed = 0_u64;
         let mut frames_extrapolated = 0_u64;
 
-        log::info!("Real-time pipeline worker started");
+        log::info!("Video pipeline worker started");
 
         while let Ok(mut frame) = frame_rx.recv() {
             let now = Instant::now();
@@ -231,9 +236,9 @@ impl RealtimePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detector_pool::DetectorPool;
+    use crate::batch_executor::{BatchConfig, BatchExecutor};
     use crate::detector_trait::DetectorType;
-    use crate::pipeline::PipelineConfig;
+    use crate::frame_pipeline::{DetectionPipeline, PipelineConfig};
     use crate::types::DetectorConfig;
     use std::sync::Arc;
 
@@ -242,24 +247,25 @@ mod tests {
     fn test_realtime_pipeline() {
         env_logger::init();
 
-        // Create detector pool
+        // Create batch executor
         let detector_config = DetectorConfig::default();
-        let batch_config = crate::batch_executor::BatchConfig {
+        let batch_config = BatchConfig {
             batch_size: 1,
             timeout_ms: 50,
+            max_queue_depth: 2,
         };
 
-        let detector_pool = Arc::new(
-            DetectorPool::new(2, DetectorType::RTDETR, detector_config, batch_config).unwrap(),
+        let batch_executor = Arc::new(
+            BatchExecutor::new(DetectorType::RTDETR, detector_config, batch_config).unwrap(),
         );
 
         // Create pipeline
         let pipeline_config = PipelineConfig::default();
-        let pipeline = Arc::new(DetectionPipeline::new(detector_pool, pipeline_config));
+        let pipeline = Arc::new(DetectionPipeline::new(batch_executor, pipeline_config));
 
-        // Create real-time pipeline
-        let rt_config = RealtimePipelineConfig::default();
-        let rt_pipeline = RealtimePipeline::new(pipeline, rt_config);
+        // Create video pipeline
+        let config = VideoPipelineConfig::default();
+        let video_pipeline = VideoPipeline::new(pipeline, config);
 
         // Submit test frames
         for i in 0..10 {
@@ -268,12 +274,12 @@ mod tests {
                 image: RgbImage::new(640, 480),
                 timestamp: Instant::now(),
             };
-            rt_pipeline.submit_frame(frame).unwrap();
+            video_pipeline.submit_frame(frame).unwrap();
         }
 
         // Get results
         for _ in 0..10 {
-            let result = rt_pipeline
+            let result = video_pipeline
                 .get_result_timeout(Duration::from_secs(5))
                 .unwrap();
             println!(

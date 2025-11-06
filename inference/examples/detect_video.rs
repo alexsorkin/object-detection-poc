@@ -18,16 +18,13 @@
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --classes 0,2,5,7 test_data/airport.mp4
 use image::{Rgb, RgbImage};
-use military_target_detector::batch_executor::BatchConfig;
-use military_target_detector::detector_pool::DetectorPool;
+use military_target_detector::batch_executor::{BatchConfig, BatchExecutor};
 use military_target_detector::detector_trait::DetectorType;
+use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
 use military_target_detector::kalman_tracker::{KalmanConfig, MultiObjectTracker};
-use military_target_detector::pipeline::{DetectionPipeline, PipelineConfig};
-use military_target_detector::realtime_pipeline::{
-    Frame, RealtimePipeline, RealtimePipelineConfig,
-};
 use military_target_detector::types::DetectorConfig;
+use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
 use opencv::{
     core::Mat,
     highgui, imgproc,
@@ -38,7 +35,7 @@ use std::env;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
@@ -98,8 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args[arg_idx].clone()
     } else {
         // Use default video if no path provided
-        eprintln!("ℹ️  No video path provided, using default: test_data/airport_320.mp4");
-        "test_data/airport_320.mp4".to_string()
+        eprintln!("ℹ️  No video path provided, using default: test_data/airport.mp4");
+        "test_data/airport.mp4".to_string()
     };
 
     eprintln!("🎯 Real-Time Video Detection with Kalman Extrapolation\n");
@@ -121,6 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let fps = cap.get(videoio::CAP_PROP_FPS).unwrap_or(24.0);
+
+    // Try to set FPS for camera sources (doesn't work for video files)
+    // For video files, we'll pace with sleep() in the main loop
+    if video_source.parse::<i32>().is_ok() {
+        cap.set(videoio::CAP_PROP_FPS, fps)?;
+    }
+
     let frame_width = cap.get(videoio::CAP_PROP_FRAME_WIDTH).unwrap_or(1920.0) as i32;
     let frame_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT).unwrap_or(1080.0) as i32;
     let total_frames = cap.get(videoio::CAP_PROP_FRAME_COUNT).unwrap_or(0.0) as i32;
@@ -134,11 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     io::stderr().flush()?;
 
-    // Create detector pool
-    eprintln!("\n📦 Creating detector pool...");
+    // Create batch executor (replaces detector pool)
+    eprintln!("\n📦 Creating batch executor...");
     io::stderr().flush()?;
     let detector_type = DetectorType::RTDETR;
-    let num_workers = 4;
     let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
     let detector_config = DetectorConfig {
@@ -154,10 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_config = BatchConfig {
         batch_size,
         timeout_ms: 5, // Very short timeout since frames arrive ~400ms apart (no batching possible)
+        max_queue_depth: 2, // Drop frames if more than 2 pending (backpressure control)
     };
+    let max_queue_depth = batch_config.max_queue_depth; // Save before move
 
-    let detector_pool = Arc::new(DetectorPool::new(
-        num_workers,
+    let batch_executor = Arc::new(BatchExecutor::new(
         detector_type,
         detector_config,
         batch_config,
@@ -171,19 +175,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pipeline = Arc::new(DetectionPipeline::new(
-        Arc::clone(&detector_pool),
+        Arc::clone(&batch_executor),
         pipeline_config,
     ));
 
-    // Create real-time pipeline with Kalman tracker
+    // Create video pipeline with Kalman tracker
     let buffer_size = 2; // Tiny buffer - only allow 2 frames queued max
-    let rt_config = RealtimePipelineConfig {
+    let video_config = VideoPipelineConfig {
         max_latency_ms: 500,
         kalman_config: Default::default(),
         buffer_size,
     };
 
-    let rt_pipeline = RealtimePipeline::new(Arc::clone(&pipeline), rt_config);
+    let video_pipeline = VideoPipeline::new(Arc::clone(&pipeline), video_config);
 
     // Create single shared Kalman tracker with 1000ms track timeout
     let kalman_config = KalmanConfig {
@@ -199,9 +203,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("  ✓ Pipeline ready");
     eprintln!("\n💡 Configuration:");
-    eprintln!("  • Detector: RT-DETR");
-    eprintln!("  • Workers: {}", num_workers);
+    eprintln!("  • Detector: RT-DETR (direct batch executor)");
     eprintln!("  • Batch size: {}", batch_size);
+    eprintln!("  • Queue depth: {} (backpressure)", max_queue_depth);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
     eprintln!("  • Classes: {:?}", allowed_classes);
     eprintln!("  • Kalman tracker: 1s track timeout");
@@ -238,6 +242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_count = 0_usize;
     let mut last_kalman_update = Instant::now();
 
+    // FPS pacing: Calculate target frame duration to match video's native FPS
+    let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
+    let mut next_frame_time = Instant::now();
+
     eprintln!(
         "📝 Detection strategy: Submit frames whenever pipeline has capacity (max {} pending)\n",
         max_pending
@@ -246,6 +254,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let frame_start = Instant::now();
+
+        // Pace frame reading at video's native FPS
+        if frame_start < next_frame_time {
+            let sleep_duration = next_frame_time - frame_start;
+            std::thread::sleep(sleep_duration);
+        }
+        next_frame_time = Instant::now() + frame_duration;
 
         // Capture frame
         let mut mat_frame = Mat::default();
@@ -310,15 +325,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writer_handle = Some(handle);
         }
 
-        // Get results from detection pipeline
-        while let Some(result) = rt_pipeline.try_get_result() {
+        // Get results from detection pipeline (async - may or may not have results)
+        while let Some(result) = video_pipeline.try_get_result() {
             if result.is_extrapolated {
                 stats_extrapolated += 1;
             } else {
                 stats_processed += 1;
 
                 // Update Kalman tracker with real detections
-                // Use WALL-CLOCK time, not frame timestamp (which may be 0 for all frames)
+                // Use WALL-CLOCK time, not frame timestamp
                 let current_time = Instant::now();
                 let dt = current_time
                     .duration_since(last_kalman_update)
@@ -339,34 +354,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image: rgb_image.clone(),
                 timestamp: frame_start,
             };
-            if rt_pipeline.try_submit_frame(frame) {
+            if video_pipeline.try_submit_frame(frame) {
                 pending_count += 1;
             }
         }
 
-        // Get current Kalman predictions for display (synchronous read)
-        // Predict forward to current frame time just before getting predictions
-        // Only predict if enough time has passed (> 10ms) to avoid double-updating
+        // ALWAYS predict Kalman forward to current frame time (moving window)
         let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
-        if dt > 0.010 {
+        if dt > 0.001 {
             kalman_tracker.update(&[], dt);
             last_kalman_update = frame_start;
         }
-        let kalman_predictions = kalman_tracker.get_predictions();
+
+        // Get current Kalman predictions (may be empty if no tracks yet)
+        let detections_to_display = kalman_tracker.get_predictions();
 
         // Annotate current frame with Kalman predictions
         let mut annotated = rgb_image.clone();
-
-        // Always use Kalman predictions once tracking starts (predictions include track IDs)
-        // Kalman tracker maintains all active tracks and updates them with new detections
-        let empty_vec = Vec::new();
-        let detections_to_display: &Vec<_> = if kalman_tracker.num_tracks() > 0 {
-            // Have active tracks - use Kalman predictions (with track IDs)
-            &kalman_predictions
-        } else {
-            // No tracks yet - display empty until first detection processed
-            &empty_vec
-        };
 
         // Calculate scale factors (detections are in resized image coordinates)
         // Pipeline resizes so LONGEST dimension = 640, preserving aspect ratio
@@ -392,7 +396,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scale_y = orig_height as f32 / resized_height as f32;
 
         // Draw detections with track ID visualization
-        for det in detections_to_display {
+        for det in &detections_to_display {
             // Use consistent color per class (person=green, car=blue, etc.)
             let color = generate_class_color(det.class_id);
 
@@ -485,7 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             highgui::imshow("Detection", &display_mat)?;
         }
 
-        // Write to output video asynchronously (non-blocking)
+        // Write ALL frames to output video (including initial frames without annotations)
         if let Some(ref tx) = frame_tx {
             // Use try_send to avoid blocking the main loop if video writer is slow
             if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(display_mat.clone()) {
