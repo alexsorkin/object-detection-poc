@@ -18,17 +18,20 @@ pub struct KalmanConfig {
     pub max_age_ms: u64,
     /// IoU threshold for associating detections to tracks
     pub iou_threshold: f32,
+    /// Maximum centroid distance for matching (pixels) - fallback when IoU=0
+    pub max_centroid_distance: f32,
 }
 
 impl Default for KalmanConfig {
     fn default() -> Self {
         Self {
-            process_noise_pos: 0.5,   // Moderate position uncertainty
-            process_noise_vel: 2.0,   // Higher velocity uncertainty (acceleration)
-            measurement_noise: 2.0,   // 2 pixels of detector jitter
-            initial_covariance: 10.0, // Initial uncertainty
-            max_age_ms: 500,          // Drop tracks after 500ms
-            iou_threshold: 0.3,       // Match if IoU > 30%
+            process_noise_pos: 0.5,       // Moderate position uncertainty
+            process_noise_vel: 2.0,       // Higher velocity uncertainty (acceleration)
+            measurement_noise: 2.0,       // 2 pixels of detector jitter
+            initial_covariance: 10.0,     // Initial uncertainty
+            max_age_ms: 500,              // Drop tracks after 500ms
+            iou_threshold: 0.3,           // Match if IoU > 30%
+            max_centroid_distance: 100.0, // Match if centroids within 100px when IoU=0
         }
     }
 }
@@ -285,6 +288,22 @@ impl MultiObjectTracker {
         inter_area / union_area
     }
 
+    /// Calculate centroid distance between detection and tracked object (pixels)
+    fn calculate_centroid_distance(det: &TileDetection, track: &TrackedObject) -> f32 {
+        let track_det = track.get_detection();
+
+        let det_cx = det.x + det.w / 2.0;
+        let det_cy = det.y + det.h / 2.0;
+
+        let track_cx = track_det.x + track_det.w / 2.0;
+        let track_cy = track_det.y + track_det.h / 2.0;
+
+        let dx = det_cx - track_cx;
+        let dy = det_cy - track_cy;
+
+        (dx * dx + dy * dy).sqrt()
+    }
+
     /// Associate detections to existing tracks using Hungarian algorithm
     fn associate_detections(&self, detections: &[TileDetection]) -> Vec<(usize, usize)> {
         if self.tracks.is_empty() || detections.is_empty() {
@@ -312,8 +331,18 @@ impl MultiObjectTracker {
                 // Only match same class
                 if det.class_id == track.class_id {
                     let iou = Self::calculate_iou(det, track);
-                    // Convert to integer cost: (1 - IoU) * scale
-                    let cost = ((1.0 - iou) * scale as f32) as i32;
+                    let centroid_dist = Self::calculate_centroid_distance(det, track);
+
+                    // Compute cost: prefer IoU, but use distance if IoU is zero
+                    let cost = if iou > 0.01 {
+                        // IoU-based cost (lower is better)
+                        ((1.0 - iou) * scale as f32) as i32
+                    } else {
+                        // Distance-based cost normalized to similar range
+                        let normalized_dist =
+                            (centroid_dist / self.config.max_centroid_distance).min(2.0);
+                        (normalized_dist * scale as f32) as i32
+                    };
 
                     // Place cost in correct position depending on transpose
                     if transpose {
@@ -348,8 +377,9 @@ impl MultiObjectTracker {
                 cost_matrix[(det_idx, track_idx)]
             };
 
-            let iou = 1.0 - (cost as f32 / scale as f32);
-            if iou > self.config.iou_threshold {
+            // Accept match if cost is reasonable (< 2.0 * scale means distance or IoU based match is valid)
+            // This allows both IoU-based and centroid-distance-based matches
+            if cost < 2 * scale {
                 matches.push((det_idx, track_idx));
             }
         }
@@ -371,24 +401,47 @@ impl MultiObjectTracker {
         let mut matched_tracks = vec![false; self.tracks.len()];
 
         // Update matched tracks
-        for (det_idx, track_idx) in matches {
-            self.tracks[track_idx].update(&detections[det_idx]);
-            matched_detections[det_idx] = true;
-            matched_tracks[track_idx] = true;
+        for (det_idx, track_idx) in &matches {
+            log::debug!(
+                "✓ Matched detection {} → track_id={}",
+                det_idx,
+                self.tracks[*track_idx].track_id
+            );
+            self.tracks[*track_idx].update(&detections[*det_idx]);
+            matched_detections[*det_idx] = true;
+            matched_tracks[*track_idx] = true;
         }
 
         // Create new tracks for unmatched detections
         for (det_idx, det) in detections.iter().enumerate() {
             if !matched_detections[det_idx] {
+                log::debug!(
+                    "✨ Creating NEW track_id={} for unmatched detection {} (class={})",
+                    self.next_track_id,
+                    det_idx,
+                    det.class_name
+                );
                 let track = TrackedObject::new(self.next_track_id, det, &self.config);
                 self.tracks.push(track);
                 self.next_track_id += 1;
             }
         }
 
-        // Remove stale tracks
-        self.tracks
-            .retain(|track| !track.is_stale(self.config.max_age_ms));
+        // Remove stale tracks ONLY if we had actual detections to match against
+        // (prediction-only updates should not age out tracks)
+        if !detections.is_empty() {
+            let before_count = self.tracks.len();
+            self.tracks
+                .retain(|track| !track.is_stale(self.config.max_age_ms));
+            let removed_count = before_count - self.tracks.len();
+            if removed_count > 0 {
+                log::debug!(
+                    "🗑️  Removed {} stale tracks ({} remaining)",
+                    removed_count,
+                    self.tracks.len()
+                );
+            }
+        }
     }
 
     /// Get all current track predictions (for extrapolation)

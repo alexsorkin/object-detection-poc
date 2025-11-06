@@ -25,7 +25,7 @@ use military_target_detector::image_utils::{draw_rect, draw_text, generate_class
 use military_target_detector::kalman_tracker::{KalmanConfig, MultiObjectTracker};
 use military_target_detector::pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::realtime_pipeline::{
-    Frame, FrameResult, RealtimePipeline, RealtimePipelineConfig,
+    Frame, RealtimePipeline, RealtimePipelineConfig,
 };
 use military_target_detector::types::DetectorConfig;
 use opencv::{
@@ -97,20 +97,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_source = if args.len() > arg_idx {
         args[arg_idx].clone()
     } else {
-        eprintln!(
-            "Usage: {} [--confidence %%] [--classes c1,c2,...] <video_path | camera_id>",
-            args[0]
-        );
-        eprintln!("  --confidence: Detection confidence threshold (0-100, default: 50)");
-        eprintln!("  --classes:    Comma-separated class IDs to detect (default: 0,2,3,4,5,7)");
-        eprintln!("                0=person, 2=car, 3=motorcycle, 4=airplane, 5=bus, 7=truck");
-        eprintln!("  video_path:   Path to video file");
-        eprintln!("  camera_id:    0 for default webcam");
-        eprintln!("\nExamples:");
-        eprintln!("  {} test_data/airport.mp4", args[0]);
-        eprintln!("  {} --confidence 35 test_data/airport.mp4", args[0]);
-        eprintln!("  {} --classes 0,2,5,7 test_data/airport.mp4", args[0]);
-        return Ok(());
+        // Use default video if no path provided
+        eprintln!("ℹ️  No video path provided, using default: test_data/airport_320.mp4");
+        "test_data/airport_320.mp4".to_string()
     };
 
     eprintln!("🎯 Real-Time Video Detection with Kalman Extrapolation\n");
@@ -196,10 +185,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rt_pipeline = RealtimePipeline::new(Arc::clone(&pipeline), rt_config);
 
-    // Create single shared Kalman tracker with 500ms track timeout
+    // Create single shared Kalman tracker with 1000ms track timeout
     let kalman_config = KalmanConfig {
-        max_age_ms: 500, // Keep tracks for 500ms without real detections
-        ..Default::default()
+        max_age_ms: 1000,             // Keep tracks for 1s (detection interval is ~600ms)
+        iou_threshold: 0.10, // Very low threshold - detections 350-400ms apart can drift significantly
+        max_centroid_distance: 150.0, // Match if centroids within 150px (for fast-moving objects)
+        process_noise_pos: 5.0, // Higher position uncertainty for fast-moving objects
+        process_noise_vel: 10.0, // Much higher velocity uncertainty (fast aircraft/vehicles)
+        measurement_noise: 5.0, // Higher detector noise tolerance
+        initial_covariance: 20.0, // Higher initial uncertainty
     };
     let mut kalman_tracker = MultiObjectTracker::new(kalman_config);
 
@@ -210,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  • Batch size: {}", batch_size);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
     eprintln!("  • Classes: {:?}", allowed_classes);
-    eprintln!("  • Kalman tracker: 0.5s track timeout");
+    eprintln!("  • Kalman tracker: 1s track timeout");
     eprintln!("  • Output FPS: {:.1} (matching input)", fps);
     eprintln!("  • Max latency for extrapolation: 500ms");
 
@@ -236,14 +230,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stats_processed = 0_u32;
     let mut stats_extrapolated = 0_u32;
     let mut stats_latency_sum = 0.0_f32;
-    let mut stats_displayed_fresh = 0_u32; // Frames displayed with fresh/recent result
-    let mut stats_displayed_extrapolated = 0_u32; // Frames displayed with old extrapolated result
     let stats_start = Instant::now();
 
     // Strategy: Only submit if result queue is not backed up
     // This prevents overwhelming the pipeline and allows Kalman to work
-    let mut latest_result: Option<FrameResult> = None;
-    let mut latest_result_time = Instant::now();
     let max_pending = 2; // Only allow 2 frames in flight at a time
     let mut pending_count = 0_usize;
     let mut last_kalman_update = Instant::now();
@@ -328,18 +318,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stats_processed += 1;
 
                 // Update Kalman tracker with real detections
-                // Use dt since last real detection update (not last frame)
-                let dt = result
-                    .timestamp
+                // Use WALL-CLOCK time, not frame timestamp (which may be 0 for all frames)
+                let current_time = Instant::now();
+                let dt = current_time
                     .duration_since(last_kalman_update)
                     .as_secs_f32();
                 kalman_tracker.update(&result.detections, dt);
-                last_kalman_update = result.timestamp;
+                last_kalman_update = current_time;
             }
             stats_latency_sum += result.latency_ms;
 
-            latest_result = Some(result.clone());
-            latest_result_time = result.timestamp;
             pending_count = pending_count.saturating_sub(1);
         }
 
@@ -358,8 +346,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Get current Kalman predictions for display (synchronous read)
         // Predict forward to current frame time just before getting predictions
+        // Only predict if enough time has passed (> 10ms) to avoid double-updating
         let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
-        if dt > 0.001 {
+        if dt > 0.010 {
             kalman_tracker.update(&[], dt);
             last_kalman_update = frame_start;
         }
@@ -368,23 +357,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Annotate current frame with Kalman predictions
         let mut annotated = rgb_image.clone();
 
-        // Use Kalman predictions if available, otherwise fall back to latest result
+        // Always use Kalman predictions once tracking starts (predictions include track IDs)
+        // Kalman tracker maintains all active tracks and updates them with new detections
         let empty_vec = Vec::new();
-        let detections_to_display: &Vec<_> = if !kalman_predictions.is_empty() {
-            stats_extrapolated += 1;
-            stats_displayed_extrapolated += 1;
+        let detections_to_display: &Vec<_> = if kalman_tracker.num_tracks() > 0 {
+            // Have active tracks - use Kalman predictions (with track IDs)
             &kalman_predictions
-        } else if let Some(ref result) = latest_result {
-            // Track display stats: fresh result vs extrapolated
-            let dt = frame_start.duration_since(latest_result_time).as_secs_f32();
-            if dt < 0.05 {
-                stats_displayed_fresh += 1;
-            } else {
-                stats_displayed_extrapolated += 1;
-            }
-            &result.detections
         } else {
-            // No detections yet
+            // No tracks yet - display empty until first detection processed
             &empty_vec
         };
 
@@ -521,12 +501,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if frame_id % progress_interval == 0 {
             let elapsed = stats_start.elapsed().as_secs_f32();
             let avg_fps = frame_id as f32 / elapsed;
-            let total_displayed = stats_displayed_fresh + stats_displayed_extrapolated;
-            let display_extrapolation_rate = if total_displayed > 0 {
-                stats_displayed_extrapolated as f32 / total_displayed as f32 * 100.0
-            } else {
-                0.0
-            };
             let total = stats_processed + stats_extrapolated;
             let avg_latency = if total > 0 {
                 stats_latency_sum / total as f32
@@ -535,8 +509,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             eprintln!(
-                "Frame {}: {:.1} FPS | Pipeline: {} real + {} Kalman | Display: {:.1}% extrapolated | Avg Latency: {:.0}ms",
-                frame_id, avg_fps, stats_processed, stats_extrapolated, display_extrapolation_rate, avg_latency
+                "Frame {}: {:.1} FPS | Tracks: {} | Real detections: {} | Avg Latency: {:.0}ms",
+                frame_id,
+                avg_fps,
+                kalman_tracker.num_tracks(),
+                stats_processed,
+                avg_latency
             );
             io::stderr().flush().ok();
         }
@@ -565,17 +543,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_time = stats_start.elapsed().as_secs_f32();
     let total = stats_processed + stats_extrapolated;
     let avg_fps = frame_id as f32 / total_time;
-    let total_displayed = stats_displayed_fresh + stats_displayed_extrapolated;
-    let display_extrapolation_rate = if total_displayed > 0 {
-        stats_displayed_extrapolated as f32 / total_displayed as f32 * 100.0
-    } else {
-        0.0
-    };
-    let extrapolation_rate = if total > 0 {
-        stats_extrapolated as f32 / total as f32 * 100.0
-    } else {
-        0.0
-    };
     let avg_latency = if total > 0 {
         stats_latency_sum / total as f32
     } else {
@@ -586,23 +553,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  • Total frames displayed: {}", frame_id);
     eprintln!("  • Duration: {:.1}s", total_time);
     eprintln!("  • Average FPS: {:.1}", avg_fps);
-    eprintln!("\n  Pipeline Stats:");
+    eprintln!("\n  Detection Stats:");
     eprintln!("    - Real detections: {}", stats_processed);
-    eprintln!(
-        "    - Kalman predictions: {} ({:.1}%)",
-        stats_extrapolated, extrapolation_rate
-    );
     eprintln!("    - Average latency: {:.0}ms", avg_latency);
-    eprintln!("\n  Display Stats:");
-    eprintln!(
-        "    - Fresh frames: {} ({:.1}%)",
-        stats_displayed_fresh,
-        100.0 - display_extrapolation_rate
-    );
-    eprintln!(
-        "    - Extrapolated frames: {} ({:.1}%)",
-        stats_displayed_extrapolated, display_extrapolation_rate
-    );
     io::stderr().flush()?;
 
     // Close video writer channel and wait for thread to finish
