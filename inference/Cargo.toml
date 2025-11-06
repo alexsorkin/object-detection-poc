@@ -31,6 +31,19 @@ thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
 
+# Kalman filter and tracking
+nalgebra = "0.33"
+
+# Video processing (requires opencv installed via brew)
+opencv = { version = "0.93", default-features = false, features = ["videoio", "highgui", "imgproc"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+crossbeam = "0.8"
+
+# Hungarian algorithm for data association
+pathfinding = "4.0"
+
 [dev-dependencies]
 # Not needed for now
 

@@ -2,6 +2,11 @@
 use crate::detector_pool::DetectorPool;
 use crate::types::{ImageData, ImageFormat};
 use image::{Rgb, RgbImage};
+use opencv::{
+    core::{Mat, Size, Vector, CV_8UC3},
+    imgproc,
+    prelude::*,
+};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -53,6 +58,9 @@ pub struct TileDetection {
     pub class_id: u32,
     pub class_name: String,
     pub tile_idx: usize,
+    // Optional Kalman filter velocity (pixels per second)
+    pub vx: Option<f32>,
+    pub vy: Option<f32>,
 }
 
 /// Execution output: detections from all tiles
@@ -117,7 +125,68 @@ impl PreprocessStage {
         )
     }
 
-    /// Apply HSV-based shadow removal (brightness enhancement)
+    /// Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for shadow removal
+    /// Uses OpenCV's CLAHE on the L channel of LAB color space
+    fn remove_shadows_clahe(&self, img: &RgbImage) -> Result<RgbImage, Box<dyn std::error::Error>> {
+        let width = img.width();
+        let height = img.height();
+        
+        // Convert RgbImage to OpenCV Mat (RGB format)
+        let data = img.as_raw();
+        let rgb_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                height as i32,
+                width as i32,
+                CV_8UC3,
+                data.as_ptr() as *mut _,
+                opencv::core::Mat_AUTO_STEP,
+            )?
+        };
+        
+        // Convert RGB to LAB color space
+        let mut lab_mat = Mat::default();
+        imgproc::cvt_color(
+            &rgb_mat,
+            &mut lab_mat,
+            imgproc::COLOR_RGB2Lab,
+            0,
+            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        
+        // Split LAB channels
+        let mut lab_channels = Vector::<Mat>::new();
+        opencv::core::split(&lab_mat, &mut lab_channels)?;
+        
+        // Apply CLAHE to L channel (lightness)
+        let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
+        let mut l_equalized = Mat::default();
+        clahe.apply(&lab_channels.get(0)?, &mut l_equalized)?;
+        
+        // Replace L channel with equalized version
+        lab_channels.set(0, l_equalized)?;
+        
+        // Merge channels back
+        let mut lab_enhanced = Mat::default();
+        opencv::core::merge(&lab_channels, &mut lab_enhanced)?;
+        
+        // Convert back to RGB
+        let mut rgb_enhanced = Mat::default();
+        imgproc::cvt_color(
+            &lab_enhanced,
+            &mut rgb_enhanced,
+            imgproc::COLOR_Lab2RGB,
+            0,
+            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        
+        // Convert Mat back to RgbImage
+        let data_bytes = rgb_enhanced.data_bytes()?.to_vec();
+        Ok(RgbImage::from_vec(width, height, data_bytes)
+            .ok_or("Failed to create RgbImage from CLAHE result")?)
+    }
+
+    /// Apply HSV-based shadow removal (brightness enhancement) - DEPRECATED: Use CLAHE instead
+    #[allow(dead_code)]
     fn remove_shadows_hsv(&self, img: &RgbImage) -> RgbImage {
         let (width, height) = img.dimensions();
         let mut result = RgbImage::new(width, height);
@@ -293,8 +362,14 @@ impl PreprocessStage {
         let resized_width = resized_img.width();
         let resized_height = resized_img.height();
 
-        // Apply shadow removal to entire resized image once (more efficient than per-tile)
-        let deshadowed_img = self.remove_shadows_hsv(&resized_img);
+        // Apply CLAHE-based shadow removal to entire resized image once (more efficient than per-tile)
+        let deshadowed_img = match self.remove_shadows_clahe(&resized_img) {
+            Ok(enhanced) => enhanced,
+            Err(e) => {
+                eprintln!("⚠️  CLAHE failed, using original image: {}", e);
+                resized_img.clone()
+            }
+        };
 
         // Extract tiles from shadow-removed image (tiles will be used for detection)
         let tiles = self.extract_tiles(&deshadowed_img);
@@ -413,6 +488,8 @@ impl ExecutionStage {
                         class_id,
                         class_name: capitalized_name,
                         tile_idx,
+                        vx: None,  // No velocity for raw detections
+                        vy: None,
                     });
                 }
             }

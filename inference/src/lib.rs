@@ -28,7 +28,10 @@ pub mod detector_pool;
 pub mod detector_rtdetr;
 pub mod detector_trait;
 pub mod detector_yolov8;
+pub mod kalman_pool;
+pub mod kalman_tracker;
 pub mod pipeline;
+pub mod realtime_pipeline;
 
 // Core modules
 pub mod error;

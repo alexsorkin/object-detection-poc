@@ -16,6 +16,8 @@ See `GPU_ACCELERATION_ROADMAP.md` for details and implementation plan.
 
 - **Pure Rust**: No Python dependencies, safe for production
 - **CPU Inference**: Tract ONNX Runtime (works everywhere)
+- **Kalman Tracking**: Real-time 30 FPS output with extrapolation (see [KALMAN_TRACKING.md](KALMAN_TRACKING.md))
+- **Video Processing**: OpenCV integration for camera/video files (see [BUILD_VIDEO.md](BUILD_VIDEO.md))
 - **Unity Ready**: C FFI bridge for Unity/VR integration
 - **ONNX Models**: YOLOv8 nano (fast) or medium (accurate)
 
@@ -26,6 +28,22 @@ See `GPU_ACCELERATION_ROADMAP.md` for details and implementation plan.
 cargo build --release
 cargo run --release --example detect -- ../models/military_target_detector.onnx test_data/test_tank.jpg
 ```
+
+### Real-Time Video with Kalman Tracking
+```bash
+# Prerequisites: brew install opencv llvm
+
+# Test Kalman tracker (no video file required)
+cargo run --release --features metal --example test_kalman
+
+# Video processing with real-time tracking
+cargo run --release --features metal --example detect_video -- video.mp4
+
+# Or use webcam
+cargo run --release --features metal --example detect_video -- 0
+```
+
+See [BUILD_VIDEO.md](BUILD_VIDEO.md) for setup details and [KALMAN_TRACKING.md](KALMAN_TRACKING.md) for tracking documentation.
 
 ## Performance
 
