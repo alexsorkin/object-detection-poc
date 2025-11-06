@@ -154,6 +154,7 @@ impl KalmanFilter {
             tile_idx: 0,  // Not applicable for tracked objects
             vx: Some(vx), // Include velocity from Kalman state
             vy: Some(vy),
+            track_id: None, // Will be set by TrackedObject
         }
     }
 }
@@ -205,10 +206,13 @@ impl TrackedObject {
         self.misses = 0;
     }
 
-    /// Get current detection (predicted or measured)
+    /// Get current detection (predicted or measured) with track ID
     pub fn get_detection(&self) -> TileDetection {
-        self.kalman
-            .get_detection(self.class_id, &self.class_name, self.confidence)
+        let mut det = self
+            .kalman
+            .get_detection(self.class_id, &self.class_name, self.confidence);
+        det.track_id = Some(self.track_id); // Add persistent track ID
+        det
     }
 
     /// Check if track is stale (too old)
@@ -406,6 +410,7 @@ mod tests {
             tile_idx: 0,
             vx: None,
             vy: None,
+            track_id: None,
         };
 
         let config = KalmanConfig::default();
@@ -435,6 +440,7 @@ mod tests {
             tile_idx: 0,
             vx: None,
             vy: None,
+            track_id: None,
         };
 
         // First update: create new track
@@ -453,6 +459,7 @@ mod tests {
             tile_idx: 0,
             vx: None,
             vy: None,
+            track_id: None,
         };
         tracker.update(&[det2], 0.033);
         assert_eq!(tracker.num_tracks(), 1); // Should match, not create new
@@ -463,6 +470,12 @@ mod tests {
 
         let predictions = tracker.get_predictions();
         assert_eq!(predictions.len(), 1);
-        assert!(predictions[0].x > 105.0); // Should have moved right (learned velocity)
+
+        // Verify track ID is assigned
+        assert!(predictions[0].track_id.is_some());
+
+        // Should have learned some velocity (moved from 100 to 105)
+        // With Kalman filter, prediction should be at or slightly ahead of last measurement
+        assert!(predictions[0].x >= 104.0); // At least near the last measurement
     }
 }

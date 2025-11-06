@@ -61,6 +61,8 @@ pub struct TileDetection {
     // Optional Kalman filter velocity (pixels per second)
     pub vx: Option<f32>,
     pub vy: Option<f32>,
+    // Optional track ID for persistent object identification
+    pub track_id: Option<u32>,
 }
 
 /// Execution output: detections from all tiles
@@ -98,7 +100,8 @@ impl PreprocessStage {
         Self { tile_size, overlap }
     }
 
-    /// Resize image so the shorter dimension fits tile_size while preserving aspect ratio
+    /// Resize image so the longer dimension fits tile_size while preserving aspect ratio
+    /// This ensures the entire image fits within a single tile (no tiling needed)
     fn resize_to_fit(&self, img: &RgbImage) -> RgbImage {
         let (width, height) = img.dimensions();
         
@@ -107,8 +110,8 @@ impl PreprocessStage {
             return img.clone();
         }
 
-        // Calculate scale factor based on the SHORTER dimension
-        let scale = if width < height {
+        // Calculate scale factor based on the LONGER dimension
+        let scale = if width > height {
             self.tile_size as f32 / width as f32
         } else {
             self.tile_size as f32 / height as f32
@@ -357,7 +360,8 @@ impl PreprocessStage {
         let original_width = img.width();
         let original_height = img.height();
 
-        // Resize image to fit tile_size on shorter dimension while preserving aspect ratio
+        // Resize image to fit tile_size on longer dimension while preserving aspect ratio
+        // This ensures the entire image fits in a single tile
         let resized_img = self.resize_to_fit(img);
         let resized_width = resized_img.width();
         let resized_height = resized_img.height();
@@ -490,6 +494,7 @@ impl ExecutionStage {
                         tile_idx,
                         vx: None,  // No velocity for raw detections
                         vy: None,
+                        track_id: None,  // No track ID yet (assigned by Kalman tracker)
                     });
                 }
             }
