@@ -334,6 +334,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pending_count = pending_count.saturating_sub(1);
         }
 
+        // Predict Kalman tracker forward for current frame (even without new detections)
+        let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
+        if dt > 0.001 {
+            // Only predict if time has passed
+            kalman_tracker.update(&[], dt); // Empty detections = prediction only
+            last_kalman_update = frame_start;
+        }
+
         // Submit detection for every 40th frame (RT-DETR on CPU is ~0.3-0.4 FPS)
         let should_detect = frame_id % 40 == 0;
 
@@ -491,9 +499,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             highgui::imshow("Detection", &display_mat)?;
         }
 
-        // Write to output video asynchronously
+        // Write to output video asynchronously (non-blocking)
         if let Some(ref tx) = frame_tx {
-            let _ = tx.send(display_mat.clone());
+            // Use try_send to avoid blocking the main loop if video writer is slow
+            if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(display_mat.clone()) {
+                // Drop frame if video writer can't keep up
+                log::warn!("Video writer queue full, dropping frame {}", frame_id);
+            }
         }
 
         frame_id += 1;
