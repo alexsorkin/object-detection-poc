@@ -17,6 +17,7 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::TensorRef,
 };
+use rayon::prelude::*;
 
 /// RT-DETR detector for object detection
 pub struct RTDETRDetector {
@@ -274,18 +275,35 @@ impl RTDETRDetector {
             let total_dim = shape[2];
             let num_classes = total_dim - 4;
 
+            // PARALLEL: Split combined tensor using ndarray parallel iteration
+            // Pre-compute box and logit slices for each batch
+            let boxes_logits: Vec<_> = (0..batch_size)
+                .into_par_iter()
+                .map(|b| {
+                    let mut batch_boxes = Array::zeros((num_queries, 4));
+                    let mut batch_logits = Array::zeros((num_queries, num_classes));
+
+                    for q in 0..num_queries {
+                        for i in 0..4 {
+                            batch_boxes[[q, i]] = combined_output[[b, q, i]];
+                        }
+                        for i in 0..num_classes {
+                            batch_logits[[q, i]] = combined_output[[b, q, 4 + i]];
+                        }
+                    }
+                    (batch_boxes, batch_logits)
+                })
+                .collect();
+
+            // Reassemble into final arrays
             let mut pred_boxes = Array::zeros((batch_size, num_queries, 4));
             let mut pred_logits = Array::zeros((batch_size, num_queries, num_classes));
 
-            for b in 0..batch_size {
-                for q in 0..num_queries {
-                    for i in 0..4 {
-                        pred_boxes[[b, q, i]] = combined_output[[b, q, i]];
-                    }
-                    for i in 0..num_classes {
-                        pred_logits[[b, q, i]] = combined_output[[b, q, 4 + i]];
-                    }
-                }
+            for (b, (boxes, logits)) in boxes_logits.into_iter().enumerate() {
+                pred_boxes.slice_mut(ndarray::s![b, .., ..]).assign(&boxes);
+                pred_logits
+                    .slice_mut(ndarray::s![b, .., ..])
+                    .assign(&logits);
             }
 
             (pred_boxes.into_dyn(), pred_logits.into_dyn())
@@ -320,7 +338,13 @@ impl RTDETRDetector {
         );
         let batch_size = images.len();
 
-        // Preprocess all images into a single batch tensor [N, 3, 576, 576]
+        // PARALLEL: Preprocess all images concurrently
+        let preprocessed_images: Vec<_> = images
+            .par_iter()
+            .map(|image| self.preprocess(image))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Assemble into batch tensor [N, 3, 640, 640]
         let mut batch_tensor = Array::zeros((
             batch_size,
             3,
@@ -328,16 +352,10 @@ impl RTDETRDetector {
             self.input_size.0 as usize,
         ));
 
-        for (batch_idx, image) in images.iter().enumerate() {
-            let preprocessed = self.preprocess(image)?;
-            // Copy from [1, 3, 576, 576] to batch position [batch_idx, 3, 576, 576]
-            for c in 0..3 {
-                for y in 0..self.input_size.1 as usize {
-                    for x in 0..self.input_size.0 as usize {
-                        batch_tensor[[batch_idx, c, y, x]] = preprocessed[[0, c, y, x]];
-                    }
-                }
-            }
+        for (batch_idx, preprocessed) in preprocessed_images.iter().enumerate() {
+            batch_tensor
+                .slice_mut(ndarray::s![batch_idx, .., .., ..])
+                .assign(&preprocessed.slice(ndarray::s![0, .., .., ..]));
         }
 
         // Run batch inference
@@ -377,18 +395,34 @@ impl RTDETRDetector {
             let total_dim = shape[2];
             let num_classes = total_dim - 4;
 
+            // PARALLEL: Split combined tensor for each batch
+            let boxes_logits: Vec<_> = (0..actual_batch_size)
+                .into_par_iter()
+                .map(|b| {
+                    let mut batch_boxes = Array::zeros((num_queries, 4));
+                    let mut batch_logits = Array::zeros((num_queries, num_classes));
+
+                    for q in 0..num_queries {
+                        for i in 0..4 {
+                            batch_boxes[[q, i]] = combined_output[[b, q, i]];
+                        }
+                        for i in 0..num_classes {
+                            batch_logits[[q, i]] = combined_output[[b, q, 4 + i]];
+                        }
+                    }
+                    (batch_boxes, batch_logits)
+                })
+                .collect();
+
+            // Reassemble into final arrays
             let mut pred_boxes = Array::zeros((actual_batch_size, num_queries, 4));
             let mut pred_logits = Array::zeros((actual_batch_size, num_queries, num_classes));
 
-            for b in 0..actual_batch_size {
-                for q in 0..num_queries {
-                    for i in 0..4 {
-                        pred_boxes[[b, q, i]] = combined_output[[b, q, i]];
-                    }
-                    for i in 0..num_classes {
-                        pred_logits[[b, q, i]] = combined_output[[b, q, 4 + i]];
-                    }
-                }
+            for (b, (boxes, logits)) in boxes_logits.into_iter().enumerate() {
+                pred_boxes.slice_mut(ndarray::s![b, .., ..]).assign(&boxes);
+                pred_logits
+                    .slice_mut(ndarray::s![b, .., ..])
+                    .assign(&logits);
             }
 
             (pred_boxes.into_dyn(), pred_logits.into_dyn())
@@ -437,20 +471,36 @@ impl RTDETRDetector {
         // Convert to DynamicImage for resizing
         let img = image::DynamicImage::ImageRgb8(rgb_img);
 
-        // Resize to 576x576 (RT-DETR input size)
+        // Resize to 640x640 (RT-DETR input size)
         let (target_w, target_h) = self.input_size;
         let resized = img.resize_exact(target_w, target_h, FilterType::Triangle);
         let rgb = resized.to_rgb8();
 
-        // Convert to normalized CHW format [1, 3, 576, 576]
-        let mut input_data = Array::zeros((1, 3, target_h as usize, target_w as usize));
+        // PARALLEL: Convert to normalized CHW format [1, 3, 640, 640]
+        // Process rows in parallel and collect results
+        let pixel_rows: Vec<Vec<[f32; 3]>> = (0..target_h as usize)
+            .into_par_iter()
+            .map(|y| {
+                (0..target_w as usize)
+                    .map(|x| {
+                        let pixel = rgb.get_pixel(x as u32, y as u32);
+                        [
+                            pixel[0] as f32 / 255.0,
+                            pixel[1] as f32 / 255.0,
+                            pixel[2] as f32 / 255.0,
+                        ]
+                    })
+                    .collect()
+            })
+            .collect();
 
-        for y in 0..target_h as usize {
-            for x in 0..target_w as usize {
-                let pixel = rgb.get_pixel(x as u32, y as u32);
-                input_data[[0, 0, y, x]] = pixel[0] as f32 / 255.0;
-                input_data[[0, 1, y, x]] = pixel[1] as f32 / 255.0;
-                input_data[[0, 2, y, x]] = pixel[2] as f32 / 255.0;
+        // Assemble into final array
+        let mut input_data = Array::zeros((1, 3, target_h as usize, target_w as usize));
+        for (y, row) in pixel_rows.iter().enumerate() {
+            for (x, pixel) in row.iter().enumerate() {
+                input_data[[0, 0, y, x]] = pixel[0];
+                input_data[[0, 1, y, x]] = pixel[1];
+                input_data[[0, 2, y, x]] = pixel[2];
             }
         }
 

@@ -36,8 +36,6 @@ pub mod video_pipeline;
 pub mod error;
 pub mod ffi; // Unity/C# integration
 pub mod image_utils; // Image manipulation utilities
-pub mod postprocessing;
-pub mod preprocessing;
 pub mod types;
 
 // Export the detectors

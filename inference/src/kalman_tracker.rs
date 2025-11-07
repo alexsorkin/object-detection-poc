@@ -171,7 +171,11 @@ pub struct TrackedObject {
     pub class_id: u32,
     pub class_name: String,
     pub kalman: KalmanFilter,
-    pub last_detection: TileDetection,
+    // OPTIMIZATION: Store only essential fields instead of full detection
+    pub last_x: f32,
+    pub last_y: f32,
+    pub last_w: f32,
+    pub last_h: f32,
     pub last_seen: Instant,
     pub confidence: f32,
     pub hits: u32,   // Number of successful measurements
@@ -185,7 +189,10 @@ impl TrackedObject {
             class_id: detection.class_id,
             class_name: detection.class_name.clone(),
             kalman: KalmanFilter::new(detection, config),
-            last_detection: detection.clone(),
+            last_x: detection.x,
+            last_y: detection.y,
+            last_w: detection.w,
+            last_h: detection.h,
             last_seen: Instant::now(),
             confidence: detection.confidence,
             hits: 1,
@@ -208,10 +215,8 @@ impl TrackedObject {
 
         if dt > 0.001 {
             // Manually compute and set velocity in Kalman state from position difference
-            let dx = (detection.x + detection.w / 2.0)
-                - (self.last_detection.x + self.last_detection.w / 2.0);
-            let dy = (detection.y + detection.h / 2.0)
-                - (self.last_detection.y + self.last_detection.h / 2.0);
+            let dx = (detection.x + detection.w / 2.0) - (self.last_x + self.last_w / 2.0);
+            let dy = (detection.y + detection.h / 2.0) - (self.last_y + self.last_h / 2.0);
             let vx = dx / dt;
             let vy = dy / dt;
 
@@ -221,7 +226,11 @@ impl TrackedObject {
         }
 
         self.kalman.update(detection);
-        self.last_detection = detection.clone();
+        // OPTIMIZATION: Store only essential fields instead of cloning entire detection
+        self.last_x = detection.x;
+        self.last_y = detection.y;
+        self.last_w = detection.w;
+        self.last_h = detection.h;
         self.last_seen = Instant::now();
         self.confidence = detection.confidence;
         self.hits += 1;
@@ -368,32 +377,37 @@ impl MultiObjectTracker {
         // Use Hungarian algorithm for optimal assignment
         let (_total_cost, assignments) = pathfinding::kuhn_munkres::kuhn_munkres(&cost_matrix);
 
-        // Filter matches by IoU threshold and convert back from transpose if needed
-        let mut matches = Vec::new();
-        for (row_idx, col_idx) in assignments.iter().enumerate() {
-            let (det_idx, track_idx) = if transpose {
-                (*col_idx, row_idx) // Transpose back
-            } else {
-                (row_idx, *col_idx)
-            };
+        // PARALLEL: Filter matches by cost threshold and convert from transpose if needed
+        let matches: Vec<(usize, usize)> = assignments
+            .par_iter()
+            .enumerate()
+            .filter_map(|(row_idx, col_idx)| {
+                let (det_idx, track_idx) = if transpose {
+                    (*col_idx, row_idx) // Transpose back
+                } else {
+                    (row_idx, *col_idx)
+                };
 
-            // Check if this is a valid match within bounds
-            if det_idx >= num_detections || track_idx >= num_tracks {
-                continue;
-            }
+                // Check if this is a valid match within bounds
+                if det_idx >= num_detections || track_idx >= num_tracks {
+                    return None;
+                }
 
-            let cost = if transpose {
-                cost_matrix[(track_idx, det_idx)]
-            } else {
-                cost_matrix[(det_idx, track_idx)]
-            };
+                let cost = if transpose {
+                    cost_matrix[(track_idx, det_idx)]
+                } else {
+                    cost_matrix[(det_idx, track_idx)]
+                };
 
-            // Accept match if cost is reasonable (< 2.0 * scale means distance or IoU based match is valid)
-            // This allows both IoU-based and centroid-distance-based matches
-            if cost < 2 * scale {
-                matches.push((det_idx, track_idx));
-            }
-        }
+                // Accept match if cost is reasonable (< 2.0 * scale means distance or IoU based match is valid)
+                // This allows both IoU-based and centroid-distance-based matches
+                if cost < 2 * scale {
+                    Some((det_idx, track_idx))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         matches
     }
