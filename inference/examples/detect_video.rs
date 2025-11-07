@@ -22,7 +22,6 @@ use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
-use military_target_detector::kalman_operator::KalmanOperator;
 use military_target_detector::kalman_tracker::KalmanConfig;
 use military_target_detector::types::DetectorConfig;
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
@@ -33,6 +32,7 @@ use opencv::{
     videoio::{self, VideoCapture, VideoWriter},
 };
 use std::env;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::thread;
@@ -208,25 +208,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let buffer_size = 2; // Tiny buffer - only allow 2 frames queued max
     let video_config = VideoPipelineConfig {
         max_latency_ms: 500,
-        kalman_config: Default::default(),
+        kalman_config: KalmanConfig {
+            max_age_ms: 1000,             // Keep tracks for 1s (detection interval is ~600ms)
+            iou_threshold: 0.10, // Very low threshold - detections 350-400ms apart can drift significantly
+            max_centroid_distance: 150.0, // Match if centroids within 150px (for fast-moving objects)
+            process_noise_pos: 5.0,       // Higher position uncertainty for fast-moving objects
+            process_noise_vel: 10.0, // Much higher velocity uncertainty (fast aircraft/vehicles)
+            measurement_noise: 5.0,  // Higher detector noise tolerance
+            initial_covariance: 20.0, // Higher initial uncertainty
+        },
         buffer_size,
     };
 
-    let video_pipeline = VideoPipeline::new(Arc::clone(&pipeline), video_config);
+    let video_pipeline = Arc::new(VideoPipeline::new(Arc::clone(&pipeline), video_config));
 
-    // Initialize global Kalman operator with maintenance thread
-    let kalman_config = KalmanConfig {
-        max_age_ms: 1000,             // Keep tracks for 1s (detection interval is ~600ms)
-        iou_threshold: 0.10, // Very low threshold - detections 350-400ms apart can drift significantly
-        max_centroid_distance: 150.0, // Match if centroids within 150px (for fast-moving objects)
-        process_noise_pos: 5.0, // Higher position uncertainty for fast-moving objects
-        process_noise_vel: 10.0, // Much higher velocity uncertainty (fast aircraft/vehicles)
-        measurement_noise: 5.0, // Higher detector noise tolerance
-        initial_covariance: 20.0, // Higher initial uncertainty
-    };
-    let kalman_operator = KalmanOperator::init(kalman_config);
-
-    eprintln!("  ✓ Pipeline ready (with Kalman operator + maintenance thread)");
+    eprintln!("  ✓ Pipeline ready (with internal Kalman tracker)");
     eprintln!("\n💡 Configuration:");
     eprintln!("  • Detector: RT-DETR (frame executor)");
     eprintln!("  • Batch size: {}", batch_size);
@@ -256,15 +252,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut frame_id = 0_u64;
     let mut paused = false;
-    let mut stats_processed = 0_u32;
-    let mut stats_extrapolated = 0_u32;
-    let mut stats_latency_sum = 0.0_f32;
+
+    // Thread-safe stats for detector thread
+    let stats_processed = Arc::new(AtomicU32::new(0));
+    let stats_extrapolated = Arc::new(AtomicU32::new(0));
+    let stats_latency_sum = Arc::new(AtomicU32::new(0)); // Store as integer (sum of ms)
     let stats_start = Instant::now();
-    let mut last_kalman_update = Instant::now();
+
+    // Track latest detections from VideoPipeline (includes Kalman tracking)
+    let mut latest_detections: Vec<military_target_detector::frame_pipeline::TileDetection> =
+        Vec::new();
+    let mut num_tracks = 0;
 
     // FPS pacing: Calculate target frame duration to match video's native FPS
     let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
-    let mut next_frame_time = Instant::now();
     let mut last_rgb_image: Option<RgbImage> = None;
 
     eprintln!(
@@ -275,83 +276,168 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     io::stderr().flush()?;
 
     // Create async capture thread - captures frames at video's native FPS
-    let (capture_tx, capture_rx) = sync_channel::<RgbImage>(3); // Small buffer for latest frames
-    let (done_tx, done_rx) = sync_channel::<()>(1); // Signal for end of video
+    // TWO separate queues:
+    // 1. detector_rx: Can drop frames (non-blocking), used for detection - carries timestamp
+    // 2. output_rx: Must process ALL frames (blocking), used for output
+    let (detector_tx, detector_rx) = sync_channel::<(RgbImage, Instant)>(3); // Detector queue with timestamp
+    let (output_tx, output_rx) = sync_channel::<(RgbImage, Instant)>(3); // Output queue - must process all
+    let (output_done_tx, output_done_rx) = sync_channel::<()>(1); // Signal for end of video
+    let (results_done_tx, results_done_rx) = sync_channel::<()>(1); // Signal for end of video
+    let (detector_done_tx, detector_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
-    let capture_handle = thread::spawn(move || {
-        let mut next_capture_time = Instant::now();
 
+    let capture_handle = thread::spawn(move || {
         loop {
-            // Pace capture to video's FPS
-            let now = Instant::now();
-            if now < next_capture_time {
-                let sleep_duration = next_capture_time - now;
-                std::thread::sleep(sleep_duration);
-            }
-            next_capture_time += capture_frame_duration;
+            let frame_start = Instant::now();
 
             match capture_frame(&mut cap) {
                 Ok(frame) => {
-                    // Send frame to main thread (non-blocking)
-                    if capture_tx.try_send(frame).is_err() {
-                        // Queue full, drop oldest frame (main thread will get latest)
-                        log::trace!("Capture queue full, dropping frame");
+                    let capture_time = Instant::now();
+
+                    // Send to detector queue (NON-BLOCKING - can drop if overflowing)
+                    // Include capture timestamp for age-based filtering
+                    let _ = detector_tx.try_send((frame.clone(), capture_time));
+
+                    // Send to output queue (BLOCKING - ensures ALL frames reach output)
+                    if output_tx.send((frame.clone(), capture_time)).is_err() {
+                        // Channel closed - main thread terminated
+                        break;
+                    }
+
+                    // Pace to target FPS - sleep for remaining time in this frame period
+                    let elapsed = frame_start.elapsed();
+                    if elapsed < capture_frame_duration {
+                        std::thread::sleep(capture_frame_duration - elapsed);
                     }
                 }
                 Err(_) => {
                     // End of video - send termination signal
                     eprintln!("\n📹 Capture thread: End of video");
                     io::stderr().flush().ok();
-                    let _ = done_tx.send(()); // Signal main thread
+                    let _ = output_done_tx.send(()); // Signal main thread
+                    let _ = detector_done_tx.send(()); // Signal main thread
+                    let _ = results_done_tx.send(()); // Signal main thread
+                                                      // Explicitly drop senders to close channels
+                    drop(detector_tx);
+                    drop(output_tx);
                     break;
                 }
             }
         }
     });
 
+    let video_pipeline_for_detector = Arc::clone(&video_pipeline);
+
+    let detector_handle = thread::spawn(move || {
+        let mut detector_frame_id = 0_u64;
+
+        loop {
+            if detector_done_rx.try_recv().is_ok() {
+                eprintln!("\n📹 Detector thread: End of video");
+                io::stderr().flush().ok();
+                break;
+            }
+
+            // Drain DETECTOR queue to get only the LATEST frame
+            // This naturally skips frames - if detection is slow, many frames accumulate and we only take the newest
+            let mut latest_detector_frame: Option<(RgbImage, Instant)> = None;
+            let mut frames_drained = 0;
+            while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
+                latest_detector_frame = Some(frame_with_timestamp);
+                frames_drained += 1;
+            }
+
+            // Submit latest detector frame if available
+            if let Some((detector_frame, capture_time)) = latest_detector_frame {
+                if frames_drained > 1 {
+                    log::debug!("Drained {} frames, using latest", frames_drained);
+                }
+
+                let frame = Frame {
+                    frame_id: detector_frame_id,
+                    image: detector_frame,
+                    timestamp: capture_time,
+                };
+
+                // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
+                // This provides natural backpressure without pacing
+                if video_pipeline_for_detector.try_submit_frame(frame) {
+                    log::debug!("Submitted frame {} to video pipeline", detector_frame_id);
+                    detector_frame_id += 1;
+                } else {
+                    log::debug!("Pipeline busy, frame dropped");
+                }
+            }
+
+            // Small sleep to avoid busy loop when queue is empty
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    // Create result collector thread - consumes detection results asynchronously
+    // This prevents result retrieval from blocking the main display loop
+    let video_pipeline_for_results = Arc::clone(&video_pipeline);
+    let stats_processed_for_results = Arc::clone(&stats_processed);
+    let stats_extrapolated_for_results = Arc::clone(&stats_extrapolated);
+    let stats_latency_for_results = Arc::clone(&stats_latency_sum);
+
+    // Channel to send latest detections to main thread for display
+    let (detections_tx, detections_rx) =
+        sync_channel::<Vec<military_target_detector::frame_pipeline::TileDetection>>(2);
+
+    let results_handle = thread::spawn(move || {
+        loop {
+            if results_done_rx.try_recv().is_ok() {
+                eprintln!("\n📹 Results thread: End of video");
+                io::stderr().flush().ok();
+                break;
+            }
+
+            // Non-blocking check for results
+            if let Some(result) = video_pipeline_for_results.try_get_result() {
+                // Update stats
+                if result.is_extrapolated {
+                    stats_extrapolated_for_results.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats_processed_for_results.fetch_add(1, Ordering::Relaxed);
+                }
+                stats_latency_for_results.fetch_add(result.latency_ms as u32, Ordering::Relaxed);
+
+                // Send detections to main thread (non-blocking)
+                let _ = detections_tx.try_send(result.detections);
+            }
+
+            // Small sleep to avoid busy loop
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
     loop {
         let frame_start = Instant::now();
 
-        // Try to get latest frame from capture thread
-        let mut new_captured_frame: Option<RgbImage> = None;
-        let mut frames_available = 0;
+        // Try to get frame from OUTPUT queue (non-blocking with compensation)
+        let new_captured_frame: Option<RgbImage> =
+            output_rx.try_recv().ok().map(|(frame, _timestamp)| frame);
 
-        // Drain capture queue to get the latest frame
-        while let Ok(frame) = capture_rx.try_recv() {
-            new_captured_frame = Some(frame);
-            frames_available += 1;
-        }
-
-        // Determine what frame to use and whether to send to detector
-        let (rgb_image, send_to_detector) = if let Some(captured) = new_captured_frame {
+        // Determine what frame to use for output
+        let rgb_image = if let Some(captured) = new_captured_frame {
             // Got a new frame from capture thread
             last_rgb_image = Some(captured.clone());
-
-            // If we're lagging (more than 1 frame available), skip detector to catch up
-            let should_send_to_detector = frames_available <= 1;
-
-            if frames_available > 1 {
-                log::debug!(
-                    "⚠️ Lagging {} frames behind capture - skipping detector",
-                    frames_available
-                );
-            }
-
-            (captured, should_send_to_detector) // New frame - conditionally send to detector, always output
+            captured
         } else if let Some(ref last_frame) = last_rgb_image {
             // Check if capture thread signaled end of video
-            if done_rx.try_recv().is_ok() {
+            if output_done_rx.try_recv().is_ok() {
                 eprintln!("\n📹 End of video");
                 io::stderr().flush()?;
                 break;
             }
 
-            // No new frame available - repeat last frame for output only
+            // No new frame available - repeat last frame for output
             log::debug!("⏭️ No new frame, repeating last frame for output");
-            (last_frame.clone(), false) // Repeated frame - output only, skip detector
+            last_frame.clone() // Repeated frame for smooth output
         } else {
             // No frames captured yet - check if capture thread signaled end
-            if done_rx.try_recv().is_ok() {
+            if output_done_rx.try_recv().is_ok() {
                 eprintln!("\n📹 End of video (no frames captured)");
                 io::stderr().flush()?;
                 break;
@@ -360,13 +446,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
-
-        // Pace to target FPS
-        if frame_start < next_frame_time {
-            let sleep_duration = next_frame_time - frame_start;
-            std::thread::sleep(sleep_duration);
-        }
-        next_frame_time += frame_duration;
 
         // Initialize video writer on first frame (now we know actual dimensions)
         let orig_width = rgb_image.width();
@@ -409,47 +488,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writer_handle = Some(handle);
         }
 
-        // Get results from detection pipeline (async - may or may not have results)
-        while let Some(result) = video_pipeline.try_get_result() {
-            if result.is_extrapolated {
-                stats_extrapolated += 1;
-            } else {
-                stats_processed += 1;
-
-                // Update Kalman operator with real detections
-                // Use WALL-CLOCK time, not frame timestamp
-                let current_time = Instant::now();
-                let dt = current_time
-                    .duration_since(last_kalman_update)
-                    .as_secs_f32();
-
-                let operator = kalman_operator.lock().unwrap();
-                let _ = operator.send_update(result.detections.clone(), dt);
-                drop(operator);
-
-                last_kalman_update = current_time;
-            }
-            stats_latency_sum += result.latency_ms;
+        // Get latest detections from results thread (non-blocking)
+        if let Ok(detections) = detections_rx.try_recv() {
+            latest_detections = detections;
+            num_tracks = latest_detections
+                .iter()
+                .filter(|d| d.track_id.is_some())
+                .count();
         }
 
-        // Submit frame to detector ONLY if it's a newly captured frame (not repeated)
-        if send_to_detector {
-            let frame = Frame {
-                frame_id,
-                image: rgb_image.clone(),
-                timestamp: frame_start,
-            };
-            video_pipeline.try_submit_frame(frame);
-        } else {
-            log::debug!("⏭️  Skipping detector for repeated frame {}", frame_id);
-        }
-
-        // Get current Kalman predictions (may be empty if no tracks yet)
-        let operator = kalman_operator.lock().unwrap();
-        let detections_to_display = operator.get_predictions();
-        drop(operator);
-
-        // Annotate current frame with Kalman predictions
+        // Annotate current frame with latest detections (from VideoPipeline with Kalman)
         let mut annotated = rgb_image.clone();
 
         // Calculate scale factors (detections are in resized image coordinates)
@@ -476,7 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scale_y = orig_height as f32 / resized_height as f32;
 
         // Draw detections with track ID visualization
-        for det in &detections_to_display {
+        for det in &latest_detections {
             // Use consistent color per class (person=green, car=blue, etc.)
             let color = generate_class_color(det.class_id);
 
@@ -521,13 +569,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Draw stats overlay
-        let operator = kalman_operator.lock().unwrap();
-        let num_tracks = operator.get_predictions().len();
-        drop(operator);
-
         let stats_text = format!(
             "Frame: {} | Tracks: {} | Detections: {} RT-DETR",
-            frame_id, num_tracks, stats_processed
+            frame_id,
+            num_tracks,
+            stats_processed.load(Ordering::Relaxed)
         );
 
         draw_text(
@@ -585,20 +631,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if frame_id % progress_interval == 0 {
             let elapsed = stats_start.elapsed().as_secs_f32();
             let avg_fps = frame_id as f32 / elapsed;
-            let total = stats_processed + stats_extrapolated;
+            let processed = stats_processed.load(Ordering::Relaxed);
+            let extrapolated = stats_extrapolated.load(Ordering::Relaxed);
+            let total = processed + extrapolated;
             let avg_latency = if total > 0 {
-                stats_latency_sum / total as f32
+                stats_latency_sum.load(Ordering::Relaxed) as f32 / total as f32
             } else {
                 0.0
             };
 
-            let operator = kalman_operator.lock().unwrap();
-            let num_tracks = operator.get_predictions().len();
-            drop(operator);
-
             eprintln!(
                 "Frame {}: {:.1} FPS | Tracks: {} | Real detections: {} | Avg Latency: {:.0}ms",
-                frame_id, avg_fps, num_tracks, stats_processed, avg_latency
+                frame_id, avg_fps, num_tracks, processed, avg_latency
             );
             io::stderr().flush().ok();
         }
@@ -621,14 +665,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("▶️  Resumed");
             io::stderr().flush()?;
         }
+
+        // Pace to target FPS - sleep for remaining time in this frame period
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_duration {
+            std::thread::sleep(frame_duration - elapsed);
+        }
     }
 
     // Final statistics
     let total_time = stats_start.elapsed().as_secs_f32();
-    let total = stats_processed + stats_extrapolated;
+    let processed = stats_processed.load(Ordering::Relaxed);
+    let extrapolated = stats_extrapolated.load(Ordering::Relaxed);
+    let total = processed + extrapolated;
     let avg_fps = frame_id as f32 / total_time;
     let avg_latency = if total > 0 {
-        stats_latency_sum / total as f32
+        stats_latency_sum.load(Ordering::Relaxed) as f32 / total as f32
     } else {
         0.0
     };
@@ -638,7 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  • Duration: {:.1}s", total_time);
     eprintln!("  • Average FPS: {:.1}", avg_fps);
     eprintln!("\n  Detection Stats:");
-    eprintln!("    - Real detections: {}", stats_processed);
+    eprintln!("    - Real detections: {}", processed);
     eprintln!("    - Average latency: {:.0}ms", avg_latency);
     io::stderr().flush()?;
 
@@ -653,6 +705,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for capture thread to finish
     if let Err(e) = capture_handle.join() {
         eprintln!("⚠️  Capture thread error: {:?}", e);
+    }
+    if let Err(e) = detector_handle.join() {
+        eprintln!("⚠️  Detector thread error: {:?}", e);
+    }
+    // Results thread will exit when video_pipeline is dropped
+    if let Err(e) = results_handle.join() {
+        eprintln!("⚠️  Results thread error: {:?}", e);
     }
 
     eprintln!("\n✅ Output video saved: {}", output_path);
