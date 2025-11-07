@@ -344,9 +344,8 @@ impl PreprocessStage {
                 // Pad if necessary
                 let tile = if crop_width < self.tile_size || crop_height < self.tile_size {
                     let mut padded = RgbImage::new(self.tile_size, self.tile_size);
-                    for pixel in padded.pixels_mut() {
-                        *pixel = Rgb([114, 114, 114]);
-                    }
+                    // OPTIMIZATION: Use fill instead of loop for faster initialization
+                    padded.fill(114);  // Gray padding color
                     image::imageops::overlay(&mut padded, &cropped, 0, 0);
                     padded
                 } else {
@@ -436,21 +435,32 @@ impl ExecutionStage {
         // Submit all tiles to batch executor
         let mut responses = Vec::new();
         let submit_start = Instant::now();
-        for tile in &input.tiles {
-            let mut tile_data = Vec::new();
-            for pixel in tile.image.pixels() {
-                tile_data.push(pixel[0]);
-                tile_data.push(pixel[1]);
-                tile_data.push(pixel[2]);
-            }
+        
+        // PARALLEL: Convert all tiles to ImageData concurrently
+        let tile_data_vec: Vec<_> = input.tiles
+            .par_iter()
+            .map(|tile| {
+                // Pre-allocate with exact capacity for better performance
+                let mut tile_data = Vec::with_capacity((tile.image.width() * tile.image.height() * 3) as usize);
+                
+                // Flatten RGB data
+                for pixel in tile.image.pixels() {
+                    tile_data.push(pixel[0]);
+                    tile_data.push(pixel[1]);
+                    tile_data.push(pixel[2]);
+                }
 
-            let image_data = ImageData::new(
-                tile_data,
-                tile.image.width(),
-                tile.image.height(),
-                ImageFormat::RGB,
-            );
+                ImageData::new(
+                    tile_data,
+                    tile.image.width(),
+                    tile.image.height(),
+                    ImageFormat::RGB,
+                )
+            })
+            .collect();
 
+        // Submit tiles sequentially (submission must be sequential for ordering)
+        for (tile, image_data) in input.tiles.iter().zip(tile_data_vec) {
             let tile_start = Instant::now();
             let response_rx = self.frame_executor.detect_async(image_data);
             
@@ -619,41 +629,43 @@ impl PostprocessStage {
 
     /// Filter out detections that are fully contained within other detections
     /// Only removes nested detections if they are of the same class as the parent
+    /// OPTIMIZATION: Parallel filtering - each detection checked concurrently
     fn filter_nested_detections(&self, detections: Vec<TileDetection>) -> Vec<TileDetection> {
-        let mut filtered = Vec::new();
         const NESTED_PADDING: f32 = 10.0; // Add 10px padding to nested detection boundaries
 
-        for (i, det) in detections.iter().enumerate() {
-            let mut is_contained = false;
+        // PARALLEL: Check each detection concurrently for containment
+        let filtered: Vec<TileDetection> = detections
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, det)| {
+                // Check if this detection is contained in any other detection
+                let is_contained = detections.iter().enumerate().any(|(j, other)| {
+                    i != j 
+                        && det.class_id == other.class_id  // Only remove if same class
+                        && Self::is_fully_contained(det, other, NESTED_PADDING)
+                });
 
-            // Check if this detection is contained in any other detection
-            for (j, other) in detections.iter().enumerate() {
-                if i != j 
-                    && det.class_id == other.class_id  // Only remove if same class
-                    && Self::is_fully_contained(det, other, NESTED_PADDING) 
-                {
-                    is_contained = true;
-                    break;
+                if !is_contained {
+                    Some(det.clone())
+                } else {
+                    None
                 }
-            }
-
-            if !is_contained {
-                filtered.push(det.clone());
-            }
-        }
+            })
+            .collect();
 
         filtered
     }
 
     /// Apply NMS to remove duplicates
     /// OPTIMIZATION: Parallel NMS by class - each class processed independently
+    /// OPTIMIZATION: Parallel IoU calculation - suppression checks run concurrently
     fn apply_nms(&self, detections: Vec<TileDetection>) -> Vec<TileDetection> {
         if detections.is_empty() {
             return detections;
         }
 
-        // Group detections by class
-        let classes: HashSet<u32> = detections.iter().map(|d| d.class_id).collect();
+        // PARALLEL: Group detections by class using concurrent collection
+        let classes: HashSet<u32> = detections.par_iter().map(|d| d.class_id).collect();
         
         // PARALLEL: Process each class independently
         let results: Vec<TileDetection> = classes
@@ -680,15 +692,19 @@ impl PostprocessStage {
 
                     keep.push(class_dets[i].clone());
 
-                    for j in (i + 1)..class_dets.len() {
-                        if suppressed[j] {
-                            continue;
-                        }
+                    // PARALLEL: Calculate IoU for all remaining detections concurrently
+                    // Collect indices that should be suppressed
+                    let to_suppress: Vec<usize> = (i + 1..class_dets.len())
+                        .into_par_iter()
+                        .filter(|&j| {
+                            !suppressed[j] 
+                                && Self::calculate_iou(&class_dets[i], &class_dets[j]) > self.iou_threshold
+                        })
+                        .collect();
 
-                        let iou = Self::calculate_iou(&class_dets[i], &class_dets[j]);
-                        if iou > self.iou_threshold {
-                            suppressed[j] = true;
-                        }
+                    // Mark all suppressed indices
+                    for j in to_suppress {
+                        suppressed[j] = true;
                     }
                 }
 
