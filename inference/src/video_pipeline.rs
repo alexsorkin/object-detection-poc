@@ -46,7 +46,7 @@ impl Default for VideoPipelineConfig {
         Self {
             max_latency_ms: 500,
             kalman_config: KalmanConfig::default(),
-            buffer_size: 10,
+            buffer_size: 2,
         }
     }
 }

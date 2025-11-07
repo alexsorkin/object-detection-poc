@@ -327,12 +327,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Got a new frame from capture thread
             last_rgb_image = Some(captured.clone());
 
-            // Check if we're lagging more than 2 frames behind
-            if frames_available > 2 {
-                log::warn!("⚠️ Lagging {} frames behind capture", frames_available);
+            // If we're lagging (more than 1 frame available), skip detector to catch up
+            let should_send_to_detector = frames_available <= 1;
+
+            if frames_available > 1 {
+                log::debug!(
+                    "⚠️ Lagging {} frames behind capture - skipping detector",
+                    frames_available
+                );
             }
 
-            (captured, true) // New frame - send to detector and output
+            (captured, should_send_to_detector) // New frame - conditionally send to detector, always output
         } else if let Some(ref last_frame) = last_rgb_image {
             // Check if capture thread signaled end of video
             if done_rx.try_recv().is_ok() {
