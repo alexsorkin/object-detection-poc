@@ -15,6 +15,7 @@
 /// Options (can be in any order):
 ///   --confidence <0-100>    Detection confidence threshold (default: 50)
 ///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
+///   --model <variant>       RT-DETR model variant: r18vd, r34vd, r50vd (default: r18vd)
 ///   --headless              Run without display window (default: show window)
 ///
 /// Examples:
@@ -22,14 +23,17 @@
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- test_data/airport.mp4 --confidence 60 --headless
 ///   cargo run --release --features metal --example detect_video -- --headless --classes 0,2,5,7 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- --model r50vd test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam
 use image::{Rgb, RgbImage};
 use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
-use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
+use military_target_detector::image_utils::{
+    draw_rect_batch, draw_text, draw_text_batch, generate_class_color,
+};
 use military_target_detector::kalman_tracker::KalmanConfig;
-use military_target_detector::types::DetectorConfig;
+use military_target_detector::types::{DetectorConfig, RTDETRModel};
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
 use opencv::{
     core::Mat,
@@ -91,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut confidence_threshold = 0.50; // Default 50%
     let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
     let mut headless = false; // Default: show display window
+    let mut model_variant = RTDETRModel::R18VD; // Default: r18vd
     let mut video_source: Option<String> = None;
 
     // Parse all arguments in any order
@@ -126,6 +131,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--headless" => {
                 headless = true;
+            }
+            "--model" => {
+                i += 1;
+                if i < args.len() {
+                    match RTDETRModel::from_str(&args[i]) {
+                        Some(model) => {
+                            model_variant = model;
+                        }
+                        None => {
+                            eprintln!(
+                                "Invalid model variant '{}'. Valid options: r18vd, r34vd, r50vd",
+                                args[i]
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
             }
             arg => {
                 // If it doesn't start with --, treat it as the video source
@@ -188,8 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
     let detector_config = DetectorConfig {
-        fp16_model_path: Some("../models/rtdetr_v2_r18vd_batch.onnx".to_string()),
-        fp32_model_path: Some("../models/rtdetr_v2_r18vd_batch.onnx".to_string()),
+        model_path: format!("../models/{}", model_variant.filename()),
         confidence_threshold,
         nms_threshold: 0.45,
         input_size: (640, 640),
@@ -240,7 +261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("  ✓ Pipeline ready (with internal Kalman tracker)");
     eprintln!("\n💡 Configuration:");
-    eprintln!("  • Detector: RT-DETR (frame executor)");
+    eprintln!("  • Detector: {} (frame executor)", model_variant.name());
     eprintln!("  • Batch size: {}", batch_size);
     eprintln!("  • Queue depth: {} (backpressure)", max_queue_depth);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
@@ -599,29 +620,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
 
-        // SEQUENTIAL: Apply annotations to image (image operations are not thread-safe)
-        for (scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label) in annotation_data {
-            draw_rect(
-                &mut annotated,
-                scaled_x,
-                scaled_y,
-                scaled_w,
-                scaled_h,
-                color,
-                2,
-            );
+        // PARALLEL BATCH: Prepare rectangle and label data for batch drawing
+        let rects: Vec<_> = annotation_data
+            .iter()
+            .map(|(x, y, w, h, color, _label, _show_label)| (*x, *y, *w, *h, *color, 2))
+            .collect();
 
-            if show_label {
-                draw_text(
-                    &mut annotated,
-                    &label,
-                    scaled_x + 3,
-                    scaled_y + 15,
-                    Rgb([255, 255, 255]),
-                    None,
-                );
-            }
-        }
+        let labels: Vec<_> = annotation_data
+            .iter()
+            .filter(|(_x, _y, _w, _h, _color, _label, show_label)| *show_label)
+            .map(|(x, _y, _w, _h, _color, label, _show_label)| {
+                (label.as_str(), x + 3, _y + 15, Rgb([255, 255, 255]), None)
+            })
+            .collect();
+
+        // Draw all rectangles and labels in parallel
+        draw_rect_batch(&mut annotated, &rects);
+        draw_text_batch(&mut annotated, &labels);
 
         // Draw stats overlay (only when displaying to reduce overhead)
         if frame_id % display_interval == 0 {

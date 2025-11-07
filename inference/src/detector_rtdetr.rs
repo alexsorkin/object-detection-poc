@@ -118,19 +118,6 @@ impl RTDETRDetector {
 
     /// Select appropriate model based on config
     fn select_model(config: &DetectorConfig) -> Result<(String, bool), DetectionError> {
-        if let Some(ref fp16_path) = config.fp16_model_path {
-            if config.use_gpu {
-                return Ok((fp16_path.clone(), true));
-            }
-        }
-
-        if let Some(ref fp32_path) = config.fp32_model_path {
-            if !config.use_gpu {
-                return Ok((fp32_path.clone(), false));
-            }
-        }
-
-        #[allow(deprecated)]
         if !config.model_path.is_empty() {
             return Ok((config.model_path.clone(), config.use_gpu));
         }
@@ -143,11 +130,6 @@ impl RTDETRDetector {
 
     /// Get fallback model path (FP32 for CPU)
     fn get_fallback_model(config: &DetectorConfig) -> Result<String, DetectionError> {
-        if let Some(ref fp32_path) = config.fp32_model_path {
-            return Ok(fp32_path.clone());
-        }
-
-        #[allow(deprecated)]
         if !config.model_path.is_empty() {
             return Ok(config.model_path.clone());
         }

@@ -16,10 +16,7 @@ fn benchmark_model(
     println!("═══════════════════════════════════════════════════════\n");
 
     let config = DetectorConfig {
-        #[allow(deprecated)]
         model_path: model_path.to_string(),
-        fp16_model_path: Some(model_path.to_string()),
-        fp32_model_path: Some(model_path.to_string()),
         confidence_threshold: 0.25,
         nms_threshold: 0.45,
         input_size: (640, 640),

@@ -73,10 +73,7 @@ pub extern "C" fn mtd_create_detector(
     // For FFI backward compatibility, use the same model path for both variants
     // The detector will use whichever one exists based on use_gpu setting
     let config = DetectorConfig {
-        #[allow(deprecated)]
         model_path: model_path_str.clone(),
-        fp16_model_path: Some(model_path_str.clone()),
-        fp32_model_path: Some(model_path_str),
         input_size: (input_width as u32, input_height as u32),
         confidence_threshold,
         nms_threshold,

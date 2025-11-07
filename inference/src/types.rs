@@ -728,15 +728,7 @@ impl DetectionResult {
 /// Configuration for the military target detector
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectorConfig {
-    /// Path to ONNX model file (deprecated - use fp16_model_path/fp32_model_path)
-    #[deprecated(note = "Use fp16_model_path and fp32_model_path instead")]
     pub model_path: String,
-
-    /// Path to FP16 ONNX model (used when GPU/CoreML is available)
-    pub fp16_model_path: Option<String>,
-
-    /// Path to FP32 ONNX model (used for CPU fallback or when use_gpu=false)
-    pub fp32_model_path: Option<String>,
 
     /// Input image size (width, height)
     pub input_size: (u32, u32),
@@ -766,10 +758,7 @@ pub struct DetectorConfig {
 impl Default for DetectorConfig {
     fn default() -> Self {
         Self {
-            #[allow(deprecated)]
             model_path: "models/military_targets.onnx".to_string(),
-            fp16_model_path: Some("models/yolov8m_batch_fp16.onnx".to_string()),
-            fp32_model_path: Some("models/yolov8m_batch_fp32.onnx".to_string()),
             input_size: (640, 640),
             confidence_threshold: 0.5,
             nms_threshold: 0.45,
@@ -884,5 +873,63 @@ impl ImageData {
     pub fn validate(&self) -> bool {
         let expected_size = (self.width * self.height * self.channels()) as usize;
         self.data.len() == expected_size
+    }
+}
+
+/// RT-DETR model variants with their corresponding ONNX file paths
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RTDETRModel {
+    /// RT-DETR v2 with ResNet-18 backbone
+    R18VD,
+    /// RT-DETR v2 with ResNet-34 backbone  
+    R34VD,
+    /// RT-DETR v2 with ResNet-50 backbone
+    R50VD,
+}
+
+impl RTDETRModel {
+    /// Get the model file name for this variant
+    pub fn filename(&self) -> &'static str {
+        match self {
+            Self::R18VD => "rtdetr_v2_r18vd_batch.onnx",
+            Self::R34VD => "rtdetr_v2_r34vd_batch.onnx",
+            Self::R50VD => "rtdetr_v2_r50vd_batch.onnx",
+        }
+    }
+
+    /// Get the model name as a string
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::R18VD => "RT-DETR v2 R18",
+            Self::R34VD => "RT-DETR v2 R34",
+            Self::R50VD => "RT-DETR v2 R50",
+        }
+    }
+
+    /// Parse from string (case-insensitive)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "r18vd" | "r18" => Some(Self::R18VD),
+            "r34vd" | "r34" => Some(Self::R34VD),
+            "r50vd" | "r50" => Some(Self::R50VD),
+            _ => None,
+        }
+    }
+
+    /// Get all available model variants
+    pub fn all() -> Vec<Self> {
+        vec![Self::R18VD, Self::R34VD, Self::R50VD]
+    }
+}
+
+impl Default for RTDETRModel {
+    fn default() -> Self {
+        Self::R18VD // Smallest/fastest model as default
+    }
+}
+
+impl std::fmt::Display for RTDETRModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
     }
 }

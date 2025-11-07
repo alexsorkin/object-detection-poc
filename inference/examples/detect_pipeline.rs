@@ -20,7 +20,9 @@ use image::ImageReader;
 use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
-use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
+use military_target_detector::image_utils::{
+    draw_rect_batch, draw_text_batch, generate_class_color,
+};
 use military_target_detector::types::DetectorConfig;
 use std::env;
 use std::sync::Arc;
@@ -116,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - NVIDIA (CUDA/TensorRT): Use FP16 for 2-3x speedup
     // - Apple (CoreML/Metal): Use FP32 (CoreML optimizes internally)
     // - CPU: Use FP32
-    let (fp16_path, fp32_path) = match detector_type {
+    let (_module_path, _use_gpu) = match detector_type {
         DetectorType::YOLOV8 => {
             #[cfg(any(feature = "cuda", feature = "tensorrt"))]
             let paths = (
@@ -150,8 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let detector_config = DetectorConfig {
-        fp16_model_path: Some(fp16_path.to_string()),
-        fp32_model_path: Some(fp32_path.to_string()),
+        model_path: "../models/rtdetr_v2_r18vd_batch.onnx".to_string(),
         confidence_threshold,
         nms_threshold: 0.45,
         input_size: (input_width, input_height),
@@ -291,41 +292,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         annotated_img.height()
     );
 
-    for (detection_num, det) in result.detections.iter().enumerate() {
-        let color = generate_class_color(det.class_id);
+    // Prepare batch data for parallel drawing
+    let rects: Vec<_> = result
+        .detections
+        .iter()
+        .map(|det| {
+            let color = generate_class_color(det.class_id);
+            (
+                det.x as i32,
+                det.y as i32,
+                det.w as u32,
+                det.h as u32,
+                color,
+                2,
+            )
+        })
+        .collect();
 
-        // Use detection coordinates directly (already in resized image space)
-        draw_rect(
-            &mut annotated_img,
-            det.x as i32,
-            det.y as i32,
-            det.w as u32,
-            det.h as u32,
-            color,
-            2,
-        );
-
-        let label = format!(
-            "{}#{} {:.0}%",
-            det.class_name,
-            detection_num + 1,
-            det.confidence * 100.0
-        );
-        let padding = 3;
-        let text_x = (det.x as i32 + padding).max(0);
-        let text_y = (det.y as i32 + padding).max(0);
-
-        if det.h > 20.0 && det.w > 30.0 {
-            draw_text(
-                &mut annotated_img,
-                &label,
-                text_x,
-                text_y,
-                image::Rgb([255, 255, 255]),
-                None,
+    let labels: Vec<_> = result
+        .detections
+        .iter()
+        .enumerate()
+        .filter(|(_i, det)| det.h > 20.0 && det.w > 30.0) // Only show labels if box is big enough
+        .map(|(detection_num, det)| {
+            let label = format!(
+                "{}#{} {:.0}%",
+                det.class_name,
+                detection_num + 1,
+                det.confidence * 100.0
             );
-        }
-    }
+            let padding = 3;
+            let text_x = (det.x as i32 + padding).max(0);
+            let text_y = (det.y as i32 + padding).max(0);
+            (label, text_x, text_y, image::Rgb([255, 255, 255]), None)
+        })
+        .collect();
+
+    // Convert labels to string references for batch function
+    let label_refs: Vec<_> = labels
+        .iter()
+        .map(|(label, x, y, color, bg)| (label.as_str(), *x, *y, *color, *bg))
+        .collect();
+
+    // Draw all rectangles and labels in parallel
+    draw_rect_batch(&mut annotated_img, &rects);
+    draw_text_batch(&mut annotated_img, &label_refs);
     println!("✓");
 
     // Save
