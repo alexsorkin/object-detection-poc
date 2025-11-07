@@ -297,3 +297,143 @@ pub fn draw_rect(
         draw_hollow_rect_mut(img, expanded_rect, color);
     }
 }
+
+/// Parallel batch text rendering - draw multiple text labels in parallel
+///
+/// # Arguments
+/// * `img` - The image to draw on
+/// * `labels` - Vector of (text, x, y, color, bg_color) tuples
+pub fn draw_text_batch(
+    img: &mut RgbImage,
+    labels: &[(&str, i32, i32, Rgb<u8>, Option<Rgb<u8>>)],
+) {
+    use rayon::prelude::*;
+
+    // Collect all pixel modifications in parallel
+    let pixel_updates: Vec<Vec<(u32, u32, Rgb<u8>)>> = labels
+        .par_iter()
+        .map(|(text, x, y, color, bg_color)| {
+            let mut pixels = Vec::new();
+            let char_width = 5;
+            let char_height = 7;
+
+            // Collect background pixels
+            if let Some(bg) = bg_color {
+                let text_width = (text.len() as i32 * char_width) + 2;
+                let text_height = char_height + 2;
+
+                for dy in 0..text_height {
+                    for dx in 0..text_width {
+                        let px = x + dx;
+                        let py = y + dy;
+                        if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                            pixels.push((px as u32, py as u32, *bg));
+                        }
+                    }
+                }
+            }
+
+            // Collect character pixels
+            for (i, ch) in text.to_uppercase().chars().enumerate() {
+                let char_x = x + 1 + (i as i32 * char_width);
+                let char_y = y + 1;
+                let pattern = get_char_pattern(ch);
+
+                for (row, &bits) in pattern.iter().enumerate() {
+                    for col in 0..5 {
+                        if (bits >> (4 - col)) & 1 == 1 {
+                            let px = char_x + col;
+                            let py = char_y + row as i32;
+                            if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                                pixels.push((px as u32, py as u32, *color));
+                            }
+                        }
+                    }
+                }
+            }
+
+            pixels
+        })
+        .collect();
+
+    // Apply all pixel updates sequentially (fast since it's just memory writes)
+    for pixel_set in pixel_updates {
+        for (x, y, color) in pixel_set {
+            img.put_pixel(x, y, color);
+        }
+    }
+}
+
+/// Parallel batch rectangle drawing - draw multiple rectangles in parallel
+///
+/// # Arguments
+/// * `img` - The image to draw on
+/// * `rects` - Vector of (x, y, width, height, color, thickness) tuples
+pub fn draw_rect_batch(
+    img: &mut RgbImage,
+    rects: &[(i32, i32, u32, u32, Rgb<u8>, i32)],
+) {
+    use imageproc::rect::Rect;
+    use rayon::prelude::*;
+
+    // Collect all pixels for all rectangles in parallel
+    let pixel_updates: Vec<Vec<(u32, u32, Rgb<u8>)>> = rects
+        .par_iter()
+        .map(|(x, y, width, height, color, thickness)| {
+            let mut pixels = Vec::new();
+            let rect = Rect::at(*x, *y).of_size(*width, *height);
+
+            // Collect pixels for all thickness layers
+            for offset in 0..*thickness {
+                let expanded_rect = Rect::at(rect.left() - offset, rect.top() - offset)
+                    .of_size(
+                        rect.width() + (offset * 2) as u32,
+                        rect.height() + (offset * 2) as u32,
+                    );
+
+                // Collect hollow rectangle pixels
+                // Top edge
+                for dx in 0..expanded_rect.width() {
+                    let px = expanded_rect.left() + dx as i32;
+                    let py = expanded_rect.top();
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        pixels.push((px as u32, py as u32, *color));
+                    }
+                }
+                // Bottom edge
+                for dx in 0..expanded_rect.width() {
+                    let px = expanded_rect.left() + dx as i32;
+                    let py = expanded_rect.bottom() - 1;
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        pixels.push((px as u32, py as u32, *color));
+                    }
+                }
+                // Left edge
+                for dy in 0..expanded_rect.height() {
+                    let px = expanded_rect.left();
+                    let py = expanded_rect.top() + dy as i32;
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        pixels.push((px as u32, py as u32, *color));
+                    }
+                }
+                // Right edge
+                for dy in 0..expanded_rect.height() {
+                    let px = expanded_rect.right() - 1;
+                    let py = expanded_rect.top() + dy as i32;
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        pixels.push((px as u32, py as u32, *color));
+                    }
+                }
+            }
+
+            pixels
+        })
+        .collect();
+
+    // Apply all pixel updates sequentially
+    for pixel_set in pixel_updates {
+        for (x, y, color) in pixel_set {
+            img.put_pixel(x, y, color);
+        }
+    }
+}

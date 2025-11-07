@@ -225,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_config = VideoPipelineConfig {
         max_latency_ms: 500,
         kalman_config: KalmanConfig {
-            max_age_ms: 1000,             // Keep tracks for 1s (detection interval is ~600ms)
+            max_age_ms: 500,              // Keep tracks for 1s (detection interval is ~600ms)
             iou_threshold: 0.10, // Very low threshold - detections 350-400ms apart can drift significantly
             max_centroid_distance: 150.0, // Match if centroids within 150px (for fast-moving objects)
             process_noise_pos: 5.0,       // Higher position uncertainty for fast-moving objects
@@ -353,13 +353,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_pipeline_for_detector = Arc::clone(&video_pipeline);
 
     let detector_handle = thread::spawn(move || {
-        let mut detector_frame_id = 0_u64;
-        let mut detect_frame_id = 0_u64;
+        let mut submitted_frame_id = 0_u64;
+        let mut input_frame_id = 0_u64;
 
         loop {
             let frame_start = Instant::now();
 
-            if detector_done_rx.try_recv().is_ok() {
+            if let Ok(_) = detector_done_rx.try_recv() {
                 log::debug!("Detector thread: End of video");
                 break;
             }
@@ -371,18 +371,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
                 latest_detector_frame = Some(frame_with_timestamp);
                 frames_drained += 1;
-                detect_frame_id += 1;
+                input_frame_id += 1;
             }
 
             if frames_drained > 1 {
                 log::debug!("Drained {} frames, using latest", frames_drained);
             }
-            log::debug!("Consuming frame {} for detect", detect_frame_id);
+            log::debug!("Consuming frame {} for detect", input_frame_id);
 
             // Submit latest detector frame if available
             if let Some((detector_frame, capture_time)) = latest_detector_frame {
                 let frame = Frame {
-                    frame_id: detector_frame_id,
+                    frame_id: submitted_frame_id,
                     image: detector_frame,
                     timestamp: capture_time,
                 };
@@ -390,8 +390,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
                 if video_pipeline_for_detector.try_submit_frame(frame) {
-                    log::debug!("Submitted frame {} for detect", detector_frame_id);
-                    detector_frame_id += 1;
+                    log::debug!("Submitted frame {} for detect", submitted_frame_id);
+                    submitted_frame_id += 1;
                 } else {
                     log::warn!("Pipeline busy, frame dropped");
                 }
@@ -418,7 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let results_handle = thread::spawn(move || {
         loop {
-            if results_done_rx.try_recv().is_ok() {
+            if let Ok(_) = results_done_rx.try_recv() {
                 log::debug!("Results thread: End of video");
                 break;
             }
@@ -453,17 +453,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     loop {
-        if output_done_rx.try_recv().is_ok() {
+        if let Ok(_) = output_done_rx.try_recv() {
             log::debug!("Main Loop: End of video (no frames captured)");
             break;
         }
 
-        // Try to get frame from OUTPUT queue (BLOCKING - wait for frames)
-        // We use recv() instead of try_recv() because we want to wait for frames
-        // The loop will only end when the channel is closed (capture thread finishes)
-        let new_captured_frame: Option<RgbImage> = match output_rx.recv() {
+        // Try to get frame from OUTPUT queue with timeout
+        // This allows the loop to check for exit conditions periodically
+        // instead of blocking forever waiting for frames
+        let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(5)) {
             Ok((frame, _timestamp)) => Some(frame),
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No frame yet, continue loop to check exit conditions
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed - capture thread finished
                 log::info!("Output channel closed, ending video processing");
                 break;
@@ -471,11 +475,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let rgb_image = if let Some(frame) = new_captured_frame {
-            log::info!("Consuming frame: {} for output", out_frame_id);
+            log::debug!("Consuming frame: {} for output", out_frame_id);
             out_frame_id += 1;
             frame
         } else {
-            log::info!("No more frames available, ending video processing");
+            log::warn!("No more frames available, ending video processing");
             break;
         };
 
