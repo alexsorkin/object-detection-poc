@@ -31,6 +31,7 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, VideoWriter},
 };
+use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -550,17 +551,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scale_x = orig_width as f32 / resized_width as f32;
         let scale_y = orig_height as f32 / resized_height as f32;
 
-        // Draw detections with track ID visualization
-        for det in &latest_detections {
-            // Use consistent color per class (person=green, car=blue, etc.)
-            let color = generate_class_color(det.class_id);
+        // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
+        let annotation_data: Vec<_> = latest_detections
+            .par_iter()
+            .map(|det| {
+                let color = generate_class_color(det.class_id);
+                let scaled_x = (det.x * scale_x) as i32;
+                let scaled_y = (det.y * scale_y) as i32;
+                let scaled_w = (det.w * scale_x) as u32;
+                let scaled_h = (det.h * scale_y) as u32;
 
-            // Scale detection coordinates back to original image size
-            let scaled_x = (det.x * scale_x) as i32;
-            let scaled_y = (det.y * scale_y) as i32;
-            let scaled_w = (det.w * scale_x) as u32;
-            let scaled_h = (det.h * scale_y) as u32;
+                let label = if let Some(track_id) = det.track_id {
+                    format!(
+                        "#{} {} {:.0}%",
+                        track_id,
+                        det.class_name,
+                        det.confidence * 100.0
+                    )
+                } else {
+                    format!("{} {:.0}%", det.class_name, det.confidence * 100.0)
+                };
 
+                let show_label = scaled_h > 20 && scaled_w > 30;
+
+                (
+                    scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label,
+                )
+            })
+            .collect();
+
+        // SEQUENTIAL: Apply annotations to image (image operations are not thread-safe)
+        for (scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label) in annotation_data {
             draw_rect(
                 &mut annotated,
                 scaled_x,
@@ -571,19 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 2,
             );
 
-            // Label with track ID
-            let label = if let Some(track_id) = det.track_id {
-                format!(
-                    "#{} {} {:.0}%",
-                    track_id,
-                    det.class_name,
-                    det.confidence * 100.0
-                )
-            } else {
-                format!("{} {:.0}%", det.class_name, det.confidence * 100.0)
-            };
-
-            if scaled_h > 20 && scaled_w > 30 {
+            if show_label {
                 draw_text(
                     &mut annotated,
                     &label,

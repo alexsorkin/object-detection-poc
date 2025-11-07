@@ -40,6 +40,7 @@ opencv = { version = "0.93", default-features = false, features = ["videoio", "h
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 crossbeam = "0.8"
+rayon = "1.10"
 
 # Hungarian algorithm for data association
 pathfinding = "4.0"
