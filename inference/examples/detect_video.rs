@@ -243,9 +243,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_tx: Option<std::sync::mpsc::SyncSender<Mat>> = None;
     let mut writer_handle: Option<thread::JoinHandle<Result<(), String>>> = None;
 
-    // Create window for display (updated every N frames for performance)
+    // Create window for display - will be resized after first frame to match video size (max 720p)
     highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
-    highgui::resize_window("Detection", 1280, 720)?;
 
     // Display update interval: update window every frame for smooth playback
     let display_interval = 1; // Update display every frame
@@ -264,8 +263,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new();
     let mut num_tracks = 0;
 
-    // FPS pacing: Calculate target frame duration to match video's native FPS
-    let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut last_rgb_image: Option<RgbImage> = None;
 
     eprintln!(
@@ -287,25 +284,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
 
     let capture_handle = thread::spawn(move || {
+        let mut cp_frame_id = 0_u64;
         loop {
             let frame_start = Instant::now();
+            cp_frame_id += 1;
+
+            // Pace to target FPS - sleep for remaining time in this frame period
+            let elapsed = frame_start.elapsed();
+            if elapsed < capture_frame_duration {
+                std::thread::sleep(capture_frame_duration - elapsed);
+            }
 
             match capture_frame(&mut cap) {
                 Ok(frame) => {
                     let capture_time = Instant::now();
 
-                    // Send to detector queue (NON-BLOCKING - can drop if overflowing)
-                    // Include capture timestamp for age-based filtering
-                    if detector_tx.send((frame.clone(), capture_time)).is_err() {
-                        // Channel closed - main thread terminated
-                        break;
-                    }
+                    // Send to output queue (NON-BLOCKING - drop if queue full)
+                    let _ = output_tx.try_send((frame.clone(), capture_time));
 
-                    // Send to output queue (BLOCKING - ensures ALL frames reach output)
-                    if output_tx.send((frame.clone(), capture_time)).is_err() {
-                        // Channel closed - main thread terminated
-                        break;
-                    }
+                    // Send to detector queue (NON-BLOCKING - drop if queue full)
+                    let _ = detector_tx.try_send((frame.clone(), capture_time));
+
+                    log::info!("Produced frame {} for processing", cp_frame_id);
                 }
                 Err(_) => {
                     // End of video - send termination signal
@@ -320,12 +320,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
             }
-
-            // Pace to target FPS - sleep for remaining time in this frame period
-            let elapsed = frame_start.elapsed();
-            if elapsed < capture_frame_duration {
-                std::thread::sleep(capture_frame_duration - elapsed);
-            }
         }
     });
 
@@ -333,8 +327,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let detector_handle = thread::spawn(move || {
         let mut detector_frame_id = 0_u64;
+        let mut detect_frame_id = 0_u64;
 
         loop {
+            let frame_start = Instant::now();
+
             if detector_done_rx.try_recv().is_ok() {
                 eprintln!("\n📹 Detector thread: End of video");
                 io::stderr().flush().ok();
@@ -348,14 +345,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
                 latest_detector_frame = Some(frame_with_timestamp);
                 frames_drained += 1;
+                detect_frame_id += 1;
             }
+
+            if frames_drained > 1 {
+                log::info!("Drained {} frames, using latest", frames_drained);
+            }
+            log::info!("Detector processing frame {}", detect_frame_id);
 
             // Submit latest detector frame if available
             if let Some((detector_frame, capture_time)) = latest_detector_frame {
-                if frames_drained > 1 {
-                    log::debug!("Drained {} frames, using latest", frames_drained);
-                }
-
                 let frame = Frame {
                     frame_id: detector_frame_id,
                     image: detector_frame,
@@ -365,15 +364,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
                 if video_pipeline_for_detector.try_submit_frame(frame) {
-                    log::info!("Submitted frame {} to video pipeline", detector_frame_id);
+                    log::info!("Submitted frame {} to detect pipeline", detector_frame_id);
                     detector_frame_id += 1;
                 } else {
                     log::warn!("Pipeline busy, frame dropped");
                 }
             }
 
-            // Small sleep to avoid busy loop when queue is empty
-            std::thread::sleep(Duration::from_millis(100));
+            // Pace to target FPS - sleep for remaining time in this frame period
+            let elapsed = frame_start.elapsed();
+            if elapsed < capture_frame_duration {
+                std::thread::sleep(capture_frame_duration - elapsed);
+            }
         }
     });
 
@@ -415,18 +417,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    loop {
-        let frame_start = Instant::now();
+    let mut out_frame_id = 0_u64;
 
+    // Pre-allocate Mat for reuse (optimization #5)
+    let mut display_mat = Mat::default();
+
+    loop {
         // Try to get frame from OUTPUT queue (non-blocking with compensation)
         let new_captured_frame: Option<RgbImage> =
             output_rx.try_recv().ok().map(|(frame, _timestamp)| frame);
 
-        // Determine what frame to use for output
+        if new_captured_frame.is_some() {
+            log::info!("Consuming frame: {} from capture", out_frame_id);
+            out_frame_id += 1;
+        } else {
+            log::info!("Missing output frame in iteration");
+        }
+
+        // Determine what frame to use for output (OPTIMIZED - reduce clones)
         let rgb_image = if let Some(captured) = new_captured_frame {
-            // Got a new frame from capture thread
-            last_rgb_image = Some(captured.clone());
-            captured
+            // Got a new frame from capture thread - move it, don't clone
+            last_rgb_image = Some(captured);
+            last_rgb_image.as_ref().unwrap()
         } else if let Some(ref last_frame) = last_rgb_image {
             // Check if capture thread signaled end of video
             if output_done_rx.try_recv().is_ok() {
@@ -435,9 +447,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            // No new frame available - repeat last frame for output
+            // No new frame available - reuse last frame
             log::debug!("⏭️ No new frame, repeating last frame for output");
-            last_frame.clone() // Repeated frame for smooth output
+            last_frame
         } else {
             // No frames captured yet - check if capture thread signaled end
             if output_done_rx.try_recv().is_ok() {
@@ -455,24 +467,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let orig_height = rgb_image.height();
 
         if !writer_initialized.get() {
-            // Calculate output dimensions: 640 on longest axis, preserving aspect ratio
-            let target_size = 640.0_f32;
-            let (output_width, output_height) = if orig_width > orig_height {
-                // Landscape: width = 640
-                let scale = target_size / orig_width as f32;
-                (640, (orig_height as f32 * scale) as i32)
-            } else {
-                // Portrait or square: height = 640
-                let scale = target_size / orig_height as f32;
-                ((orig_width as f32 * scale) as i32, 640)
-            };
-
             let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')?;
             let mut new_writer = VideoWriter::new(
                 output_path,
                 fourcc,
                 fps,
-                opencv::core::Size::new(output_width, output_height),
+                opencv::core::Size::new(orig_width as i32, orig_height as i32),
                 true,
             )?;
 
@@ -483,10 +483,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             eprintln!(
-                "  ✓ Writing output to: {} ({}x{} → {}x{})\n",
-                output_path, orig_width, orig_height, output_width, output_height
+                "  ✓ Writing output to: {} ({}x{})\n",
+                output_path, orig_width, orig_height
             );
             io::stderr().flush()?;
+
+            // Resize display window to match video size (capped at 640p)
+            let max_height = 640;
+            let (window_width, window_height) = if orig_height > max_height {
+                // Scale down to 640p preserving aspect ratio
+                let scale = max_height as f32 / orig_height as f32;
+                ((orig_width as f32 * scale) as i32, max_height as i32)
+            } else {
+                // Use native resolution
+                (orig_width as i32, orig_height as i32)
+            };
+            highgui::resize_window("Detection", window_width, window_height)?;
 
             // Create async video writer thread with large buffer
             let (tx, rx) = sync_channel::<Mat>(120); // Buffer ~5 seconds at 24fps
@@ -604,11 +616,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let display_width = annotated.width();
         let display_height = annotated.height();
 
-        // Convert back to Mat for display
-        let mut display_mat = Mat::default();
-        let data_slice = annotated.as_raw();
-
         // Create Mat from RGB data - opencv expects CV_8UC3 format
+        let data_slice = annotated.as_raw();
         let mat = unsafe {
             Mat::new_rows_cols_with_data_unsafe(
                 display_height as i32,
@@ -619,6 +628,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
         };
 
+        // Reuse pre-allocated display_mat buffer for BGR conversion
         imgproc::cvt_color(
             &mat,
             &mut display_mat,
@@ -634,29 +644,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Write ALL frames to output video (async, non-blocking)
         if let Some(ref tx) = frame_tx {
-            // Resize to 640 on longest axis before writing
-            let target_size = 640.0_f32;
-            let (output_width, output_height) = if display_width > display_height {
-                let scale = target_size / display_width as f32;
-                (640, (display_height as f32 * scale) as i32)
-            } else {
-                let scale = target_size / display_height as f32;
-                ((display_width as f32 * scale) as i32, 640)
-            };
-
-            let mut resized_mat = Mat::default();
-            imgproc::resize(
-                &display_mat,
-                &mut resized_mat,
-                opencv::core::Size::new(output_width, output_height),
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
-            )?;
-
             // Use try_send to avoid blocking the main loop
             // If queue is full, skip this frame (writer can't keep up)
-            let _ = tx.try_send(resized_mat);
+            let _ = tx.try_send(display_mat.clone());
         }
 
         frame_id += 1;
@@ -706,12 +696,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             paused = false;
             eprintln!("▶️  Resumed");
             io::stderr().flush()?;
-        }
-
-        // Pace to target FPS - sleep for remaining time in this frame period
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_duration {
-            std::thread::sleep(frame_duration - elapsed);
         }
     }
 
