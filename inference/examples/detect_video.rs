@@ -22,7 +22,8 @@ use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{draw_rect, draw_text, generate_class_color};
-use military_target_detector::kalman_tracker::{KalmanConfig, MultiObjectTracker};
+use military_target_detector::kalman_operator::KalmanOperator;
+use military_target_detector::kalman_tracker::KalmanConfig;
 use military_target_detector::types::DetectorConfig;
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
 use opencv::{
@@ -36,6 +37,32 @@ use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Helper function to capture and convert a frame from video
+fn capture_frame(cap: &mut VideoCapture) -> Result<RgbImage, Box<dyn std::error::Error>> {
+    let mut mat_frame = Mat::default();
+    if !cap.read(&mut mat_frame)? || mat_frame.empty() {
+        return Err("End of video".into());
+    }
+
+    // Convert BGR to RGB
+    let mut rgb_mat = Mat::default();
+    imgproc::cvt_color(
+        &mat_frame,
+        &mut rgb_mat,
+        imgproc::COLOR_BGR2RGB,
+        0,
+        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+
+    // Convert to RgbImage
+    let width = rgb_mat.cols() as u32;
+    let height = rgb_mat.rows() as u32;
+    let data = rgb_mat.data_bytes()?.to_vec();
+    let rgb_image = RgbImage::from_vec(width, height, data).ok_or("Failed to create RgbImage")?;
+
+    Ok(rgb_image)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
@@ -55,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse confidence threshold and class filter
     let mut confidence_threshold = 0.50; // Default 50%
-    let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, bus, truck
+    let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
     let mut arg_idx = 1;
 
     // Parse --confidence parameter
@@ -187,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let video_pipeline = VideoPipeline::new(Arc::clone(&pipeline), video_config);
 
-    // Create single shared Kalman tracker with 1000ms track timeout
+    // Initialize global Kalman operator with maintenance thread
     let kalman_config = KalmanConfig {
         max_age_ms: 1000,             // Keep tracks for 1s (detection interval is ~600ms)
         iou_threshold: 0.10, // Very low threshold - detections 350-400ms apart can drift significantly
@@ -197,11 +224,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measurement_noise: 5.0, // Higher detector noise tolerance
         initial_covariance: 20.0, // Higher initial uncertainty
     };
-    let mut kalman_tracker = MultiObjectTracker::new(kalman_config);
+    let kalman_operator = KalmanOperator::init(kalman_config);
 
-    eprintln!("  ✓ Pipeline ready");
+    eprintln!("  ✓ Pipeline ready (with Kalman operator + maintenance thread)");
     eprintln!("\n💡 Configuration:");
-    eprintln!("  • Detector: RT-DETR (direct batch executor)");
+    eprintln!("  • Detector: RT-DETR (frame executor)");
     eprintln!("  • Batch size: {}", batch_size);
     eprintln!("  • Queue depth: {} (backpressure)", max_queue_depth);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
@@ -238,49 +265,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FPS pacing: Calculate target frame duration to match video's native FPS
     let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next_frame_time = Instant::now();
+    let mut last_rgb_image: Option<RgbImage> = None;
 
     eprintln!(
-        "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})\n",
+        "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})",
         max_queue_depth
     );
+    eprintln!("📝 Starting async capture thread at {:.1} FPS\n", fps);
     io::stderr().flush()?;
+
+    // Create async capture thread - captures frames at video's native FPS
+    let (capture_tx, capture_rx) = sync_channel::<RgbImage>(3); // Small buffer for latest frames
+    let (done_tx, done_rx) = sync_channel::<()>(1); // Signal for end of video
+    let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
+    let capture_handle = thread::spawn(move || {
+        let mut next_capture_time = Instant::now();
+
+        loop {
+            // Pace capture to video's FPS
+            let now = Instant::now();
+            if now < next_capture_time {
+                let sleep_duration = next_capture_time - now;
+                std::thread::sleep(sleep_duration);
+            }
+            next_capture_time += capture_frame_duration;
+
+            match capture_frame(&mut cap) {
+                Ok(frame) => {
+                    // Send frame to main thread (non-blocking)
+                    if capture_tx.try_send(frame).is_err() {
+                        // Queue full, drop oldest frame (main thread will get latest)
+                        log::trace!("Capture queue full, dropping frame");
+                    }
+                }
+                Err(_) => {
+                    // End of video - send termination signal
+                    eprintln!("\n📹 Capture thread: End of video");
+                    io::stderr().flush().ok();
+                    let _ = done_tx.send(()); // Signal main thread
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
         let frame_start = Instant::now();
 
-        // Pace frame reading at video's native FPS
+        // Try to get latest frame from capture thread
+        let mut new_captured_frame: Option<RgbImage> = None;
+        let mut frames_available = 0;
+
+        // Drain capture queue to get the latest frame
+        while let Ok(frame) = capture_rx.try_recv() {
+            new_captured_frame = Some(frame);
+            frames_available += 1;
+        }
+
+        // Determine what frame to use and whether to send to detector
+        let (rgb_image, send_to_detector) = if let Some(captured) = new_captured_frame {
+            // Got a new frame from capture thread
+            last_rgb_image = Some(captured.clone());
+
+            // Check if we're lagging more than 2 frames behind
+            if frames_available > 2 {
+                log::warn!("⚠️ Lagging {} frames behind capture", frames_available);
+            }
+
+            (captured, true) // New frame - send to detector and output
+        } else if let Some(ref last_frame) = last_rgb_image {
+            // Check if capture thread signaled end of video
+            if done_rx.try_recv().is_ok() {
+                eprintln!("\n📹 End of video");
+                io::stderr().flush()?;
+                break;
+            }
+
+            // No new frame available - repeat last frame for output only
+            log::debug!("⏭️ No new frame, repeating last frame for output");
+            (last_frame.clone(), false) // Repeated frame - output only, skip detector
+        } else {
+            // No frames captured yet - check if capture thread signaled end
+            if done_rx.try_recv().is_ok() {
+                eprintln!("\n📹 End of video (no frames captured)");
+                io::stderr().flush()?;
+                break;
+            }
+            // Wait a bit for first frame
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+
+        // Pace to target FPS
         if frame_start < next_frame_time {
             let sleep_duration = next_frame_time - frame_start;
             std::thread::sleep(sleep_duration);
         }
-        next_frame_time = Instant::now() + frame_duration;
-
-        // Capture frame
-        let mut mat_frame = Mat::default();
-        if !cap.read(&mut mat_frame)? || mat_frame.empty() {
-            eprintln!("\n📹 End of video");
-            io::stderr().flush()?;
-            break;
-        }
-
-        // Convert BGR to RGB
-        let mut rgb_mat = Mat::default();
-        imgproc::cvt_color(
-            &mat_frame,
-            &mut rgb_mat,
-            imgproc::COLOR_BGR2RGB,
-            0,
-            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-        )?;
-
-        // Convert to RgbImage
-        let orig_width = rgb_mat.cols() as u32;
-        let orig_height = rgb_mat.rows() as u32;
-        let data = rgb_mat.data_bytes()?.to_vec();
-        let rgb_image =
-            RgbImage::from_vec(orig_width, orig_height, data).ok_or("Failed to create RgbImage")?;
+        next_frame_time += frame_duration;
 
         // Initialize video writer on first frame (now we know actual dimensions)
+        let orig_width = rgb_image.width();
+        let orig_height = rgb_image.height();
+
         if !writer_initialized.get() {
             let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')?;
             let mut new_writer = VideoWriter::new(
@@ -303,8 +389,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             io::stderr().flush()?;
 
-            // Create async video writer thread
-            let (tx, rx) = sync_channel::<Mat>(30);
+            // Create async video writer thread with large buffer
+            let (tx, rx) = sync_channel::<Mat>(120); // Buffer ~5 seconds at 24fps
             let handle = thread::spawn(move || -> Result<(), String> {
                 for mat in rx {
                     new_writer.write(&mat).map_err(|e| e.to_string())?;
@@ -325,28 +411,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 stats_processed += 1;
 
-                // Update Kalman tracker with real detections
+                // Update Kalman operator with real detections
                 // Use WALL-CLOCK time, not frame timestamp
                 let current_time = Instant::now();
                 let dt = current_time
                     .duration_since(last_kalman_update)
                     .as_secs_f32();
-                kalman_tracker.update(&result.detections, dt);
+
+                let operator = kalman_operator.lock().unwrap();
+                let _ = operator.send_update(result.detections.clone(), dt);
+                drop(operator);
+
                 last_kalman_update = current_time;
             }
             stats_latency_sum += result.latency_ms;
         }
 
-        // Submit frame - executor handles backpressure internally
-        let frame = Frame {
-            frame_id,
-            image: rgb_image.clone(),
-            timestamp: frame_start,
-        };
-        video_pipeline.try_submit_frame(frame);
+        // Submit frame to detector ONLY if it's a newly captured frame (not repeated)
+        if send_to_detector {
+            let frame = Frame {
+                frame_id,
+                image: rgb_image.clone(),
+                timestamp: frame_start,
+            };
+            video_pipeline.try_submit_frame(frame);
+        } else {
+            log::debug!("⏭️  Skipping detector for repeated frame {}", frame_id);
+        }
 
         // Get current Kalman predictions (may be empty if no tracks yet)
-        let detections_to_display = kalman_tracker.get_predictions();
+        let operator = kalman_operator.lock().unwrap();
+        let detections_to_display = operator.get_predictions();
+        drop(operator);
 
         // Annotate current frame with Kalman predictions
         let mut annotated = rgb_image.clone();
@@ -420,11 +516,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Draw stats overlay
+        let operator = kalman_operator.lock().unwrap();
+        let num_tracks = operator.get_predictions().len();
+        drop(operator);
+
         let stats_text = format!(
             "Frame: {} | Tracks: {} | Detections: {} RT-DETR",
-            frame_id,
-            kalman_tracker.num_tracks(),
-            stats_processed
+            frame_id, num_tracks, stats_processed
         );
 
         draw_text(
@@ -468,13 +566,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             highgui::imshow("Detection", &display_mat)?;
         }
 
-        // Write ALL frames to output video (including initial frames without annotations)
+        // Write ALL frames to output video (async, non-blocking)
         if let Some(ref tx) = frame_tx {
-            // Use try_send to avoid blocking the main loop if video writer is slow
-            if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(display_mat.clone()) {
-                // Drop frame if video writer can't keep up
-                log::warn!("Video writer queue full, dropping frame {}", frame_id);
-            }
+            // Use try_send to avoid blocking the main loop
+            // If queue is full, skip this frame (writer can't keep up)
+            let _ = tx.try_send(display_mat.clone());
         }
 
         frame_id += 1;
@@ -491,13 +587,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
 
+            let operator = kalman_operator.lock().unwrap();
+            let num_tracks = operator.get_predictions().len();
+            drop(operator);
+
             eprintln!(
                 "Frame {}: {:.1} FPS | Tracks: {} | Real detections: {} | Avg Latency: {:.0}ms",
-                frame_id,
-                avg_fps,
-                kalman_tracker.num_tracks(),
-                stats_processed,
-                avg_latency
+                frame_id, avg_fps, num_tracks, stats_processed, avg_latency
             );
             io::stderr().flush().ok();
         }
@@ -547,6 +643,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = handle.join() {
             eprintln!("⚠️  Writer thread error: {:?}", e);
         }
+    }
+
+    // Wait for capture thread to finish
+    if let Err(e) = capture_handle.join() {
+        eprintln!("⚠️  Capture thread error: {:?}", e);
     }
 
     eprintln!("\n✅ Output video saved: {}", output_path);

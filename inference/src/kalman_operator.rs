@@ -4,11 +4,14 @@
 /// - Command queue for async updates from detector
 /// - Query interface for predictions
 /// - Single thread processing updates
+/// - Maintenance thread for periodic track cleanup
 use crate::frame_pipeline::TileDetection;
 use crate::kalman_tracker::MultiObjectTracker;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
+use tokio::runtime::Runtime;
 
 /// Commands that can be sent to the Kalman operator
 #[derive(Debug)]
@@ -29,6 +32,8 @@ pub struct KalmanOperator {
     command_tx: Sender<KalmanCommand>,
     tracker: Arc<Mutex<MultiObjectTracker>>,
     _worker_handle: Option<thread::JoinHandle<()>>,
+    _runtime: Runtime,
+    shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 static KALMAN_INSTANCE: OnceLock<Arc<Mutex<KalmanOperator>>> = OnceLock::new();
@@ -38,18 +43,38 @@ impl KalmanOperator {
     pub fn init(tracker_config: crate::kalman_tracker::KalmanConfig) -> Arc<Mutex<Self>> {
         KALMAN_INSTANCE
             .get_or_init(|| {
-                let tracker = Arc::new(Mutex::new(MultiObjectTracker::new(tracker_config)));
+                let tracker = Arc::new(Mutex::new(MultiObjectTracker::new(tracker_config.clone())));
                 let (command_tx, command_rx) = channel::<KalmanCommand>();
 
+                // Create tokio runtime for maintenance thread
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("kalman-maintenance")
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create Kalman maintenance runtime");
+
+                // Spawn command processor thread
                 let tracker_clone = Arc::clone(&tracker);
                 let worker_handle = thread::spawn(move || {
                     Self::command_processor(tracker_clone, command_rx);
+                });
+
+                // Spawn maintenance thread
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                let tracker_clone = Arc::clone(&tracker);
+                let max_age_ms = tracker_config.max_age_ms;
+
+                runtime.spawn(async move {
+                    Self::maintenance_loop(tracker_clone, max_age_ms, shutdown_rx).await;
                 });
 
                 Arc::new(Mutex::new(Self {
                     command_tx,
                     tracker,
                     _worker_handle: Some(worker_handle),
+                    _runtime: runtime,
+                    shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
                 }))
             })
             .clone()
@@ -82,7 +107,70 @@ impl KalmanOperator {
 
     /// Shutdown the tracker thread
     pub fn shutdown(&self) {
+        // Shutdown maintenance thread
+        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+
+        // Shutdown command processor
         let _ = self.command_tx.send(KalmanCommand::Shutdown);
+    }
+
+    /// Maintenance loop - runs every 20ms to evict stale tracks
+    async fn maintenance_loop(
+        tracker: Arc<Mutex<MultiObjectTracker>>,
+        max_age_ms: u64,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        log::info!(
+            "Kalman maintenance thread started (checking every 20ms, TTL={}ms)",
+            max_age_ms
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        let mut maintenance_cycles = 0_u64;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    maintenance_cycles += 1;
+
+                    // Evict stale tracks
+                    let mut tracker = tracker.lock().unwrap();
+                    let before_count = tracker.num_tracks();
+
+                    // Remove tracks that haven't been updated in max_age_ms
+                    tracker.evict_stale_tracks(max_age_ms);
+
+                    let after_count = tracker.num_tracks();
+                    let evicted = before_count - after_count;
+
+                    if evicted > 0 {
+                        log::debug!(
+                            "🧹 Maintenance cycle {}: evicted {} stale tracks ({} remaining)",
+                            maintenance_cycles,
+                            evicted,
+                            after_count
+                        );
+                    }
+
+                    // Periodic status log
+                    if maintenance_cycles % 500 == 0 {
+                        log::info!(
+                            "Kalman maintenance: {} cycles, {} active tracks",
+                            maintenance_cycles,
+                            after_count
+                        );
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    log::info!("Kalman maintenance thread shutting down after {} cycles", maintenance_cycles);
+                    break;
+                }
+            }
+        }
+
+        log::info!("Kalman maintenance thread stopped");
     }
 
     /// Command processor thread - subscribes to queue and updates tracker
@@ -134,8 +222,12 @@ impl KalmanOperator {
 impl Drop for KalmanOperator {
     fn drop(&mut self) {
         self.shutdown();
+
+        // Wait for command processor thread
         if let Some(handle) = self._worker_handle.take() {
             let _ = handle.join();
         }
+
+        // Runtime will be dropped automatically, cleaning up maintenance thread
     }
 }

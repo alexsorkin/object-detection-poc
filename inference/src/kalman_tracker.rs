@@ -461,6 +461,12 @@ impl MultiObjectTracker {
     pub fn get_track(&self, track_id: u32) -> Option<&TrackedObject> {
         self.tracks.iter().find(|t| t.track_id == track_id)
     }
+
+    /// Evict stale tracks that haven't been updated within max_age_ms
+    /// This is called by the maintenance thread, not by update()
+    pub fn evict_stale_tracks(&mut self, max_age_ms: u64) {
+        self.tracks.retain(|track| !track.is_stale(max_age_ms));
+    }
 }
 
 #[cfg(test)]
