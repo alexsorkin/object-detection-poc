@@ -463,13 +463,21 @@ impl ExecutionStage {
         }
         let submit_time = submit_start.elapsed();
 
-        // Collect results and track per-tile timing
-        let mut tile_times = Vec::new();
+        // Collect results sequentially (receivers are not Sync) and track per-tile timing
+        let mut tile_results = Vec::new();
         for (tile_idx, offset_x, offset_y, response_rx, tile_start) in responses {
             if let Ok(Ok(detections)) = response_rx.recv() {
                 let tile_time = tile_start.elapsed();
-                tile_times.push((tile_idx, tile_time, detections.len()));
-                
+                tile_results.push((tile_idx, offset_x, offset_y, tile_time, detections));
+            }
+        }
+
+        // PARALLEL: Process all tile detections concurrently
+        let processed_detections: Vec<(usize, std::time::Duration, Vec<TileDetection>)> = tile_results
+            .par_iter()
+            .map(|(tile_idx, offset_x, offset_y, tile_time, detections)| {
+                let mut tile_dets = Vec::new();
+
                 for det in detections {
                     let class_id = det.class.id();
 
@@ -486,8 +494,8 @@ impl ExecutionStage {
                     let h_tile_px = det.bbox.height * self.tile_size as f32;
 
                     // Add tile offset to get position in original image
-                    let x_final = x_tile_px + offset_x as f32;
-                    let y_final = y_tile_px + offset_y as f32;
+                    let x_final = x_tile_px + *offset_x as f32;
+                    let y_final = y_tile_px + *offset_y as f32;
 
                     // Get class name and capitalize first letter
                     let class_name = det.class.name();
@@ -501,7 +509,7 @@ impl ExecutionStage {
                         class_name
                     };
                     
-                    all_detections.push(TileDetection {
+                    tile_dets.push(TileDetection {
                         x: x_final,
                         y: y_final,
                         w: w_tile_px,
@@ -509,13 +517,22 @@ impl ExecutionStage {
                         confidence: det.confidence,
                         class_id,
                         class_name: capitalized_name,
-                        tile_idx,
+                        tile_idx: *tile_idx,
                         vx: None,  // No velocity for raw detections
                         vy: None,
                         track_id: None,  // No track ID yet (assigned by Kalman tracker)
                     });
                 }
-            }
+
+                (*tile_idx, *tile_time, tile_dets)
+            })
+            .collect();
+
+        // Collect all detections and timing info
+        let mut tile_times = Vec::new();
+        for (tile_idx, tile_time, tile_dets) in processed_detections {
+            tile_times.push((tile_idx, tile_time, tile_dets.len()));
+            all_detections.extend(tile_dets);
         }
         
         // Log per-tile performance
