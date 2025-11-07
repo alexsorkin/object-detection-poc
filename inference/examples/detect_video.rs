@@ -10,13 +10,19 @@
 /// - YELLOW boxes: Kalman filter extrapolations
 ///
 /// Usage:
-///   cargo run --release --features metal --example detect_video [--confidence %%] [--classes c1,c2,...] <video_path>
-///   cargo run --release --features metal --example detect_video 0  # Use webcam
+///   cargo run --release --features metal --example detect_video [OPTIONS] <video_path>
+///
+/// Options (can be in any order):
+///   --confidence <0-100>    Detection confidence threshold (default: 50)
+///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
+///   --headless              Run without display window (default: show window)
 ///
 /// Examples:
 ///   cargo run --release --features metal --example detect_video test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --classes 0,2,5,7 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- test_data/airport.mp4 --confidence 60 --headless
+///   cargo run --release --features metal --example detect_video -- --headless --classes 0,2,5,7 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video 0  # Use webcam
 use image::{Rgb, RgbImage};
 use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
@@ -81,51 +87,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("   Args: {:?}", args);
     io::stderr().flush()?;
 
-    // Parse confidence threshold and class filter
+    // Parse confidence threshold, class filter, and display mode
     let mut confidence_threshold = 0.50; // Default 50%
     let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
-    let mut arg_idx = 1;
+    let mut headless = false; // Default: show display window
+    let mut video_source: Option<String> = None;
 
-    // Parse --confidence parameter
-    if args.len() > arg_idx && args[arg_idx] == "--confidence" {
-        arg_idx += 1;
-        if args.len() > arg_idx {
-            match args[arg_idx].parse::<f32>() {
-                Ok(val) => {
-                    confidence_threshold = (val / 100.0).clamp(0.0, 1.0); // Convert % to 0.0-1.0
-                }
-                Err(_) => {
-                    eprintln!("Invalid confidence threshold. Use a number between 0-100");
-                    return Ok(());
+    // Parse all arguments in any order
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--confidence" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].parse::<f32>() {
+                        Ok(val) => {
+                            confidence_threshold = (val / 100.0).clamp(0.0, 1.0);
+                        }
+                        Err(_) => {
+                            eprintln!("Invalid confidence threshold. Use a number between 0-100");
+                            return Ok(());
+                        }
+                    }
                 }
             }
-            arg_idx += 1;
-        }
-    }
-
-    // Parse --classes parameter
-    if args.len() > arg_idx && args[arg_idx] == "--classes" {
-        arg_idx += 1;
-        if args.len() > arg_idx {
-            allowed_classes = args[arg_idx]
-                .split(',')
-                .filter_map(|s| s.trim().parse::<u32>().ok())
-                .collect();
-            if allowed_classes.is_empty() {
-                eprintln!("Invalid classes. Use comma-separated numbers (e.g., 0,2,5,7)");
-                return Ok(());
+            "--classes" => {
+                i += 1;
+                if i < args.len() {
+                    allowed_classes = args[i]
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<u32>().ok())
+                        .collect();
+                    if allowed_classes.is_empty() {
+                        eprintln!("Invalid classes. Use comma-separated numbers (e.g., 0,2,5,7)");
+                        return Ok(());
+                    }
+                }
             }
-            arg_idx += 1;
+            "--headless" => {
+                headless = true;
+            }
+            arg => {
+                // If it doesn't start with --, treat it as the video source
+                if !arg.starts_with("--") {
+                    video_source = Some(arg.to_string());
+                }
+            }
         }
+        i += 1;
     }
 
-    let video_source = if args.len() > arg_idx {
-        args[arg_idx].clone()
-    } else {
-        // Use default video if no path provided
+    let video_source = video_source.unwrap_or_else(|| {
         eprintln!("ℹ️  No video path provided, using default: test_data/airport.mp4");
         "test_data/airport.mp4".to_string()
-    };
+    });
 
     eprintln!("🎯 Real-Time Video Detection with Kalman Extrapolation\n");
     io::stderr().flush()?;
@@ -233,9 +248,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  • Kalman tracker: 1s track timeout");
     eprintln!("  • Output FPS: {:.1} (matching input)", fps);
     eprintln!("  • Max latency for extrapolation: 500ms");
+    eprintln!(
+        "  • Display mode: {}",
+        if headless {
+            "headless (no window)"
+        } else {
+            "window enabled"
+        }
+    );
 
     eprintln!("\n🎬 Starting video processing...");
-    eprintln!("  Press 'q' to quit, 'p' to pause\n");
+    if !headless {
+        eprintln!("  Press 'q' to quit, 'p' to pause\n");
+    } else {
+        eprintln!("  Press Ctrl+C to stop\n");
+    }
     io::stderr().flush()?;
 
     // We'll create the video writer after we get the first frame (to know actual dimensions)
@@ -244,8 +271,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_tx: Option<std::sync::mpsc::SyncSender<Mat>> = None;
     let mut writer_handle: Option<thread::JoinHandle<Result<(), String>>> = None;
 
-    // Create window for display - will be resized after first frame to match video size (max 720p)
-    highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
+    // Create window for display - will be resized after first frame to match video size (max 640p)
+    if !headless {
+        highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
+    }
 
     // Display update interval: update window every frame for smooth playback
     let display_interval = 1; // Update display every frame
@@ -263,8 +292,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut latest_detections: Vec<military_target_detector::frame_pipeline::TileDetection> =
         Vec::new();
     let mut num_tracks = 0;
-
-    let mut last_rgb_image: Option<RgbImage> = None;
 
     eprintln!(
         "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})",
@@ -310,8 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(_) => {
                     // End of video - send termination signal
-                    eprintln!("\n📹 Capture thread: End of video");
-                    io::stderr().flush().ok();
+                    log::debug!("Capture thread: End of video");
                     let _ = output_done_tx.send(()); // Signal main thread
                     let _ = detector_done_tx.send(()); // Signal main thread
                     let _ = results_done_tx.send(()); // Signal main thread
@@ -334,8 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let frame_start = Instant::now();
 
             if detector_done_rx.try_recv().is_ok() {
-                eprintln!("\n📹 Detector thread: End of video");
-                io::stderr().flush().ok();
+                log::debug!("Detector thread: End of video");
                 break;
             }
 
@@ -394,8 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let results_handle = thread::spawn(move || {
         loop {
             if results_done_rx.try_recv().is_ok() {
-                eprintln!("\n📹 Results thread: End of video");
-                io::stderr().flush().ok();
+                log::debug!("Results thread: End of video");
                 break;
             }
 
@@ -429,43 +453,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     loop {
-        // Try to get frame from OUTPUT queue (non-blocking with compensation)
-        let new_captured_frame: Option<RgbImage> =
-            output_rx.try_recv().ok().map(|(frame, _timestamp)| frame);
-
-        if new_captured_frame.is_some() {
-            log::info!("Consuming frame: {} for output", out_frame_id);
-            out_frame_id += 1;
-        } else {
-            log::warn!("Missing output frame in iteration");
+        if output_done_rx.try_recv().is_ok() {
+            log::debug!("Main Loop: End of video (no frames captured)");
+            break;
         }
 
-        // Determine what frame to use for output (OPTIMIZED - reduce clones)
-        let rgb_image = if let Some(captured) = new_captured_frame {
-            // Got a new frame from capture thread - move it, don't clone
-            last_rgb_image = Some(captured);
-            last_rgb_image.as_ref().unwrap()
-        } else if let Some(ref last_frame) = last_rgb_image {
-            // Check if capture thread signaled end of video
-            if output_done_rx.try_recv().is_ok() {
-                eprintln!("\n📹 End of video");
-                io::stderr().flush()?;
+        // Try to get frame from OUTPUT queue (BLOCKING - wait for frames)
+        // We use recv() instead of try_recv() because we want to wait for frames
+        // The loop will only end when the channel is closed (capture thread finishes)
+        let new_captured_frame: Option<RgbImage> = match output_rx.recv() {
+            Ok((frame, _timestamp)) => Some(frame),
+            Err(_) => {
+                // Channel closed - capture thread finished
+                log::info!("Output channel closed, ending video processing");
                 break;
             }
+        };
 
-            // No new frame available - reuse last frame
-            log::warn!("⏭️ No new frame, repeating last frame for output");
-            last_frame
+        let rgb_image = if let Some(frame) = new_captured_frame {
+            log::info!("Consuming frame: {} for output", out_frame_id);
+            out_frame_id += 1;
+            frame
         } else {
-            // No frames captured yet - check if capture thread signaled end
-            if output_done_rx.try_recv().is_ok() {
-                eprintln!("\n📹 End of video (no frames captured)");
-                io::stderr().flush()?;
-                break;
-            }
-            // Wait a bit for first frame
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
+            log::info!("No more frames available, ending video processing");
+            break;
         };
 
         // Initialize video writer on first frame (now we know actual dimensions)
@@ -495,16 +506,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             io::stderr().flush()?;
 
             // Resize display window to match video size (capped at 640p)
-            let max_height = 640;
-            let (window_width, window_height) = if orig_height > max_height {
-                // Scale down to 640p preserving aspect ratio
-                let scale = max_height as f32 / orig_height as f32;
-                ((orig_width as f32 * scale) as i32, max_height as i32)
-            } else {
-                // Use native resolution
-                (orig_width as i32, orig_height as i32)
-            };
-            highgui::resize_window("Detection", window_width, window_height)?;
+            if !headless {
+                let max_height = 640;
+                let (window_width, window_height) = if orig_height > max_height {
+                    // Scale down to 640p preserving aspect ratio
+                    let scale = max_height as f32 / orig_height as f32;
+                    ((orig_width as f32 * scale) as i32, max_height as i32)
+                } else {
+                    // Use native resolution
+                    (orig_width as i32, orig_height as i32)
+                };
+                highgui::resize_window("Detection", window_width, window_height)?;
+            }
 
             // Create async video writer thread with large buffer
             let (tx, rx) = sync_channel::<Mat>(120); // Buffer ~5 seconds at 24fps
@@ -651,7 +664,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         // Display (every Nth frame to reduce overhead)
-        if frame_id % display_interval == 0 {
+        if !headless && frame_id % display_interval == 0 {
             highgui::imshow("Detection", &display_mat)?;
         }
 
@@ -693,26 +706,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Handle keyboard input with minimal delay (1ms for UI responsiveness)
-        let key = highgui::wait_key(1)?;
-        if key == 'q' as i32 {
-            eprintln!("\n⏹️  Stopped by user");
-            io::stderr().flush()?;
-            break;
-        } else if key == 'p' as i32 {
-            paused = !paused;
-            eprintln!("\n⏸️  Paused: {}", paused);
-            io::stderr().flush()?;
-        }
+        if !headless {
+            let key = highgui::wait_key(1)?;
+            if key == 'q' as i32 {
+                eprintln!("\n⏹️  Stopped by user");
+                io::stderr().flush()?;
+                break;
+            } else if key == 'p' as i32 {
+                paused = !paused;
+                eprintln!("\n⏸️  Paused: {}", paused);
+                io::stderr().flush()?;
+            }
 
-        if paused {
-            while highgui::wait_key(100)? != 'p' as i32 {}
-            paused = false;
-            eprintln!("▶️  Resumed");
-            io::stderr().flush()?;
+            if paused {
+                while highgui::wait_key(100)? != 'p' as i32 {}
+                paused = false;
+                eprintln!("▶️  Resumed");
+                io::stderr().flush()?;
+            }
+        } else {
+            // In headless mode, add a small sleep to prevent busy loop
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    // Final statistics
     let total_time = stats_start.elapsed().as_secs_f32();
     let processed = stats_processed.load(Ordering::Relaxed);
     let extrapolated = stats_extrapolated.load(Ordering::Relaxed);
@@ -724,38 +741,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         0.0
     };
 
-    eprintln!("\n📊 Final Statistics:");
-    eprintln!("  • Total frames displayed: {}", frame_id);
-    eprintln!("  • Duration: {:.1}s", total_time);
-    eprintln!("  • Average FPS: {:.1}", avg_fps);
-    eprintln!("\n  Detection Stats:");
-    eprintln!("    - Real detections: {}", processed);
-    eprintln!("    - Average latency: {:.0}ms", avg_latency);
-    io::stderr().flush()?;
-
     // Close video writer channel and wait for thread to finish
     drop(frame_tx);
     if let Some(handle) = writer_handle {
-        if let Err(e) = handle.join() {
-            eprintln!("⚠️  Writer thread error: {:?}", e);
+        match handle.join() {
+            Ok(Ok(())) => {
+                log::debug!("Video writer finished successfully");
+            }
+            Ok(Err(e)) => {
+                eprintln!("⚠️  Writer thread error: {}", e);
+                io::stderr().flush()?;
+            }
+            Err(e) => {
+                eprintln!("⚠️  Writer thread panicked: {:?}", e);
+                io::stderr().flush()?;
+            }
         }
     }
 
-    // Wait for capture thread to finish
+    eprintln!("\n🧹 Waiting for threads to finish...");
+
+    // Wait for threads to finish
     if let Err(e) = capture_handle.join() {
         eprintln!("⚠️  Capture thread error: {:?}", e);
+    } else {
+        eprintln!("  ✓ Capture thread finished");
     }
     if let Err(e) = detector_handle.join() {
         eprintln!("⚠️  Detector thread error: {:?}", e);
+    } else {
+        eprintln!("  ✓ Detector thread finished");
     }
-    // Results thread will exit when video_pipeline is dropped
     if let Err(e) = results_handle.join() {
         eprintln!("⚠️  Results thread error: {:?}", e);
+    } else {
+        eprintln!("  ✓ Results thread finished");
     }
-
-    eprintln!("\n✅ Output video saved: {}", output_path);
     io::stderr().flush()?;
 
-    highgui::destroy_all_windows()?;
+    log::debug!("Output video saved: {}", output_path);
+
+    eprintln!("\n");
+    eprintln!("===============================================================================");
+    eprintln!(
+        "Finished with: frame_id={}, total_time={}, processed={}, extrapolated={}",
+        frame_id, total_time, processed, extrapolated
+    );
+    eprintln!("===============================================================================");
+
+    eprintln!("\n");
+    eprintln!("===================================================");
+    eprintln!("FINAL STATISTICS:");
+    eprintln!("===================================================");
+    eprintln!("Total frames displayed: {}", frame_id);
+    eprintln!("Duration: {:.1}s", total_time);
+    eprintln!("Average FPS: {:.1}", avg_fps);
+    eprintln!("");
+    eprintln!("Detection Stats:");
+    eprintln!("  Real detections: {}", processed);
+    eprintln!("  Average latency: {:.0}ms", avg_latency);
+    eprintln!("===================================================\n");
+    io::stderr().flush()?;
+
+    if !headless {
+        highgui::destroy_all_windows()?;
+    }
     Ok(())
 }
