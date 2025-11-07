@@ -306,7 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Send to detector queue (NON-BLOCKING - drop if queue full)
                     let _ = detector_tx.try_send((frame.clone(), capture_time));
 
-                    log::info!("Produced frame {} for processing", cp_frame_id);
+                    log::debug!("Dispatching frame {} for processing", cp_frame_id);
                 }
                 Err(_) => {
                     // End of video - send termination signal
@@ -350,9 +350,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if frames_drained > 1 {
-                log::info!("Drained {} frames, using latest", frames_drained);
+                log::debug!("Drained {} frames, using latest", frames_drained);
             }
-            log::info!("Detector processing frame {}", detect_frame_id);
+            log::debug!("Consuming frame {} for detect", detect_frame_id);
 
             // Submit latest detector frame if available
             if let Some((detector_frame, capture_time)) = latest_detector_frame {
@@ -365,7 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
                 if video_pipeline_for_detector.try_submit_frame(frame) {
-                    log::info!("Submitted frame {} to detect pipeline", detector_frame_id);
+                    log::debug!("Submitted frame {} for detect", detector_frame_id);
                     detector_frame_id += 1;
                 } else {
                     log::warn!("Pipeline busy, frame dropped");
@@ -420,8 +420,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut out_frame_id = 0_u64;
 
-    // Pre-allocate Mat for reuse (optimization #5)
+    // Pre-allocate Mat for reuse (optimization)
     let mut display_mat = Mat::default();
+
+    // === OPTIMIZATION: Pre-compute color palette for all 80 COCO classes ===
+    let color_palette: Vec<Rgb<u8>> = (0..80)
+        .map(|class_id| generate_class_color(class_id))
+        .collect();
 
     loop {
         // Try to get frame from OUTPUT queue (non-blocking with compensation)
@@ -429,10 +434,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_rx.try_recv().ok().map(|(frame, _timestamp)| frame);
 
         if new_captured_frame.is_some() {
-            log::info!("Consuming frame: {} from capture", out_frame_id);
+            log::info!("Consuming frame: {} for output", out_frame_id);
             out_frame_id += 1;
         } else {
-            log::info!("Missing output frame in iteration");
+            log::warn!("Missing output frame in iteration");
         }
 
         // Determine what frame to use for output (OPTIMIZED - reduce clones)
@@ -449,7 +454,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // No new frame available - reuse last frame
-            log::debug!("⏭️ No new frame, repeating last frame for output");
+            log::warn!("⏭️ No new frame, repeating last frame for output");
             last_frame
         } else {
             // No frames captured yet - check if capture thread signaled end
@@ -516,6 +521,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writer_handle = Some(handle);
         }
 
+        // === OPTIMIZATION: Pre-compute scale factors ONCE (after first frame) ===
+        // These don't change between frames, so calculate once and reuse
+        let (scale_x, scale_y) = {
+            let target_size = 640.0_f32;
+            let scale = if orig_width > orig_height {
+                (target_size / orig_width as f32).min(1.0)
+            } else {
+                (target_size / orig_height as f32).min(1.0)
+            };
+
+            let resized_width = (orig_width as f32 * scale) as u32;
+            let resized_height = (orig_height as f32 * scale) as u32;
+
+            (
+                orig_width as f32 / resized_width as f32,
+                orig_height as f32 / resized_height as f32,
+            )
+        };
+
         // Get latest detections from results thread (non-blocking)
         if let Ok(detections) = detections_rx.try_recv() {
             latest_detections = detections;
@@ -528,34 +552,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Annotate current frame with latest detections (from VideoPipeline with Kalman)
         let mut annotated = rgb_image.clone();
 
-        // Calculate scale factors (detections are in resized image coordinates)
-        // Pipeline resizes so LONGEST dimension = 640, preserving aspect ratio
-        // This ensures the frame fits in a single 640x640 tile
-        let target_size = 640.0_f32;
-        let tile_size = if orig_width > orig_height {
-            target_size.min(orig_width as f32)
-        } else {
-            target_size.min(orig_height as f32)
-        };
-
-        let scale = if orig_width > orig_height {
-            tile_size / orig_width as f32
-        } else {
-            tile_size / orig_height as f32
-        };
-
-        let resized_width = (orig_width as f32 * scale) as u32;
-        let resized_height = (orig_height as f32 * scale) as u32;
-
-        // Scale from pipeline coords back to current frame coords
-        let scale_x = orig_width as f32 / resized_width as f32;
-        let scale_y = orig_height as f32 / resized_height as f32;
-
         // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
+        // Uses pre-computed scale_x, scale_y and color_palette
         let annotation_data: Vec<_> = latest_detections
             .par_iter()
             .map(|det| {
-                let color = generate_class_color(det.class_id);
+                let color = color_palette[det.class_id as usize]; // Lookup, not compute
                 let scaled_x = (det.x * scale_x) as i32;
                 let scaled_y = (det.y * scale_y) as i32;
                 let scaled_w = (det.w * scale_x) as u32;
@@ -604,22 +606,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Draw stats overlay
-        let stats_text = format!(
-            "Frame: {} | Tracks: {} | Detections: {} RT-DETR",
-            frame_id,
-            num_tracks,
-            stats_processed.load(Ordering::Relaxed)
-        );
+        // Draw stats overlay (only when displaying to reduce overhead)
+        if frame_id % display_interval == 0 {
+            let stats_text = format!(
+                "Frame: {} | Tracks: {} | Detections: {} RT-DETR",
+                frame_id,
+                num_tracks,
+                stats_processed.load(Ordering::Relaxed)
+            );
 
-        draw_text(
-            &mut annotated,
-            &stats_text,
-            10,
-            30,
-            Rgb([255, 255, 255]),
-            Some(Rgb([0, 0, 0])),
-        );
+            draw_text(
+                &mut annotated,
+                &stats_text,
+                10,
+                30,
+                Rgb([255, 255, 255]),
+                Some(Rgb([0, 0, 0])),
+            );
+        }
 
         // Convert annotated frame to Mat for display and writing
         let display_width = annotated.width();

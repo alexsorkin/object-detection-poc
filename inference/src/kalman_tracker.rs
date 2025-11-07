@@ -1,6 +1,8 @@
 /// Kalman filter-based multi-object tracker with Hungarian matching
 use crate::frame_pipeline::TileDetection;
 use nalgebra::{Matrix4, Matrix4x6, Matrix6, Vector4, Vector6};
+use rayon::prelude::*;
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Configuration for Kalman filter noise parameters
@@ -258,6 +260,7 @@ impl MultiObjectTracker {
     }
 
     /// Calculate IoU between detection and tracked object
+    #[inline]
     fn calculate_iou(det: &TileDetection, track: &TrackedObject) -> f32 {
         let track_det = track.get_detection();
 
@@ -289,6 +292,7 @@ impl MultiObjectTracker {
     }
 
     /// Calculate centroid distance between detection and tracked object (pixels)
+    #[inline]
     fn calculate_centroid_distance(det: &TileDetection, track: &TrackedObject) -> f32 {
         let track_det = track.get_detection();
 
@@ -324,35 +328,42 @@ impl MultiObjectTracker {
         // Build cost matrix using pathfinding::matrix::Matrix with integer costs
         // Scale IoU by 10000 to preserve precision as integers
         let scale = 10000_i32;
-        let mut cost_matrix = pathfinding::matrix::Matrix::new(rows, cols, scale);
+        let cost_matrix = Mutex::new(pathfinding::matrix::Matrix::new(rows, cols, scale));
 
-        for (det_idx, det) in detections.iter().enumerate() {
-            for (track_idx, track) in self.tracks.iter().enumerate() {
-                // Only match same class
-                if det.class_id == track.class_id {
-                    let iou = Self::calculate_iou(det, track);
-                    let centroid_dist = Self::calculate_centroid_distance(det, track);
+        // PARALLEL: Compute costs for all detection-track pairs
+        detections
+            .par_iter()
+            .enumerate()
+            .for_each(|(det_idx, det)| {
+                for (track_idx, track) in self.tracks.iter().enumerate() {
+                    // Only match same class
+                    if det.class_id == track.class_id {
+                        let iou = Self::calculate_iou(det, track);
+                        let centroid_dist = Self::calculate_centroid_distance(det, track);
 
-                    // Compute cost: prefer IoU, but use distance if IoU is zero
-                    let cost = if iou > 0.01 {
-                        // IoU-based cost (lower is better)
-                        ((1.0 - iou) * scale as f32) as i32
-                    } else {
-                        // Distance-based cost normalized to similar range
-                        let normalized_dist =
-                            (centroid_dist / self.config.max_centroid_distance).min(2.0);
-                        (normalized_dist * scale as f32) as i32
-                    };
+                        // Compute cost: prefer IoU, but use distance if IoU is zero
+                        let cost = if iou > 0.01 {
+                            // IoU-based cost (lower is better)
+                            ((1.0 - iou) * scale as f32) as i32
+                        } else {
+                            // Distance-based cost normalized to similar range
+                            let normalized_dist =
+                                (centroid_dist / self.config.max_centroid_distance).min(2.0);
+                            (normalized_dist * scale as f32) as i32
+                        };
 
-                    // Place cost in correct position depending on transpose
-                    if transpose {
-                        cost_matrix[(track_idx, det_idx)] = cost;
-                    } else {
-                        cost_matrix[(det_idx, track_idx)] = cost;
+                        // Place cost in correct position depending on transpose
+                        let mut matrix = cost_matrix.lock().unwrap();
+                        if transpose {
+                            matrix[(track_idx, det_idx)] = cost;
+                        } else {
+                            matrix[(det_idx, track_idx)] = cost;
+                        }
                     }
                 }
-            }
-        }
+            });
+
+        let cost_matrix = cost_matrix.into_inner().unwrap();
 
         // Use Hungarian algorithm for optimal assignment
         let (_total_cost, assignments) = pathfinding::kuhn_munkres::kuhn_munkres(&cost_matrix);
@@ -389,12 +400,13 @@ impl MultiObjectTracker {
 
     /// Update tracks with new detections
     pub fn update(&mut self, detections: &[TileDetection], dt: f32) {
-        // First, predict all tracks forward
+        // First, predict all tracks forward (sequential due to &mut requirement)
+        // This is fast enough - prediction is ~50 FLOPS per track
         for track in &mut self.tracks {
             track.predict(dt);
         }
 
-        // Associate detections to tracks
+        // Associate detections to tracks (uses parallel cost matrix computation)
         let matches = self.associate_detections(detections);
 
         let mut matched_detections = vec![false; detections.len()];
@@ -447,7 +459,7 @@ impl MultiObjectTracker {
     /// Get all current track predictions (for extrapolation)
     pub fn get_predictions(&self) -> Vec<TileDetection> {
         self.tracks
-            .iter()
+            .par_iter()
             .map(|track| track.get_detection())
             .collect()
     }

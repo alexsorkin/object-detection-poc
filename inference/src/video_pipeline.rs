@@ -153,10 +153,13 @@ impl VideoPipeline {
                         // Update tracker with real detections
                         tracker.update(&output.detections, dt);
 
+                        // Get tracked detections (with track IDs assigned)
+                        let tracked_detections = tracker.get_predictions();
+
                         let result = FrameResult {
                             frame_id: frame.frame_id,
                             timestamp: frame.timestamp,
-                            detections: output.detections.clone(),
+                            detections: tracked_detections,
                             is_extrapolated: false,
                             processing_time_ms: processing_time,
                             latency_ms: latency,

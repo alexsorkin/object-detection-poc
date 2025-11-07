@@ -12,6 +12,8 @@ use opencv::{
     imgproc,
     prelude::*,
 };
+use rayon::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -125,11 +127,13 @@ impl PreprocessStage {
         let new_width = (width as f32 * scale) as u32;
         let new_height = (height as f32 * scale) as u32;
 
+        // OPTIMIZATION: Use Triangle filter (3-5x faster than Lanczos3)
+        // Triangle provides good quality for real-time processing
         image::imageops::resize(
             img,
             new_width,
             new_height,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle,
         )
     }
 
@@ -323,11 +327,12 @@ impl PreprocessStage {
     }
 
     /// Extract tiles from image (shadow removal already applied to full image)
+    /// OPTIMIZATION: Uses parallel iteration for multi-tile extraction
     pub fn extract_tiles(&self, img: &RgbImage) -> Vec<Tile> {
         let positions = self.get_tile_positions(img.width(), img.height());
 
         positions
-            .iter()
+            .par_iter() // PARALLEL: Process tiles concurrently
             .enumerate()
             .map(|(idx, &(x, y))| {
                 let crop_width = self.tile_size.min(img.width() - x);
@@ -372,6 +377,7 @@ impl PreprocessStage {
         let resized_height = resized_img.height();
 
         // Apply CLAHE-based shadow removal to entire resized image once (more efficient than per-tile)
+        // CLAHE improves object detection quality and must always be applied
         let deshadowed_img = match self.remove_shadows_clahe(&resized_img) {
             Ok(enhanced) => enhanced,
             Err(e) => {
@@ -424,7 +430,8 @@ impl ExecutionStage {
     pub fn process(&self, input: PreprocessOutput) -> StageResult<ExecutionOutput> {
         let start = Instant::now();
 
-        let mut all_detections = Vec::new();
+        // OPTIMIZATION: Pre-allocate detection vector (typical: 5-15 detections per tile)
+        let mut all_detections = Vec::with_capacity(input.tiles.len() * 10);
 
         // Submit all tiles to batch executor
         let mut responses = Vec::new();
@@ -554,15 +561,18 @@ impl PostprocessStage {
     }
 
     /// Calculate IoU between two bounding boxes
+    /// OPTIMIZATION: Inline for performance + early exit for non-overlapping boxes
+    #[inline]
     fn calculate_iou(a: &TileDetection, b: &TileDetection) -> f32 {
+        // Early exit: Check if boxes don't overlap at all
+        if a.x > b.x + b.w || b.x > a.x + a.w || a.y > b.y + b.h || b.y > a.y + a.h {
+            return 0.0;
+        }
+
         let x1 = a.x.max(b.x);
         let y1 = a.y.max(b.y);
         let x2 = (a.x + a.w).min(b.x + b.w);
         let y2 = (a.y + a.h).min(b.y + b.h);
-
-        if x2 < x1 || y2 < y1 {
-            return 0.0;
-        }
 
         let intersection = (x2 - x1) * (y2 - y1);
         let area_a = a.w * a.h;
@@ -574,6 +584,7 @@ impl PostprocessStage {
 
     /// Check if detection `inner` is fully contained within detection `outer`
     /// with optional padding applied to outer detection boundaries
+    #[inline]
     fn is_fully_contained(inner: &TileDetection, outer: &TileDetection, padding: f32) -> bool {
         let inner_x1 = inner.x;
         let inner_y1 = inner.y;
@@ -618,34 +629,57 @@ impl PostprocessStage {
     }
 
     /// Apply NMS to remove duplicates
-    fn apply_nms(&self, mut detections: Vec<TileDetection>) -> Vec<TileDetection> {
-        detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-
-        let mut keep = Vec::new();
-        let mut suppressed = vec![false; detections.len()];
-
-        for i in 0..detections.len() {
-            if suppressed[i] {
-                continue;
-            }
-
-            keep.push(detections[i].clone());
-
-            for j in (i + 1)..detections.len() {
-                if suppressed[j] {
-                    continue;
-                }
-
-                if detections[i].class_id == detections[j].class_id {
-                    let iou = Self::calculate_iou(&detections[i], &detections[j]);
-                    if iou > self.iou_threshold {
-                        suppressed[j] = true;
-                    }
-                }
-            }
+    /// OPTIMIZATION: Parallel NMS by class - each class processed independently
+    fn apply_nms(&self, detections: Vec<TileDetection>) -> Vec<TileDetection> {
+        if detections.is_empty() {
+            return detections;
         }
 
-        keep
+        // Group detections by class
+        let classes: HashSet<u32> = detections.iter().map(|d| d.class_id).collect();
+        
+        // PARALLEL: Process each class independently
+        let results: Vec<TileDetection> = classes
+            .par_iter()
+            .flat_map(|&class_id| {
+                // Get all detections for this class
+                let mut class_dets: Vec<TileDetection> = detections
+                    .iter()
+                    .filter(|d| d.class_id == class_id)
+                    .cloned()
+                    .collect();
+
+                // Sort by confidence (highest first)
+                class_dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+                // Apply NMS for this class
+                let mut keep = Vec::new();
+                let mut suppressed = vec![false; class_dets.len()];
+
+                for i in 0..class_dets.len() {
+                    if suppressed[i] {
+                        continue;
+                    }
+
+                    keep.push(class_dets[i].clone());
+
+                    for j in (i + 1)..class_dets.len() {
+                        if suppressed[j] {
+                            continue;
+                        }
+
+                        let iou = Self::calculate_iou(&class_dets[i], &class_dets[j]);
+                        if iou > self.iou_threshold {
+                            suppressed[j] = true;
+                        }
+                    }
+                }
+
+                keep
+            })
+            .collect();
+
+        results
     }
 
     /// Run post-processing stage (synchronous)
