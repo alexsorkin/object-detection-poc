@@ -260,7 +260,7 @@ impl YoloV8Detector {
         // Postprocess: parse YOLOv8 output and apply NMS
         let detections = self.postprocess(output_array.view(), image.width, image.height)?;
 
-        info!("Detected {} targets", detections.len());
+        debug!("Detected {} targets", detections.len());
         Ok(detections)
     }
 

@@ -513,17 +513,17 @@ impl ExecutionStage {
         
         // Log per-tile performance
         if !tile_times.is_empty() {
-            log::info!("📊 Per-Tile End-to-End Latency (submission → response):");
+            log::debug!("📊 Per-Tile End-to-End Latency (submission → response):");
             for (idx, time, det_count) in &tile_times {
                 let ms = time.as_secs_f32() * 1000.0;
                 let fps = 1000.0 / ms;
-                log::info!("  Tile #{}: {:.1}ms ({:.1} FPS) - {} detections", idx, ms, fps, det_count);
+                log::debug!("  Tile #{}: {:.1}ms ({:.1} FPS) - {} detections", idx, ms, fps, det_count);
             }
             let total_ms: f32 = tile_times.iter().map(|(_, t, _)| t.as_secs_f32() * 1000.0).sum();
             let avg_ms = total_ms / tile_times.len() as f32;
             let avg_fps = 1000.0 / avg_ms;
-            log::info!("  Average latency: {:.1}ms ({:.1} FPS)", avg_ms, avg_fps);
-            log::info!("  Submit time: {:.1}ms", submit_time.as_secs_f32() * 1000.0);
+            log::info!("  Frame latency: {:.1}ms ({:.1} FPS)", avg_ms, avg_fps);
+            log::debug!("  Submit time: {:.1}ms", submit_time.as_secs_f32() * 1000.0);
         }
 
         let output = ExecutionOutput {

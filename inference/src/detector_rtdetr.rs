@@ -319,7 +319,7 @@ impl RTDETRDetector {
             image.height,
         )?;
 
-        info!("Detected {} targets", detections.len());
+        debug!("Detected {} targets", detections.len());
         Ok(detections)
     }
 

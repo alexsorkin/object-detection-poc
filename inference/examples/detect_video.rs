@@ -205,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Create video pipeline with Kalman tracker
-    let buffer_size = 2; // Tiny buffer - only allow 2 frames queued max
+    let buffer_size = 10; // Tiny buffer - only allow 2 frames queued max
     let video_config = VideoPipelineConfig {
         max_latency_ms: 500,
         kalman_config: KalmanConfig {
@@ -296,18 +296,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Send to detector queue (NON-BLOCKING - can drop if overflowing)
                     // Include capture timestamp for age-based filtering
-                    let _ = detector_tx.try_send((frame.clone(), capture_time));
+                    if detector_tx.send((frame.clone(), capture_time)).is_err() {
+                        // Channel closed - main thread terminated
+                        break;
+                    }
 
                     // Send to output queue (BLOCKING - ensures ALL frames reach output)
                     if output_tx.send((frame.clone(), capture_time)).is_err() {
                         // Channel closed - main thread terminated
                         break;
-                    }
-
-                    // Pace to target FPS - sleep for remaining time in this frame period
-                    let elapsed = frame_start.elapsed();
-                    if elapsed < capture_frame_duration {
-                        std::thread::sleep(capture_frame_duration - elapsed);
                     }
                 }
                 Err(_) => {
@@ -322,6 +319,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     drop(output_tx);
                     break;
                 }
+            }
+
+            // Pace to target FPS - sleep for remaining time in this frame period
+            let elapsed = frame_start.elapsed();
+            if elapsed < capture_frame_duration {
+                std::thread::sleep(capture_frame_duration - elapsed);
             }
         }
     });
@@ -362,15 +365,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
                 if video_pipeline_for_detector.try_submit_frame(frame) {
-                    log::debug!("Submitted frame {} to video pipeline", detector_frame_id);
+                    log::info!("Submitted frame {} to video pipeline", detector_frame_id);
                     detector_frame_id += 1;
                 } else {
-                    log::debug!("Pipeline busy, frame dropped");
+                    log::warn!("Pipeline busy, frame dropped");
                 }
             }
 
             // Small sleep to avoid busy loop when queue is empty
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(100));
         }
     });
 
@@ -408,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Small sleep to avoid busy loop
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(5));
         }
     });
 
@@ -452,12 +455,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let orig_height = rgb_image.height();
 
         if !writer_initialized.get() {
+            // Calculate output dimensions: 640 on longest axis, preserving aspect ratio
+            let target_size = 640.0_f32;
+            let (output_width, output_height) = if orig_width > orig_height {
+                // Landscape: width = 640
+                let scale = target_size / orig_width as f32;
+                (640, (orig_height as f32 * scale) as i32)
+            } else {
+                // Portrait or square: height = 640
+                let scale = target_size / orig_height as f32;
+                ((orig_width as f32 * scale) as i32, 640)
+            };
+
             let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')?;
             let mut new_writer = VideoWriter::new(
                 output_path,
                 fourcc,
                 fps,
-                opencv::core::Size::new(orig_width as i32, orig_height as i32),
+                opencv::core::Size::new(output_width, output_height),
                 true,
             )?;
 
@@ -468,8 +483,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             eprintln!(
-                "  ✓ Writing output to: {} ({}x{})\n",
-                output_path, orig_width, orig_height
+                "  ✓ Writing output to: {} ({}x{} → {}x{})\n",
+                output_path, orig_width, orig_height, output_width, output_height
             );
             io::stderr().flush()?;
 
@@ -619,9 +634,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Write ALL frames to output video (async, non-blocking)
         if let Some(ref tx) = frame_tx {
+            // Resize to 640 on longest axis before writing
+            let target_size = 640.0_f32;
+            let (output_width, output_height) = if display_width > display_height {
+                let scale = target_size / display_width as f32;
+                (640, (display_height as f32 * scale) as i32)
+            } else {
+                let scale = target_size / display_height as f32;
+                ((display_width as f32 * scale) as i32, 640)
+            };
+
+            let mut resized_mat = Mat::default();
+            imgproc::resize(
+                &display_mat,
+                &mut resized_mat,
+                opencv::core::Size::new(output_width, output_height),
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )?;
+
             // Use try_send to avoid blocking the main loop
             // If queue is full, skip this frame (writer can't keep up)
-            let _ = tx.try_send(display_mat.clone());
+            let _ = tx.try_send(resized_mat);
         }
 
         frame_id += 1;
@@ -640,9 +675,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
 
-            eprintln!(
-                "Frame {}: {:.1} FPS | Tracks: {} | Real detections: {} | Avg Latency: {:.0}ms",
-                frame_id, avg_fps, num_tracks, processed, avg_latency
+            log::debug!(
+                "Frame {}: {:.1} FPS | Tracks: {}",
+                frame_id,
+                avg_fps,
+                num_tracks,
+            );
+            log::debug!(
+                "Real detections: {} | Avg Latency: {:.0}ms",
+                processed,
+                avg_latency
             );
             io::stderr().flush().ok();
         }
