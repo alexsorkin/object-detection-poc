@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-python@v2
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r demo/requirements.txt
+    - uses: pre-commit/action@v2.0.3
+
+  macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: messense/maturin-action@v1
+      with:
+        command: build
+        args: --release --no-sdist -o dist --universal2
+    - name: Upload wheels
+      uses: actions/upload-artifact@v2
+      with:
+        name: wheels
+        path: dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: messense/maturin-action@v1
+      with:
+        command: build
+        args: --release --no-sdist -o dist
+    - name: Upload wheels
+      uses: actions/upload-artifact@v2
+      with:
+        name: wheels
+        path: dist
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: build docker image
+      run: |
+        cd .github/workflows && sudo docker build -t ioutrack_manylinux:latest .
+    - uses: messense/maturin-action@v1
+      with:
+        manylinux: auto
+        command: build
+        container: ioutrack_manylinux:latest
+        args: --release -o dist
+    - name: Upload wheels
+      uses: actions/upload-artifact@v2
+      with:
+        name: wheels
+        path: dist
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: "startsWith(github.ref, 'refs/tags/')"
+    needs: [ linux, windows, macos ]
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: wheels
+      - name: Publish to PyPI
+        uses: messense/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: --skip-existing *
