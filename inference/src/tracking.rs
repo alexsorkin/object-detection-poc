@@ -74,6 +74,8 @@ pub struct UnifiedTracker {
     method: TrackingMethod,
     /// Store original detection information by track ID with pre-allocated capacity
     track_metadata: HashMap<u32, TrackMetadata>,
+    /// Track ages by track ID (number of frames since last detection)
+    track_ages: HashMap<u32, u32>,
     /// Track update count for debugging
     update_count: u64,
     /// Pre-allocated vectors for IoU matching performance
@@ -133,6 +135,7 @@ impl UnifiedTracker {
             tracker,
             method,
             track_metadata: HashMap::with_capacity(64), // Pre-allocate for common use cases
+            track_ages: HashMap::with_capacity(64),     // Pre-allocate for track age tracking
             update_count: 0,
             temp_iou_results: Vec::with_capacity(128), // Pre-allocate for IoU matching
         }
@@ -142,11 +145,19 @@ impl UnifiedTracker {
     pub fn update(&mut self, detections: &[TileDetection], _dt: f32) -> Vec<TileDetection> {
         self.update_count += 1;
 
+        // For real detections (non-empty), purge tracks older than 3 frames
+        if !detections.is_empty() {
+            self.purge_old_tracks(5);
+        }
+
         if detections.is_empty() {
             log::debug!(
                 "UnifiedTracker::update called with 0 detections (update #{})",
                 self.update_count
             );
+
+            // Age all tracks by 1 frame when no detections
+            self.age_all_tracks();
             return Vec::new();
         }
 
@@ -197,6 +208,13 @@ impl UnifiedTracker {
                 // IoU matching for metadata assignment
                 self.update_track_metadata(detections, &mut tracked_detections);
 
+                // Update track ages based on active tracks
+                let active_track_ids: Vec<u32> = tracked_detections
+                    .iter()
+                    .filter_map(|det| det.track_id)
+                    .collect();
+                self.update_track_ages(&active_track_ids);
+
                 tracked_detections
             }
             Err(e) => {
@@ -243,6 +261,9 @@ impl UnifiedTracker {
                         tracked_det.class_id = detection.class_id;
                         tracked_det.class_name = detection.class_name.clone();
                         tracked_det.confidence = detection.confidence;
+
+                        // Update track ages for single detection
+                        self.update_track_ages(&[track_id]);
                     }
                 }
 
@@ -379,6 +400,64 @@ impl UnifiedTracker {
     /// Get tracking method
     pub fn method(&self) -> TrackingMethod {
         self.method
+    }
+
+    /// Purge tracks older than the specified max age (in frames)
+    fn purge_old_tracks(&mut self, max_age: u32) {
+        let old_track_ids: Vec<u32> = self
+            .track_ages
+            .iter()
+            .filter_map(
+                |(&track_id, &age)| {
+                    if age > max_age {
+                        Some(track_id)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect();
+
+        for track_id in old_track_ids {
+            log::debug!(
+                "Purging old track {} with age {} frames",
+                track_id,
+                self.track_ages.get(&track_id).unwrap_or(&0)
+            );
+
+            // Remove from tracker
+            self.tracker.remove_tracker(track_id);
+
+            // Remove from our metadata
+            self.track_metadata.remove(&track_id);
+            self.track_ages.remove(&track_id);
+        }
+    }
+
+    /// Age all tracks by 1 frame (called when no detections are present)
+    fn age_all_tracks(&mut self) {
+        for age in self.track_ages.values_mut() {
+            *age += 1;
+        }
+    }
+
+    /// Update track ages based on current active tracks
+    fn update_track_ages(&mut self, active_track_ids: &[u32]) {
+        // Age all tracks by 1 frame
+        for age in self.track_ages.values_mut() {
+            *age += 1;
+        }
+
+        // Reset age to 0 for tracks that were matched with detections
+        for &track_id in active_track_ids {
+            self.track_ages.insert(track_id, 0);
+        }
+
+        // Clean up track ages for tracks that no longer exist
+        let existing_track_ids: std::collections::HashSet<u32> =
+            active_track_ids.iter().copied().collect();
+        self.track_ages
+            .retain(|track_id, _| existing_track_ids.contains(track_id));
     }
 }
 

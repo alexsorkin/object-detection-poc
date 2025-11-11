@@ -273,13 +273,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Create video pipeline with selected tracker
-    let buffer_size = 10; // Tiny buffer - only allow 10 frames queued max
+    let buffer_size = 1; // Tiny buffer - only allow 1 frame queued max
 
     // Configure tracking based on selected method
     let tracking_config = match tracking_method {
         TrackingMethod::Kalman => {
             TrackingConfig::Kalman(KalmanConfig {
-                max_age: 5,                                // frames to keep track alive without detections
+                max_age: 3,                                // frames to keep track alive without detections
                 min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.1, // REDUCED from 0.3 to be more permissive for association
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
@@ -289,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         TrackingMethod::ByteTrack => {
             TrackingConfig::ByteTrack(ByteTrackConfig {
-                max_age: 5,                                              // frames to keep track alive
+                max_age: 3,                                              // frames to keep track alive
                 min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // IoU threshold for association (standard value)
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
@@ -308,6 +308,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let video_pipeline = Arc::new(VideoPipeline::new(Arc::clone(&pipeline), video_config));
+
+    // Create shutdown channels for coordinating thread shutdown
+    let (shutdown_tx_capture, shutdown_rx_capture) = sync_channel::<()>(1);
+    let (shutdown_tx_detector, shutdown_rx_detector) = sync_channel::<()>(1);
+    let (shutdown_tx_results, shutdown_rx_results) = sync_channel::<()>(1);
 
     eprintln!("  ✓ Pipeline ready (with {} tracker)", tracking_method);
     eprintln!("\n💡 Configuration:");
@@ -385,6 +390,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capture_handle = thread::spawn(move || {
         let mut cp_frame_id = 0_u64;
         loop {
+            // Check for shutdown signal (non-blocking)
+            if let Ok(_) = shutdown_rx_capture.try_recv() {
+                log::info!("Capture thread received shutdown signal");
+                break;
+            }
+
             let frame_start = Instant::now();
             cp_frame_id += 1;
 
@@ -412,13 +423,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = output_done_tx.send(()); // Signal main thread
                     let _ = detector_done_tx.send(()); // Signal main thread
                     let _ = results_done_tx.send(()); // Signal main thread
-                                                      // Explicitly drop senders to close channels
-                    drop(detector_tx);
-                    drop(output_tx);
                     break;
                 }
             }
         }
+
+        // Ensure channels are closed on shutdown
+        log::debug!("Capture thread: Closing channels");
     });
 
     let video_pipeline_for_detector = Arc::clone(&video_pipeline);
@@ -428,10 +439,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut input_frame_id = 0_u64;
 
         loop {
+            // Check for shutdown signal (non-blocking)
+            if let Ok(_) = shutdown_rx_detector.try_recv() {
+                log::info!("Detector thread received shutdown signal");
+                // Shutdown the video pipeline
+                video_pipeline_for_detector.shutdown();
+                break;
+            }
+
             let frame_start = Instant::now();
 
             if let Ok(_) = detector_done_rx.try_recv() {
                 log::debug!("Detector thread: End of video");
+                // Shutdown the video pipeline on end of video
+                video_pipeline_for_detector.shutdown();
                 break;
             }
 
@@ -478,7 +499,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     submitted_frame_id += 1;
                 } else {
                     let _ = video_pipeline_for_detector.advance_tracks();
-                    log::warn!("Advanced tracker for dropped frame (pipeline busy)");
                 }
             }
 
@@ -503,6 +523,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let results_handle = thread::spawn(move || {
         loop {
+            // Check for shutdown signal (non-blocking)
+            if let Ok(_) = shutdown_rx_results.try_recv() {
+                log::info!("Results thread received shutdown signal");
+                break;
+            }
+
             if let Ok(_) = results_done_rx.try_recv() {
                 log::debug!("Results thread: End of video");
                 break;
@@ -547,6 +573,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if let Ok(_) = output_done_rx.try_recv() {
             log::debug!("Main Loop: End of video (no frames captured)");
+
+            // Send shutdown signals to all threads
+            let _ = shutdown_tx_capture.send(());
+            let _ = shutdown_tx_detector.send(());
+            let _ = shutdown_tx_results.send(());
+
+            // Shutdown video pipeline
+            video_pipeline.shutdown();
             break;
         }
 
@@ -562,6 +596,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed - capture thread finished
                 log::info!("Output channel closed, ending video processing");
+
+                // Send shutdown signals to all threads
+                let _ = shutdown_tx_capture.send(());
+                let _ = shutdown_tx_detector.send(());
+                let _ = shutdown_tx_results.send(());
+
+                // Shutdown video pipeline
+                video_pipeline.shutdown();
                 break;
             }
         };
@@ -602,7 +644,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             io::stderr().flush()?;
 
             // Resize display window to match video size (capped at 640p)
-            if !headless {
+            if headless {
                 let max_height = 640;
                 let (window_width, window_height) = if orig_height > max_height {
                     // Scale down to 640p preserving aspect ratio
@@ -811,6 +853,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if key == 'q' as i32 {
                 eprintln!("\n⏹️  Stopped by user");
                 io::stderr().flush()?;
+
+                // Send shutdown signals to all threads
+                let _ = shutdown_tx_capture.send(());
+                let _ = shutdown_tx_detector.send(());
+                let _ = shutdown_tx_results.send(());
+
+                // Shutdown video pipeline
+                video_pipeline.shutdown();
                 break;
             } else if key == 'p' as i32 {
                 paused = !paused;
@@ -829,6 +879,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    // Send shutdown signals to all threads when main loop ends
+    log::info!("Main loop ended, shutting down all threads");
+    let _ = shutdown_tx_capture.send(());
+    let _ = shutdown_tx_detector.send(());
+    let _ = shutdown_tx_results.send(());
+
+    // Shutdown video pipeline
+    video_pipeline.shutdown();
 
     let total_time = stats_start.elapsed().as_secs_f32();
     let processed = stats_processed.load(Ordering::Relaxed);
