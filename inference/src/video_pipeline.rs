@@ -112,6 +112,40 @@ impl VideoPipeline {
             let now = Instant::now();
             let dt = now.duration_since(last_process_time).as_secs_f32();
 
+            // Check if this is an advance tracks command (special frame_id)
+            if frame_id == u64::MAX {
+                // Update tracker with empty detections to advance predictions
+                let tracked_predictions = tracker.update(&[], dt);
+
+                log::debug!(
+                    "Advanced tracks: {} predictions, dt={:.3}s",
+                    tracked_predictions.len(),
+                    dt
+                );
+
+                // Optionally send extrapolated result if there are predictions
+                if !tracked_predictions.is_empty() {
+                    let result = FrameResult {
+                        frame_id: 0, // No frame ID for extrapolated tracks
+                        timestamp,
+                        detections: tracked_predictions,
+                        is_extrapolated: true,
+                        processing_time_ms: 0.0,
+                        latency_ms: 0.0,
+                        duplicates_removed: 0,
+                        nested_removed: 0,
+                    };
+
+                    if let Err(e) = result_tx.send(result) {
+                        log::warn!("Failed to send extrapolated result: {}", e);
+                        break;
+                    }
+                }
+
+                last_process_time = now;
+                continue;
+            }
+
             let tracked_detections = tracker.update(&pipeline_output.detections, dt);
 
             // Create frame result with extracted diagnostics
@@ -157,15 +191,25 @@ impl VideoPipeline {
         _max_latency: Duration,
     ) {
         let mut frames_processed = 0_u64;
-        let frames_extrapolated = 0_u64;
+        let mut frames_extrapolated = 0_u64;
 
         log::info!("Video pipeline worker started");
 
         while let Ok(command) = command_rx.recv() {
             match command {
                 WorkerCommand::AdvanceTracks => {
-                    // TODO: Send advance tracks command to detection loop
-                    log::debug!("Advanced tracker predictions (dropped frame)");
+                    let now = Instant::now();
+
+                    if let Err(e) =
+                        detection_output_tx.send((u64::MAX, now, PipelineOutput::default()))
+                    {
+                        log::warn!("Failed to send advance tracks to detection loop: {}", e);
+                        break;
+                    }
+
+                    log::debug!("Advancing tracker predictions (due to dropped frame)");
+
+                    frames_extrapolated += 1;
                     continue;
                 }
                 WorkerCommand::ProcessFrame(frame) => {

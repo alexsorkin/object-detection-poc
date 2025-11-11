@@ -512,9 +512,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(result) = video_pipeline_for_results.try_get_result() {
                 // Update stats
                 if result.is_extrapolated {
-                    stats_extrapolated_for_results.fetch_add(1, Ordering::Relaxed);
+                    let new_extrapolated =
+                        stats_extrapolated_for_results.fetch_add(1, Ordering::Relaxed) + 1;
+                    log::debug!(
+                        "Got extrapolated result, total extrapolated: {}",
+                        new_extrapolated
+                    );
                 } else {
-                    stats_processed_for_results.fetch_add(1, Ordering::Relaxed);
+                    let new_processed =
+                        stats_processed_for_results.fetch_add(1, Ordering::Relaxed) + 1;
+                    log::debug!("Got processed result, total processed: {}", new_processed);
                 }
                 stats_latency_for_results.fetch_add(result.latency_ms as u32, Ordering::Relaxed);
 
@@ -775,16 +782,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             log::debug!(
-                "Frame {}: {:.1} FPS | Tracks: {}",
+                "Frame {}: {:.1} FPS | Tracks: {} | Display frames: {}",
                 frame_id,
                 avg_fps,
                 num_tracks,
+                frame_id,
             );
-            log::debug!(
-                "RT-DETR runs: {} | Avg Latency: {:.0}ms",
-                processed,
-                avg_latency
-            );
+
+            if total == 0 {
+                log::warn!(
+                    "⚠️  No detection results yet (processed: {}, extrapolated: {}) - check for ONNX errors",
+                    processed, extrapolated
+                );
+            } else {
+                log::debug!(
+                    "RT-DETR runs: {} | Extrapolated: {} | Avg Latency: {:.0}ms",
+                    processed,
+                    extrapolated,
+                    avg_latency
+                );
+            }
             io::stderr().flush().ok();
         }
 

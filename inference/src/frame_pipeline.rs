@@ -5,6 +5,7 @@
 /// 2. Execution: Frame-by-frame detection via FrameExecutor
 /// 3. Post-processing: NMS + coordinate merging
 use crate::frame_executor::FrameExecutor;
+use crate::tracking_utils::{calculate_iou, BoundingBox};
 use crate::types::{ImageData, ImageFormat};
 use image::{Rgb, RgbImage};
 use opencv::{
@@ -79,6 +80,22 @@ pub struct PipelineOutput {
     pub duplicates_removed: usize,
     pub nested_removed: usize,
     pub pipeline_total_time_ms: f32,
+}
+
+impl Default for PipelineOutput {
+    fn default() -> Self {
+        Self {
+            detections: Vec::new(),
+            original_width: 0,
+            original_height: 0,
+            resized_width: 0,
+            resized_height: 0,
+            resized_image: RgbImage::new(1, 1), // Minimal 1x1 dummy image
+            duplicates_removed: 0,
+            nested_removed: 0,
+            pipeline_total_time_ms: 0.0,
+        }
+    }
 }
 
 /// Pre-processing stage: Extract tiles and apply shadow removal
@@ -469,8 +486,13 @@ impl ExecutionStage {
                 Ok(Ok(detections)) => {
                     tile_results.push((tile_idx, offset_x, offset_y, detections));
                 }
-                _ => {
-                    log::warn!("⚠️  Failed to receive detection result for tile {}", tile_idx);
+                Ok(Err(_)) => {
+                    log::warn!("⚠️  Detection failed for tile {}", tile_idx);
+                }
+                Err(_) => {
+                    // Channel disconnected - likely due to shutdown signal
+                    log::info!("Detection channel disconnected for tile {} - shutdown signal received", tile_idx);
+                    break;
                 }
             }
         }
@@ -565,26 +587,27 @@ impl PostprocessStage {
         Self { iou_threshold }
     }
 
-    /// Calculate IoU between two bounding boxes
-    /// OPTIMIZATION: Inline for performance + early exit for non-overlapping boxes
+    /// Calculate IoU between two bounding boxes using tracking_utils
+    /// OPTIMIZATION: Inline for performance + reuses optimized utility function
     #[inline]
     fn calculate_iou(a: &TileDetection, b: &TileDetection) -> f32 {
-        // Early exit: Check if boxes don't overlap at all
-        if a.x > b.x + b.w || b.x > a.x + a.w || a.y > b.y + b.h || b.y > a.y + a.h {
-            return 0.0;
-        }
+        // Convert TileDetection to BoundingBox format
+        let box_a = BoundingBox {
+            x1: a.x,
+            y1: a.y,
+            x2: a.x + a.w,
+            y2: a.y + a.h,
+        };
+        
+        let box_b = BoundingBox {
+            x1: b.x,
+            y1: b.y,
+            x2: b.x + b.w,
+            y2: b.y + b.h,
+        };
 
-        let x1 = a.x.max(b.x);
-        let y1 = a.y.max(b.y);
-        let x2 = (a.x + a.w).min(b.x + b.w);
-        let y2 = (a.y + a.h).min(b.y + b.h);
-
-        let intersection = (x2 - x1) * (y2 - y1);
-        let area_a = a.w * a.h;
-        let area_b = b.w * b.h;
-        let union = area_a + area_b - intersection;
-
-        intersection / union
+        // Use optimized utility function
+        calculate_iou(&box_a, &box_b)
     }
 
     /// Check if detection `inner` is fully contained within detection `outer`
