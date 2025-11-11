@@ -31,14 +31,14 @@
 ///   cargo run --release --features metal --example detect_video -- --tracker kalman test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam
 use image::{Rgb, RgbImage};
-use military_target_detector::bytetrack_tracker::ByteTrackConfig;
+use military_target_detector::bytetrack_operator::ByteTrackConfig;
 use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{
     draw_rect_batch, draw_text, draw_text_batch, generate_class_color,
 };
-use military_target_detector::kalman_tracker::KalmanConfig;
+use military_target_detector::kalman_operator::KalmanConfig;
 use military_target_detector::tracking::{TrackingConfig, TrackingMethod};
 use military_target_detector::types::{DetectorConfig, RTDETRModel};
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
@@ -279,22 +279,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracking_config = match tracking_method {
         TrackingMethod::Kalman => {
             TrackingConfig::Kalman(KalmanConfig {
-                max_age_ms: 500,              // 6 FPS = 166ms/frame, allow ~3 frames missing
-                iou_threshold: 0.10,          // Very low threshold for 6 FPS with prediction drift
-                max_centroid_distance: 300.0, // Large distance - predictions drift significantly at 6 FPS
-                process_noise_pos: 3.0,       // Moderate uncertainty for 166ms gaps
-                process_noise_vel: 5.0,       // Higher velocity uncertainty - acceleration in 166ms
-                measurement_noise: 3.0,       // Trust detector measurements
-                initial_covariance: 15.0,     // Moderate initial uncertainty
+                max_age: 30,                  // frames to keep track alive without detections
+                min_hits: 1,                  // REDUCED from 3 to test track position updates
+                iou_threshold: 0.1, // REDUCED from 0.3 to be more permissive for association
+                init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
+                measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise covariance
+                process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001], // standard process noise
             })
         }
         TrackingMethod::ByteTrack => {
             TrackingConfig::ByteTrack(ByteTrackConfig {
-                high_conf_threshold: confidence_threshold,
-                low_conf_threshold: confidence_threshold * 0.3, // 30% of high threshold
-                match_thresh: 0.8,
-                frame_rate: fps as f32,
-                track_buffer: (fps as u32 / 2).max(15), // Half second buffer, minimum 15 frames
+                max_age: 30,                                             // frames to keep track alive
+                min_hits: 1,        // REDUCED from 3 to test track position updates
+                iou_threshold: 0.3, // IoU threshold for association (standard value)
+                init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
+                high_score_threshold: 0.5,    // high confidence threshold
+                low_score_threshold: 0.1,     // low confidence threshold
+                measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise
+                process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001], // process noise
             })
         }
     };
@@ -357,8 +359,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_latency_sum = Arc::new(AtomicU32::new(0)); // Store as integer (sum of ms)
     let stats_start = Instant::now();
 
-    // Track latest detections from VideoPipeline (includes Kalman tracking)
-    let mut latest_detections: Vec<military_target_detector::frame_pipeline::TileDetection> =
+    // Track latest tracker predictions from VideoPipeline (includes Kalman tracking)
+    let mut latest_predictions: Vec<military_target_detector::frame_pipeline::TileDetection> =
         Vec::new();
     let mut num_tracks = 0;
 
@@ -474,15 +476,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create result collector thread - consumes detection results asynchronously
+    // Create result collector thread - consumes tracker predictions asynchronously
     // This prevents result retrieval from blocking the main display loop
     let video_pipeline_for_results = Arc::clone(&video_pipeline);
     let stats_processed_for_results = Arc::clone(&stats_processed);
     let stats_extrapolated_for_results = Arc::clone(&stats_extrapolated);
     let stats_latency_for_results = Arc::clone(&stats_latency_sum);
 
-    // Channel to send latest detections to main thread for display
-    let (detections_tx, detections_rx) =
+    // Channel to send latest tracker predictions to main thread for display
+    let (predictions_tx, predictions_rx) =
         sync_channel::<Vec<military_target_detector::frame_pipeline::TileDetection>>(2);
 
     let results_handle = thread::spawn(move || {
@@ -502,8 +504,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 stats_latency_for_results.fetch_add(result.latency_ms as u32, Ordering::Relaxed);
 
-                // Send detections to main thread (non-blocking)
-                let _ = detections_tx.try_send(result.detections);
+                // Send tracker predictions to main thread (non-blocking)
+                let _ = predictions_tx.try_send(result.detections);
             }
 
             // Small sleep to avoid busy loop
@@ -626,21 +628,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
 
-        // Get latest detections from results thread (non-blocking)
-        if let Ok(detections) = detections_rx.try_recv() {
-            latest_detections = detections;
-            num_tracks = latest_detections
+        // Get latest tracker predictions from results thread (non-blocking)
+        if let Ok(predictions) = predictions_rx.try_recv() {
+            latest_predictions = predictions;
+            num_tracks = latest_predictions
                 .iter()
                 .filter(|d| d.track_id.is_some())
                 .count();
         }
 
-        // Annotate current frame with latest detections (from VideoPipeline with Kalman)
+        // Annotate current frame with latest tracker predictions (from VideoPipeline with tracking)
         let mut annotated = rgb_image.clone();
 
         // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
         // Uses pre-computed scale_x, scale_y and color_palette
-        let annotation_data: Vec<_> = latest_detections
+        let annotation_data: Vec<_> = latest_predictions
             .par_iter()
             .map(|det| {
                 let color = color_palette[det.class_id as usize]; // Lookup, not compute
@@ -689,7 +691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Draw stats overlay (only when displaying to reduce overhead)
         if frame_id % display_interval == 0 {
             let stats_text = format!(
-                "Frame: {} | Tracks: {} | Detections: {} RT-DETR",
+                "Frame: {} | Tracks: {} | RT-DETR Runs: {}",
                 frame_id,
                 num_tracks,
                 stats_processed.load(Ordering::Relaxed)
@@ -765,7 +767,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_tracks,
             );
             log::debug!(
-                "Real detections: {} | Avg Latency: {:.0}ms",
+                "RT-DETR runs: {} | Avg Latency: {:.0}ms",
                 processed,
                 avg_latency
             );
@@ -865,7 +867,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Average FPS: {:.1}", avg_fps);
     eprintln!("");
     eprintln!("Detection Stats:");
-    eprintln!("  Real detections: {}", processed);
+    eprintln!("  RT-DETR runs: {}", processed);
     eprintln!("  Average latency: {:.0}ms", avg_latency);
     eprintln!("===================================================\n");
     io::stderr().flush()?;

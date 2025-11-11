@@ -1,0 +1,24 @@
+[package]
+name = "ioutrack"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust IOU-based tracking (SORT & ByteTrack) without Python bindings"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "ioutrack"
+crate-type = ["lib"]
+
+[dependencies]
+ndarray = "0.16.1"
+nalgebra = "0.34.1"
+approx = "0.5"
+num = "0.4"
+anyhow = "1.0"
+itertools = "0.14"
+pathfinding = "4.14" # Hungarian algorithm implementation
+rayon = "1.8" # Parallel processing
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"

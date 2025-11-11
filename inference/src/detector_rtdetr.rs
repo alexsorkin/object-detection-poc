@@ -11,7 +11,6 @@
 
 use crate::error::DetectionError;
 use crate::types::{BoundingBox, Detection, DetectorConfig, ImageData, TargetClass};
-use log::{debug, info, warn};
 use ndarray::{Array, ArrayView, IxDyn};
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
@@ -29,15 +28,15 @@ pub struct RTDETRDetector {
 impl RTDETRDetector {
     /// Create a new RT-DETR detector with automatic GPU/CPU selection
     pub fn new(config: DetectorConfig) -> Result<Self, DetectionError> {
-        info!("Initializing RT-DETR detector");
+        log::info!("Initializing RT-DETR detector");
 
         // RT-DETR uses 640x640 input (same as YOLO for Ultralytics version)
         let input_size = (640, 640);
-        info!("RT-DETR input size: {}x{}", input_size.0, input_size.1);
+        log::info!("RT-DETR input size: {}x{}", input_size.0, input_size.1);
 
         // Determine which model to use
         let (model_path, use_gpu_backend) = Self::select_model(&config)?;
-        info!("Selected model: {}", model_path);
+        log::info!("Selected model: {}", model_path);
 
         // Try GPU path first if requested
         if config.use_gpu && use_gpu_backend {
@@ -46,7 +45,7 @@ impl RTDETRDetector {
             {
                 match Self::try_create_cuda_session(&model_path, &config) {
                     Ok(session) => {
-                        info!("✓ RT-DETR loaded successfully with CUDA (NVIDIA GPU)");
+                        log::info!("✓ RT-DETR loaded successfully with CUDA (NVIDIA GPU)");
                         return Ok(Self {
                             session,
                             config,
@@ -54,8 +53,8 @@ impl RTDETRDetector {
                         });
                     }
                     Err(e) => {
-                        warn!("CUDA initialization failed: {}", e);
-                        warn!("Trying TensorRT fallback...");
+                        log::warn!("CUDA initialization failed: {}", e);
+                        log::warn!("Trying TensorRT fallback...");
                     }
                 }
             }
@@ -65,7 +64,7 @@ impl RTDETRDetector {
             {
                 match Self::try_create_tensorrt_session(&model_path, &config) {
                     Ok(session) => {
-                        info!("✓ RT-DETR loaded successfully with TensorRT (NVIDIA GPU)");
+                        log::info!("✓ RT-DETR loaded successfully with TensorRT (NVIDIA GPU)");
                         return Ok(Self {
                             session,
                             config,
@@ -73,7 +72,7 @@ impl RTDETRDetector {
                         });
                     }
                     Err(e) => {
-                        warn!("TensorRT initialization failed: {}", e);
+                        log::warn!("TensorRT initialization failed: {}", e);
                     }
                 }
             }
@@ -83,7 +82,7 @@ impl RTDETRDetector {
             {
                 match Self::try_create_gpu_session(&model_path, &config) {
                     Ok(session) => {
-                        info!("✓ RT-DETR loaded successfully with CoreML (GPU/Metal)");
+                        log::info!("✓ RT-DETR loaded successfully with CoreML (GPU/Metal)");
                         return Ok(Self {
                             session,
                             config,
@@ -91,24 +90,24 @@ impl RTDETRDetector {
                         });
                     }
                     Err(e) => {
-                        warn!("CoreML initialization failed: {}", e);
-                        warn!("Falling back to CPU with FP32 model...");
+                        log::warn!("CoreML initialization failed: {}", e);
+                        log::warn!("Falling back to CPU with FP32 model...");
                     }
                 }
             }
 
             #[cfg(not(any(feature = "metal", feature = "cuda", feature = "tensorrt")))]
             {
-                warn!("No GPU backend feature enabled, falling back to CPU");
+                log::warn!("No GPU backend feature enabled, falling back to CPU");
             }
         }
 
         // CPU fallback path
         let fallback_model = Self::get_fallback_model(&config)?;
-        info!("Using CPU fallback model: {}", fallback_model);
+        log::info!("Using CPU fallback model: {}", fallback_model);
 
         let session = Self::create_cpu_session(&fallback_model)?;
-        info!("✓ RT-DETR loaded successfully with CPU");
+        log::info!("✓ RT-DETR loaded successfully with CPU");
 
         Ok(Self {
             session,
@@ -148,7 +147,7 @@ impl RTDETRDetector {
     ) -> Result<Session, DetectionError> {
         use ort::execution_providers::CUDAExecutionProvider;
 
-        info!("Attempting to use CUDA backend (NVIDIA GPU)...");
+        log::info!("Attempting to use CUDA backend (NVIDIA GPU)...");
 
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
@@ -172,7 +171,7 @@ impl RTDETRDetector {
     ) -> Result<Session, DetectionError> {
         use ort::execution_providers::TensorRTExecutionProvider;
 
-        info!("Attempting to use TensorRT backend (NVIDIA GPU - optimized)...");
+        log::info!("Attempting to use TensorRT backend (NVIDIA GPU - optimized)...");
 
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
@@ -201,7 +200,7 @@ impl RTDETRDetector {
     ) -> Result<Session, DetectionError> {
         use ort::execution_providers::CoreMLExecutionProvider;
 
-        info!("Attempting to use CoreML (Metal) backend...");
+        log::info!("Attempting to use CoreML (Metal) backend...");
 
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
@@ -229,9 +228,10 @@ impl RTDETRDetector {
 
     /// Detect targets in an image
     pub fn detect(&mut self, image: &ImageData) -> Result<Vec<Detection>, DetectionError> {
-        debug!(
+        log::debug!(
             "Starting RT-DETR detection on {}x{} image",
-            image.width, image.height
+            image.width,
+            image.height
         );
 
         // Preprocess: resize to 576x576, normalize, CHW format
@@ -319,7 +319,7 @@ impl RTDETRDetector {
             image.height,
         )?;
 
-        debug!("Detected {} targets", detections.len());
+        log::debug!("Detected {} targets", detections.len());
         Ok(detections)
     }
 
@@ -332,7 +332,7 @@ impl RTDETRDetector {
             return Ok(Vec::new());
         }
 
-        debug!(
+        log::debug!(
             "Starting RT-DETR batch detection on {} images",
             images.len()
         );
@@ -453,7 +453,7 @@ impl RTDETRDetector {
             all_detections.push(detections);
         }
 
-        info!("Batch detection complete: {} images processed", batch_size);
+        log::info!("Batch detection complete: {} images processed", batch_size);
         Ok(all_detections)
     }
 
@@ -540,9 +540,10 @@ impl RTDETRDetector {
         let num_queries = boxes_shape[1]; // Should be 300
         let num_classes = logits_shape[2]; // Should be 91 for COCO
 
-        debug!(
+        log::debug!(
             "Processing {} queries with {} classes",
-            num_queries, num_classes
+            num_queries,
+            num_classes
         );
 
         let mut detections = Vec::new();
@@ -590,16 +591,14 @@ impl RTDETRDetector {
 
             // Filter by confidence threshold
             if confidence < self.config.confidence_threshold {
-                debug!(
-                    "Filtered detection: class={}, conf={:.3}, threshold={:.3}",
-                    max_class, confidence, self.config.confidence_threshold
-                );
                 continue;
             }
 
-            debug!(
+            log::debug!(
                 "Accepted detection: class={}, conf={:.3}, threshold={:.3}",
-                max_class, confidence, self.config.confidence_threshold
+                max_class,
+                confidence,
+                self.config.confidence_threshold
             );
 
             // Convert from (cx, cy, w, h) normalized to absolute pixels
@@ -627,7 +626,7 @@ impl RTDETRDetector {
             detections.push(Detection::new(class, confidence, bbox));
         }
 
-        debug!("Found {} detections above threshold", detections.len());
+        log::debug!("Found {} detections above threshold", detections.len());
 
         // Note: No NMS needed for RT-DETR! The transformer already outputs unique detections
         Ok(detections)

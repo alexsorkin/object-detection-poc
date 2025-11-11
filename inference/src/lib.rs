@@ -31,10 +31,9 @@ pub mod frame_pipeline;
 
 // Tracking implementations
 pub mod bytetrack_operator;
-pub mod bytetrack_tracker;
 pub mod kalman_operator;
-pub mod kalman_tracker;
 pub mod tracking;
+pub mod tracking_utils;
 
 pub mod video_pipeline;
 

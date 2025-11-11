@@ -17,7 +17,7 @@ ort = { version = "2.0.0-rc.10", features = ["half"] }
 # Image processing
 image = "0.25.8"
 imageproc = "0.25"
-ndarray = "0.15.6"
+ndarray = "0.16.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,9 +32,9 @@ log = "0.4"
 env_logger = "0.11.8"
 
 # Kalman filter and tracking
-nalgebra = "0.30"
+nalgebra = "0.34.1"
 
-# ByteTrack tracking (alternative to Kalman)
+# ByteTrack tracking (pure Rust implementation)
 ioutrack = { path = "../ioutrack" }
 
 # Video processing (requires opencv installed via brew)

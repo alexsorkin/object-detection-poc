@@ -791,7 +791,32 @@ impl DetectionPipeline {
         }
     }
 
-    /// Process a single image through the entire pipeline (synchronous)
+    /// Process image with detection completion callback (asynchronous)
+    /// The callback is invoked immediately after detection completes, before returning results
+    pub fn process_with_callback<F>(&self, img: &RgbImage, callback: F) -> Result<PostprocessOutput, String>
+    where
+        F: FnOnce(&[TileDetection], f32),
+    {
+        let start_time = Instant::now();
+        
+        // Stage 1: Preprocess (tile extraction + shadow removal)
+        let preprocess_result = self.preprocess.process(img);
+
+        // Stage 2: Execution (batch detection via shared pool)
+        let execution_result = self.execution.process(preprocess_result.data);
+
+        // Stage 3: Postprocess (NMS)
+        let postprocess_result = self.postprocess.process(execution_result.data);
+
+        // Calculate processing time
+        let processing_time = start_time.elapsed().as_secs_f32();
+        
+        // Invoke callback with detections and processing time
+        callback(&postprocess_result.data.detections, processing_time);
+
+        Ok(postprocess_result.data)
+    }
+
     /// Stages execute sequentially: Preprocess → Execution → Postprocess
     pub fn process(&self, img: &RgbImage) -> Result<PostprocessOutput, String> {
         // Stage 1: Preprocess (tile extraction + shadow removal)

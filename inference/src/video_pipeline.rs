@@ -145,20 +145,28 @@ impl VideoPipeline {
                     tracker.num_tracks()
                 );
             } else {
-                // PROCESSING MODE: Run detection pipeline
+                // PROCESSING MODE: Run detection pipeline with tracker callback
                 let process_start = Instant::now();
 
-                match pipeline.process(&frame.image) {
-                    Ok(output) => {
-                        let processing_time = process_start.elapsed().as_secs_f32() * 1000.0;
+                // Use shared reference for callback results
+                let mut tracked_detections = Vec::new();
 
-                        // Update tracker with real detections and get tracked results
-                        let tracked_detections = tracker.update(&output.detections, dt);
+                {
+                    // Create callback that updates tracker when detection completes
+                    let tracker_ref = &mut tracker;
+                    let tracked_detections_ref = &mut tracked_detections;
+                    let callback = |detections: &[TileDetection], _processing_time: f32| {
+                        // Update tracker immediately when detection completes
+                        *tracked_detections_ref = tracker_ref.update(detections, dt);
+                    };
+
+                    if let Ok(_output) = pipeline.process_with_callback(&frame.image, callback) {
+                        let processing_time = process_start.elapsed().as_secs_f32() * 1000.0;
 
                         let result = FrameResult {
                             frame_id: frame.frame_id,
                             timestamp: frame.timestamp,
-                            detections: tracked_detections,
+                            detections: tracked_detections, // Use tracker results from callback
                             is_extrapolated: false,
                             processing_time_ms: processing_time,
                             latency_ms: latency,
@@ -171,16 +179,14 @@ impl VideoPipeline {
                         }
 
                         log::debug!(
-                            "Frame {} PROCESSED (latency: {:.1}ms, processing: {:.1}ms, {} detections, {} tracks)",
+                            "Frame {} PROCESSED (latency: {:.1}ms, processing: {:.1}ms, {} tracks)",
                             frame.frame_id,
                             latency,
                             processing_time,
-                            output.detections.len(),
                             tracker.num_tracks()
                         );
-                    }
-                    Err(e) => {
-                        log::error!("Detection pipeline error: {}", e);
+                    } else {
+                        log::error!("Detection pipeline callback failed");
                     }
                 }
             }
