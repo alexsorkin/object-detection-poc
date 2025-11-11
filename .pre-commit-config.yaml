@@ -1,0 +1,64 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v3.2.0
+    hooks:
+    -   id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+    -   id: check-added-large-files
+-   repo: https://github.com/asottile/reorder_python_imports
+    rev: v3.1.0
+    hooks:
+    -   id: reorder-python-imports
+-   repo: https://github.com/asottile/pyupgrade
+    rev: v2.32.1
+    hooks:
+    -   id: pyupgrade
+        args: [--py310-plus]
+-   repo: https://github.com/psf/black
+    rev: '22.3.0'
+    hooks:
+    - id: black
+      args: [--preview]
+-   repo: local
+    hooks:
+    -   id: mypy
+        name: mypy
+        description: Format files with cargo fmt.
+        entry: "python -m mypy ."
+        pass_filenames: false
+        language: system
+-   repo: local
+    hooks:
+    -   id: fmt
+        name: fmt
+        description: Format files with cargo fmt.
+        entry: cargo fmt
+        language: rust
+        types: [rust]
+        args: ["--"]
+    -   id: cargo-check
+        name: cargo check
+        description: Check the package for errors.
+        entry: cargo check
+        language: rust
+        types: [rust]
+        pass_filenames: false
+    -   id: clippy
+        name: clippy
+        description: Lint rust sources
+        entry: cargo clippy
+        language: rust
+        args: ["--", "-D", "warnings"]
+        types: [rust]
+        pass_filenames: false
+    -   id: tests
+        name: tests
+        description: Run tests
+        entry: cargo test
+        language: rust
+        types: [rust]
+        pass_filenames: false
