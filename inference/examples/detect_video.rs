@@ -279,8 +279,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracking_config = match tracking_method {
         TrackingMethod::Kalman => {
             TrackingConfig::Kalman(KalmanConfig {
-                max_age: 30,                  // frames to keep track alive without detections
-                min_hits: 1,                  // REDUCED from 3 to test track position updates
+                max_age: 5,                                // frames to keep track alive without detections
+                min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.1, // REDUCED from 0.3 to be more permissive for association
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
                 measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise covariance
@@ -289,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         TrackingMethod::ByteTrack => {
             TrackingConfig::ByteTrack(ByteTrackConfig {
-                max_age: 30,                                             // frames to keep track alive
+                max_age: 5,                                              // frames to keep track alive
                 min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // IoU threshold for association (standard value)
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
@@ -439,7 +439,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // This naturally skips frames - if detection is slow, many frames accumulate and we only take the newest
             let mut latest_detector_frame: Option<(RgbImage, Instant)> = None;
             let mut frames_drained = 0;
+
             while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
+                // If we already have a frame, the previous one becomes a dropped frame
+                if latest_detector_frame.is_some() {
+                    // Advance tracker for the dropped frame (async, non-blocking)
+                    let _ = video_pipeline_for_detector.advance_tracks();
+                    log::warn!("Advanced tracker for dropped frame (rt fps missed)");
+                }
+
                 latest_detector_frame = Some(frame_with_timestamp);
                 frames_drained += 1;
                 input_frame_id += 1;
@@ -451,11 +459,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log::debug!("Consuming frame {} for detect", input_frame_id);
 
             // Submit latest detector frame if available
-            if let Some((detector_frame, capture_time)) = latest_detector_frame {
+            if let Some((detector_frame, _capture_time)) = latest_detector_frame {
+                // Convert image to raw RGB data
+                let (width, height) = detector_frame.dimensions();
+                let raw_data: Vec<u8> = detector_frame.into_raw();
+
                 let frame = Frame {
-                    frame_id: submitted_frame_id,
-                    image: detector_frame,
-                    timestamp: capture_time,
+                    data: raw_data,
+                    width,
+                    height,
+                    sequence: submitted_frame_id,
                 };
 
                 // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
@@ -464,7 +477,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("Submitted frame {} for detect", submitted_frame_id);
                     submitted_frame_id += 1;
                 } else {
-                    log::warn!("Pipeline busy, frame dropped");
+                    let _ = video_pipeline_for_detector.advance_tracks();
+                    log::warn!("Advanced tracker for dropped frame (pipeline busy)");
                 }
             }
 

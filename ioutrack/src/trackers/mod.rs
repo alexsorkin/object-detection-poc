@@ -18,7 +18,7 @@ pub use sorttrack::SortMultiTracker;
 ///
 /// All tracker implementations (SORT, ByteTrack, KalmanTracker) support this interface
 /// for consistent usage across different tracking algorithms.
-pub trait MultiObjectTracker {
+pub trait MultiObjectTracker: Send {
     /// Update tracker with new detections
     ///
     /// # Arguments
