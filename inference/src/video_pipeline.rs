@@ -1,11 +1,11 @@
 use crate::frame_pipeline::{DetectionPipeline, TileDetection};
-/// Video processing pipeline with async detection and Kalman filter extrapolation
+/// Video processing pipeline with async detection and temporal tracking
 ///
 /// Handles real-time video streams with:
 /// - Async frame detection with backpressure
-/// - Kalman filter for temporal tracking
+/// - Multiple tracking algorithms (Kalman filter or ByteTrack)
 /// - Extrapolation when detection latency is high
-use crate::kalman_tracker::{KalmanConfig, MultiObjectTracker};
+use crate::tracking::{TrackingConfig, UnifiedTracker};
 use crossbeam::channel::{bounded, Receiver, Sender};
 use image::RgbImage;
 use std::sync::Arc;
@@ -35,8 +35,8 @@ pub struct FrameResult {
 pub struct VideoPipelineConfig {
     /// Maximum latency before switching to extrapolation-only mode (ms)
     pub max_latency_ms: u64,
-    /// Kalman filter configuration
-    pub kalman_config: KalmanConfig,
+    /// Tracking configuration (Kalman or ByteTrack)
+    pub tracking_config: TrackingConfig,
     /// Frame buffer size (number of frames to queue)
     pub buffer_size: usize,
 }
@@ -45,7 +45,7 @@ impl Default for VideoPipelineConfig {
     fn default() -> Self {
         Self {
             max_latency_ms: 500,
-            kalman_config: KalmanConfig::default(),
+            tracking_config: TrackingConfig::default(),
             buffer_size: 2,
         }
     }
@@ -75,19 +75,22 @@ impl VideoPipeline {
         }
     }
 
-    /// Worker thread: processes frames and manages Kalman tracker
+    /// Worker thread: processes frames and manages unified tracker
     fn worker_thread(
         pipeline: Arc<DetectionPipeline>,
         frame_rx: Receiver<Frame>,
         result_tx: Sender<FrameResult>,
         config: VideoPipelineConfig,
     ) {
-        let mut tracker = MultiObjectTracker::new(config.kalman_config.clone());
+        let mut tracker = UnifiedTracker::new(config.tracking_config.clone());
         let mut last_process_time = Instant::now();
         let mut frames_processed = 0_u64;
         let mut frames_extrapolated = 0_u64;
 
-        log::info!("Video pipeline worker started");
+        log::info!(
+            "Video pipeline worker started with {} tracker",
+            tracker.method()
+        );
 
         while let Ok(mut frame) = frame_rx.recv() {
             let now = Instant::now();
@@ -117,9 +120,8 @@ impl VideoPipeline {
             let should_extrapolate = latency > config.max_latency_ms as f32;
 
             if should_extrapolate {
-                // EXTRAPOLATION MODE: Use Kalman predictions only
-                tracker.update(&[], dt); // Predict without measurements
-                let predictions = tracker.get_predictions();
+                // EXTRAPOLATION MODE: Use tracker predictions only
+                let predictions = tracker.update(&[], dt); // Predict without measurements
 
                 let result = FrameResult {
                     frame_id: frame.frame_id,
@@ -150,11 +152,8 @@ impl VideoPipeline {
                     Ok(output) => {
                         let processing_time = process_start.elapsed().as_secs_f32() * 1000.0;
 
-                        // Update tracker with real detections
-                        tracker.update(&output.detections, dt);
-
-                        // Get tracked detections (with track IDs assigned)
-                        let tracked_detections = tracker.get_predictions();
+                        // Update tracker with real detections and get tracked results
+                        let tracked_detections = tracker.update(&output.detections, dt);
 
                         let result = FrameResult {
                             frame_id: frame.frame_id,

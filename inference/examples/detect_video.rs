@@ -1,13 +1,14 @@
-/// Real-time Video Detection with Kalman Filter Extrapolation
+/// Real-time Video Detection with Multi-Tracker Support
 ///
 /// Processes video files or camera streams with temporal tracking:
 /// - Runs detection pipeline at processing FPS (5-10 FPS based on GPU)
-/// - Maintains 30 FPS output using Kalman filter extrapolation
+/// - Maintains 30 FPS output using tracker extrapolation
+/// - Supports multiple tracking algorithms: Kalman Filter and ByteTrack
 /// - Automatically switches to extrapolation when latency > 500ms
 ///
 /// Visual indicators:
 /// - GREEN boxes: Real detections from neural network
-/// - YELLOW boxes: Kalman filter extrapolations
+/// - YELLOW boxes: Tracker extrapolations
 ///
 /// Usage:
 ///   cargo run --release --features metal --example detect_video [OPTIONS] <video_path>
@@ -17,6 +18,7 @@
 ///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
 ///   --model <variant>       RT-DETR model variant (default: r18_fp32)
 ///                           Available: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32
+///   --tracker <method>      Tracking method: kalman, bytetrack (default: kalman)
 ///   --headless              Run without display window (default: show window)
 ///
 /// Examples:
@@ -25,9 +27,11 @@
 ///   cargo run --release --features metal --example detect_video -- test_data/airport.mp4 --confidence 60 --headless
 ///   cargo run --release --features metal --example detect_video -- --headless --classes 0,2,5,7 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --model r50_fp32 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --model r18_fp16 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- --model r18_fp16 --tracker bytetrack test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- --tracker kalman test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam
 use image::{Rgb, RgbImage};
+use military_target_detector::bytetrack_tracker::ByteTrackConfig;
 use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
@@ -35,6 +39,7 @@ use military_target_detector::image_utils::{
     draw_rect_batch, draw_text, draw_text_batch, generate_class_color,
 };
 use military_target_detector::kalman_tracker::KalmanConfig;
+use military_target_detector::tracking::{TrackingConfig, TrackingMethod};
 use military_target_detector::types::{DetectorConfig, RTDETRModel};
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
 use opencv::{
@@ -98,6 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
     let mut headless = false; // Default: show display window
     let mut model_variant = RTDETRModel::R18VD_FP32; // Default: r18_fp32
+    let mut tracking_method = TrackingMethod::Kalman; // Default: Kalman
     let mut video_source: Option<String> = None;
 
     // Parse all arguments in any order
@@ -151,6 +157,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            "--tracker" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].to_lowercase().as_str() {
+                        "kalman" => {
+                            tracking_method = TrackingMethod::Kalman;
+                        }
+                        "bytetrack" => {
+                            tracking_method = TrackingMethod::ByteTrack;
+                        }
+                        _ => {
+                            eprintln!(
+                                "Invalid tracking method '{}'. Valid options: kalman, bytetrack",
+                                args[i]
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             arg => {
                 // If it doesn't start with --, treat it as the video source
                 if !arg.starts_with("--") {
@@ -166,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "test_data/airport.mp4".to_string()
     });
 
-    eprintln!("🎯 Real-Time Video Detection with Kalman Extrapolation\n");
+    eprintln!("🎯 Real-Time Video Detection with Multi-Tracker Support\n");
     io::stderr().flush()?;
 
     // Open video source
@@ -246,32 +272,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipeline_config,
     ));
 
-    // Create video pipeline with Kalman tracker
+    // Create video pipeline with selected tracker
     let buffer_size = 10; // Tiny buffer - only allow 10 frames queued max
+
+    // Configure tracking based on selected method
+    let tracking_config = match tracking_method {
+        TrackingMethod::Kalman => {
+            TrackingConfig::Kalman(KalmanConfig {
+                max_age_ms: 500,              // 6 FPS = 166ms/frame, allow ~3 frames missing
+                iou_threshold: 0.10,          // Very low threshold for 6 FPS with prediction drift
+                max_centroid_distance: 300.0, // Large distance - predictions drift significantly at 6 FPS
+                process_noise_pos: 3.0,       // Moderate uncertainty for 166ms gaps
+                process_noise_vel: 5.0,       // Higher velocity uncertainty - acceleration in 166ms
+                measurement_noise: 3.0,       // Trust detector measurements
+                initial_covariance: 15.0,     // Moderate initial uncertainty
+            })
+        }
+        TrackingMethod::ByteTrack => {
+            TrackingConfig::ByteTrack(ByteTrackConfig {
+                high_conf_threshold: confidence_threshold,
+                low_conf_threshold: confidence_threshold * 0.3, // 30% of high threshold
+                match_thresh: 0.8,
+                frame_rate: fps as f32,
+                track_buffer: (fps as u32 / 2).max(15), // Half second buffer, minimum 15 frames
+            })
+        }
+    };
+
     let video_config = VideoPipelineConfig {
         max_latency_ms: 500,
-        kalman_config: KalmanConfig {
-            max_age_ms: 500,              // 6 FPS = 166ms/frame, allow ~3 frames missing
-            iou_threshold: 0.10,          // Very low threshold for 6 FPS with prediction drift
-            max_centroid_distance: 300.0, // Large distance - predictions drift significantly at 6 FPS
-            process_noise_pos: 3.0,       // Moderate uncertainty for 166ms gaps
-            process_noise_vel: 5.0,       // Higher velocity uncertainty - acceleration in 166ms
-            measurement_noise: 3.0,       // Trust detector measurements
-            initial_covariance: 15.0,     // Moderate initial uncertainty
-        },
+        tracking_config,
         buffer_size,
     };
 
     let video_pipeline = Arc::new(VideoPipeline::new(Arc::clone(&pipeline), video_config));
 
-    eprintln!("  ✓ Pipeline ready (with internal Kalman tracker)");
+    eprintln!("  ✓ Pipeline ready (with {} tracker)", tracking_method);
     eprintln!("\n💡 Configuration:");
     eprintln!("  • Detector: {} (frame executor)", model_variant.name());
     eprintln!("  • Batch size: {}", batch_size);
     eprintln!("  • Queue depth: {} (backpressure)", max_queue_depth);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
     eprintln!("  • Classes: {:?}", allowed_classes);
-    eprintln!("  • Kalman tracker: 1s track timeout");
+    eprintln!("  • Tracker: {}", tracking_method);
     eprintln!("  • Output FPS: {:.1} (matching input)", fps);
     eprintln!("  • Max latency for extrapolation: 500ms");
     eprintln!(

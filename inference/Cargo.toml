@@ -34,6 +34,9 @@ env_logger = "0.11"
 # Kalman filter and tracking
 nalgebra = "0.33"
 
+# ByteTrack tracking (alternative to Kalman)
+ioutrack_rs = "0.1"
+
 # Video processing (requires opencv installed via brew)
 opencv = { version = "0.93", default-features = false, features = ["videoio", "highgui", "imgproc"] }
 
