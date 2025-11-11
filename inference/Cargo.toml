@@ -15,9 +15,9 @@ crate-type = ["rlib"]
 ort = { version = "2.0.0-rc.10", features = ["half"] }
 
 # Image processing
-image = "0.25"
+image = "0.25.8"
 imageproc = "0.25"
-ndarray = "0.16"
+ndarray = "0.15.6"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -29,24 +29,24 @@ thiserror = "1.0"
 
 # Logging
 log = "0.4"
-env_logger = "0.11"
+env_logger = "0.11.8"
 
 # Kalman filter and tracking
-nalgebra = "0.33"
+nalgebra = "0.30"
 
 # ByteTrack tracking (alternative to Kalman)
-ioutrack_rs = "0.1"
+ioutrack = { path = "../ioutrack" }
 
 # Video processing (requires opencv installed via brew)
-opencv = { version = "0.93", default-features = false, features = ["videoio", "highgui", "imgproc"] }
+opencv = { version = "0.97.2", default-features = false, features = ["videoio", "highgui", "imgproc"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 crossbeam = "0.8"
-rayon = "1.10"
+rayon = "1.11"
 
 # Hungarian algorithm for data association
-pathfinding = "4.0"
+pathfinding = "4.14"
 
 [dev-dependencies]
 # Not needed for now

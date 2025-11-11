@@ -16,7 +16,7 @@ nshare = {version = "0.9.0", features = ["ndarray", "nalgebra_std"]}
 approx = "0.5.1"
 numpy = "0.16.2"
 num = "0.4.0"
-anyhow = "<1.0.49"
+anyhow = "1.0"
 itertools = "0.10.3"
 lapjv = { git = "https://github.com/PaulKlinger/lapjv-rust", rev="12527061a3" }
 

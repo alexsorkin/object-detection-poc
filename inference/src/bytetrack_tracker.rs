@@ -1,56 +1,77 @@
-/// ByteTrack tracker implementation using ioutrack_rs
+/// ByteTrack tracker implementation using ioutrack crate
 ///
 /// ByteTrack is a more modern tracking algorithm compared to Kalman filtering.
 /// It uses motion prediction and data association with high/low confidence detection handling.
 ///
 /// Reference: https://arxiv.org/abs/2110.06864
 use crate::frame_pipeline::TileDetection;
-use ioutrack_rs::{ByteTracker, Detection as IOUDetection, Track};
+use ioutrack::ByteTrack;
+use ndarray::{Array2, CowArray};
 use std::time::Instant;
 
 /// Configuration for ByteTrack algorithm
 #[derive(Clone, Debug)]
 pub struct ByteTrackConfig {
-    /// High confidence threshold for detections (0-1)
-    pub high_conf_threshold: f32,
-    /// Low confidence threshold for detections (0-1)
-    pub low_conf_threshold: f32,
-    /// Matching threshold for high confidence detections
-    pub match_thresh: f32,
-    /// Frame rate of the input video (used for motion prediction)
-    pub frame_rate: f32,
-    /// Number of frames to keep a track without detections before deletion
-    pub track_buffer: u32,
+    /// Maximum frames to keep a track alive without matching detections
+    pub max_age: u32,
+    /// Minimum consecutive hits before track is confirmed
+    pub min_hits: u32,
+    /// IOU threshold for matching
+    pub iou_threshold: f32,
+    /// Minimum score to create a new tracklet from unmatched detection
+    pub init_tracker_min_score: f32,
+    /// High confidence threshold for first round of association
+    pub high_score_threshold: f32,
+    /// Low confidence threshold for second round of association  
+    pub low_score_threshold: f32,
+    /// Measurement noise covariance diagonal
+    pub measurement_noise: [f32; 4],
+    /// Process noise covariance diagonal
+    pub process_noise: [f32; 7],
 }
 
 impl Default for ByteTrackConfig {
     fn default() -> Self {
         Self {
-            high_conf_threshold: 0.5,
-            low_conf_threshold: 0.1,
-            match_thresh: 0.8,
-            frame_rate: 30.0,
-            track_buffer: 30,
+            max_age: 1,
+            min_hits: 3,
+            iou_threshold: 0.3,
+            init_tracker_min_score: 0.8,
+            high_score_threshold: 0.7,
+            low_score_threshold: 0.1,
+            measurement_noise: [1.0, 1.0, 10.0, 10.0],
+            process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001],
         }
     }
 }
 
 /// Multi-object tracker using ByteTrack algorithm
 pub struct MultiObjectTracker {
-    tracker: ByteTracker,
+    tracker: ByteTrack,
     config: ByteTrackConfig,
     frame_id: u32,
+    last_tracks: Vec<TileDetection>,
 }
 
 impl MultiObjectTracker {
     /// Create new ByteTrack tracker
     pub fn new(config: ByteTrackConfig) -> Self {
-        let tracker = ByteTracker::new(config.frame_rate, config.track_buffer);
+        let (tracker, _base) = ByteTrack::new(
+            config.max_age,
+            config.min_hits,
+            config.iou_threshold,
+            config.init_tracker_min_score,
+            config.high_score_threshold,
+            config.low_score_threshold,
+            config.measurement_noise,
+            config.process_noise,
+        );
 
         Self {
             tracker,
             config,
             frame_id: 0,
+            last_tracks: Vec::new(),
         }
     }
 
@@ -58,54 +79,72 @@ impl MultiObjectTracker {
     pub fn update(&mut self, detections: &[TileDetection], _dt: f32) -> Vec<TileDetection> {
         self.frame_id += 1;
 
-        // Convert TileDetections to IOUDetections
-        let iou_detections: Vec<IOUDetection> = detections
+        // Convert TileDetections to the expected format (n_boxes, 5) array: [x1, y1, x2, y2, score]
+        let detection_data: Vec<f32> = detections
             .iter()
-            .enumerate()
-            .map(|(idx, det)| {
-                IOUDetection::new(
-                    idx as u32, // Use index as detection ID
-                    det.x,
-                    det.y,
-                    det.x + det.w,
-                    det.y + det.h,
-                    det.confidence,
-                    det.class_id as i32,
-                )
+            .flat_map(|det| {
+                vec![
+                    det.x,          // x1 (left)
+                    det.y,          // y1 (top)
+                    det.x + det.w,  // x2 (right)
+                    det.y + det.h,  // y2 (bottom)
+                    det.confidence, // score
+                ]
             })
             .collect();
 
+        if detection_data.is_empty() {
+            self.last_tracks.clear();
+            return Vec::new();
+        }
+
+        // Create ndarray from detection data
+        let n_detections = detections.len();
+        let detection_array = Array2::from_shape_vec((n_detections, 5), detection_data)
+            .expect("Failed to create detection array");
+
         // Update tracker
-        let tracks = self.tracker.update(&iou_detections);
+        let track_array =
+            match self
+                .tracker
+                .update(CowArray::from(detection_array.view()), false, false)
+            {
+                Ok(tracks) => tracks,
+                Err(e) => {
+                    eprintln!("ByteTrack update error: {}", e);
+                    self.last_tracks.clear();
+                    return Vec::new();
+                }
+            };
 
         // Convert tracks back to TileDetections
         let mut tracked_detections = Vec::new();
-        for track in tracks {
-            if let Some(detection) = self.track_to_tile_detection(&track, detections) {
+        for track_row in track_array.outer_iter() {
+            if let Some(detection) = self.track_to_tile_detection(&track_row, detections) {
                 tracked_detections.push(detection);
             }
         }
 
+        self.last_tracks = tracked_detections.clone();
         tracked_detections
     }
 
     /// Get current predictions (for ByteTrack, this is the same as the last update result)
     pub fn get_predictions(&self) -> Vec<TileDetection> {
-        // ByteTrack doesn't have a separate prediction step like Kalman
-        // The tracks from the last update are the current predictions
-        Vec::new() // Return empty for now, as we need to store the last result
+        // Return the last tracked detections as predictions
+        self.last_tracks.clone()
     }
 
     /// Get number of active tracks
     pub fn num_tracks(&self) -> usize {
-        // This would need to be stored from the last update
-        0 // Placeholder
+        self.last_tracks.len()
     }
 
-    /// Get track by ID
-    pub fn get_track(&self, _track_id: u32) -> Option<&Track> {
-        // This would require internal track storage
-        None // Placeholder
+    /// Get track by ID (simplified implementation)
+    pub fn get_track(&self, track_id: u32) -> Option<&TileDetection> {
+        self.last_tracks
+            .iter()
+            .find(|det| det.track_id == Some(track_id))
     }
 
     /// Evict stale tracks (ByteTrack handles this internally)
@@ -114,33 +153,47 @@ impl MultiObjectTracker {
         // No manual eviction needed
     }
 
-    /// Convert ByteTrack Track to TileDetection
+    /// Convert ByteTrack track result to TileDetection
     fn track_to_tile_detection(
         &self,
-        track: &Track,
+        track_row: &ndarray::ArrayView1<f32>,
         original_detections: &[TileDetection],
     ) -> Option<TileDetection> {
-        let bbox = track.get_rect();
+        // Track row format: [x1, y1, x2, y2, track_id]
+        if track_row.len() < 5 {
+            return None;
+        }
 
-        // Extract track information
-        let x = bbox.x;
-        let y = bbox.y;
-        let w = bbox.width;
-        let h = bbox.height;
-        let track_id = track.get_track_id();
+        let x1 = track_row[0];
+        let y1 = track_row[1];
+        let x2 = track_row[2];
+        let y2 = track_row[3];
+        let track_id = track_row[4] as u32;
 
-        // Try to find the corresponding original detection to get class info
-        // For now, we'll use a default class if we can't match
-        let (class_id, class_name, confidence) = if let Some(det_idx) = track.get_detection_id() {
-            if let Some(original_det) = original_detections.get(det_idx as usize) {
-                (
-                    original_det.class_id,
-                    original_det.class_name.clone(),
-                    original_det.confidence,
-                )
-            } else {
-                (0, "unknown".to_string(), 0.5)
+        let x = x1;
+        let y = y1;
+        let w = x2 - x1;
+        let h = y2 - y1;
+
+        // Find the closest original detection to get class information
+        let mut best_match: Option<&TileDetection> = None;
+        let mut best_iou = 0.0;
+
+        for orig_det in original_detections {
+            let iou =
+                calculate_iou_boxes(x, y, w, h, orig_det.x, orig_det.y, orig_det.w, orig_det.h);
+            if iou > best_iou {
+                best_iou = iou;
+                best_match = Some(orig_det);
             }
+        }
+
+        let (class_id, class_name, confidence) = if let Some(matched_det) = best_match {
+            (
+                matched_det.class_id,
+                matched_det.class_name.clone(),
+                matched_det.confidence,
+            )
         } else {
             (0, "unknown".to_string(), 0.5)
         };
@@ -161,21 +214,24 @@ impl MultiObjectTracker {
     }
 }
 
-/// Helper function to calculate IoU for debugging
-#[allow(dead_code)]
-fn calculate_iou(det1: &TileDetection, det2: &TileDetection) -> f32 {
-    let x1_min = det1.x;
-    let y1_min = det1.y;
-    let x1_max = det1.x + det1.w;
-    let y1_max = det1.y + det1.h;
+/// Helper function to calculate IoU for box matching
+fn calculate_iou_boxes(
+    x1: f32,
+    y1: f32,
+    w1: f32,
+    h1: f32,
+    x2: f32,
+    y2: f32,
+    w2: f32,
+    h2: f32,
+) -> f32 {
+    let x1_max = x1 + w1;
+    let y1_max = y1 + h1;
+    let x2_max = x2 + w2;
+    let y2_max = y2 + h2;
 
-    let x2_min = det2.x;
-    let y2_min = det2.y;
-    let x2_max = det2.x + det2.w;
-    let y2_max = det2.y + det2.h;
-
-    let inter_x_min = x1_min.max(x2_min);
-    let inter_y_min = y1_min.max(y2_min);
+    let inter_x_min = x1.max(x2);
+    let inter_y_min = y1.max(y2);
     let inter_x_max = x1_max.min(x2_max);
     let inter_y_max = y1_max.min(y2_max);
 
@@ -184,8 +240,8 @@ fn calculate_iou(det1: &TileDetection, det2: &TileDetection) -> f32 {
     }
 
     let inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min);
-    let area1 = det1.w * det1.h;
-    let area2 = det2.w * det2.h;
+    let area1 = w1 * h1;
+    let area2 = w2 * h2;
     let union_area = area1 + area2 - inter_area;
 
     inter_area / union_area
@@ -223,35 +279,7 @@ mod tests {
 
     #[test]
     fn test_iou_calculation() {
-        let det1 = TileDetection {
-            x: 0.0,
-            y: 0.0,
-            w: 10.0,
-            h: 10.0,
-            confidence: 1.0,
-            class_id: 0,
-            class_name: "test".to_string(),
-            tile_idx: 0,
-            vx: None,
-            vy: None,
-            track_id: None,
-        };
-
-        let det2 = TileDetection {
-            x: 5.0,
-            y: 5.0,
-            w: 10.0,
-            h: 10.0,
-            confidence: 1.0,
-            class_id: 0,
-            class_name: "test".to_string(),
-            tile_idx: 0,
-            vx: None,
-            vy: None,
-            track_id: None,
-        };
-
-        let iou = calculate_iou(&det1, &det2);
+        let iou = calculate_iou_boxes(0.0, 0.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0);
         assert!(iou > 0.0 && iou < 1.0);
     }
 }
