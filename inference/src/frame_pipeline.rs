@@ -16,25 +16,7 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::oneshot;
 use tokio::task;
-
-/// Stage result that flows through the pipeline
-#[derive(Clone)]
-pub struct StageResult<T> {
-    pub data: T,
-    pub stage_name: String,
-    pub duration_ms: f32,
-}
-
-/// Timing information for each pipeline stage
-#[derive(Clone, Debug)]
-pub struct PipelineTiming {
-    pub preprocess_ms: f32,
-    pub execution_ms: f32,
-    pub postprocess_ms: f32,
-    pub total_ms: f32,
-}
 
 /// Tile with its position in the original image
 #[derive(Clone)]
@@ -87,7 +69,7 @@ pub struct ExecutionOutput {
 
 /// Final output after post-processing
 #[derive(Clone)]
-pub struct PostprocessOutput {
+pub struct PipelineOutput {
     pub detections: Vec<TileDetection>,
     pub original_width: u32,
     pub original_height: u32,
@@ -96,6 +78,7 @@ pub struct PostprocessOutput {
     pub resized_image: RgbImage,
     pub duplicates_removed: usize,
     pub nested_removed: usize,
+    pub pipeline_total_time_ms: f32,
 }
 
 /// Pre-processing stage: Extract tiles and apply shadow removal
@@ -366,9 +349,7 @@ impl PreprocessStage {
     }
 
     /// Run pre-processing stage
-    pub async fn process(&self, img: RgbImage) -> StageResult<PreprocessOutput> {
-        let start = Instant::now();
-
+    pub async fn process(&self, img: RgbImage) -> PreprocessOutput {
         let original_width = img.width();
         let original_height = img.height();
 
@@ -400,19 +381,13 @@ impl PreprocessStage {
             }
         }).await.unwrap();
         
-        let output = PreprocessOutput {
+        PreprocessOutput {
             tiles,
             original_width,
             original_height,
             resized_width,
             resized_height,
             resized_image: resized_img,  // Keep original resized for annotation
-        };
-
-        StageResult {
-            data: output,
-            stage_name: "Preprocess".to_string(),
-            duration_ms: start.elapsed().as_secs_f32() * 1000.0,
         }
     }
 }
@@ -439,15 +414,12 @@ impl ExecutionStage {
     }
 
     /// Run detection on tiles
-    pub async fn process(&self, input: PreprocessOutput) -> StageResult<ExecutionOutput> {
-        let start = Instant::now();
-
+    pub async fn process(&self, input: PreprocessOutput) -> ExecutionOutput {
         // OPTIMIZATION: Pre-allocate detection vector (typical: 5-15 detections per tile)
         let mut all_detections = Vec::with_capacity(input.tiles.len() * 10);
 
         // Submit all tiles to batch executor
         let mut responses = Vec::new();
-        let submit_start = Instant::now();
         
         // PARALLEL: Convert all tiles to ImageData concurrently
         let tile_data_vec: Vec<_> = task::spawn_blocking({
@@ -479,26 +451,23 @@ impl ExecutionStage {
 
         // Submit tiles sequentially (submission must be sequential for ordering)
         for (tile, image_data) in input.tiles.iter().zip(tile_data_vec) {
-            let tile_start = Instant::now();
             let response_rx = self.frame_executor.detect_async(image_data);
             
             // Only add to responses if frame wasn't dropped due to backpressure
             if let Some(rx) = response_rx {
-                responses.push((tile.tile_idx, tile.offset_x, tile.offset_y, rx, tile_start));
+                responses.push((tile.tile_idx, tile.offset_x, tile.offset_y, rx));
             } else {
                 log::warn!("⚠️  Tile {} dropped due to detector backpressure", tile.tile_idx);
             }
         }
-        let submit_time = submit_start.elapsed();
 
-        // Collect results asynchronously and track per-tile timing
+        // Collect results asynchronously
         let mut tile_results = Vec::new();
-        for (tile_idx, offset_x, offset_y, response_rx, tile_start) in responses {
+        for (tile_idx, offset_x, offset_y, response_rx) in responses {
             // Use tokio's blocking recv since std::sync::mpsc::Receiver is not async
             match task::spawn_blocking(move || response_rx.recv()).await.unwrap() {
                 Ok(Ok(detections)) => {
-                    let tile_time = tile_start.elapsed();
-                    tile_results.push((tile_idx, offset_x, offset_y, tile_time, detections));
+                    tile_results.push((tile_idx, offset_x, offset_y, detections));
                 }
                 _ => {
                     log::warn!("⚠️  Failed to receive detection result for tile {}", tile_idx);
@@ -507,14 +476,14 @@ impl ExecutionStage {
         }
 
         // PARALLEL: Process all tile detections concurrently
-        let processed_detections: Vec<(usize, std::time::Duration, Vec<TileDetection>)> = task::spawn_blocking({
+        let processed_detections: Vec<(usize, Vec<TileDetection>)> = task::spawn_blocking({
             let tile_results = tile_results.clone();
             let tile_size = self.tile_size;
             let allowed_classes = self.allowed_classes.clone();
             move || {
                 tile_results
                     .par_iter()
-                    .map(|(tile_idx, offset_x, offset_y, tile_time, detections)| {
+                    .map(|(tile_idx, offset_x, offset_y, detections)| {
                         let mut tile_dets = Vec::new();
 
                         for det in detections {
@@ -563,47 +532,24 @@ impl ExecutionStage {
                             });
                         }
 
-                        (*tile_idx, *tile_time, tile_dets)
+                        (*tile_idx, tile_dets)
                     })
                     .collect()
             }
         }).await.unwrap();
 
-        // Collect all detections and timing info
-        let mut tile_times = Vec::new();
-        for (tile_idx, tile_time, tile_dets) in processed_detections {
-            tile_times.push((tile_idx, tile_time, tile_dets.len()));
+        // Collect all detections
+        for (_tile_idx, tile_dets) in processed_detections {
             all_detections.extend(tile_dets);
         }
         
-        // Log per-tile performance
-        if !tile_times.is_empty() {
-            log::debug!("📊 Per-Tile End-to-End Latency (submission → response):");
-            for (idx, time, det_count) in &tile_times {
-                let ms = time.as_secs_f32() * 1000.0;
-                let fps = 1000.0 / ms;
-                log::debug!("  Tile #{}: {:.1}ms ({:.1} FPS) - {} detections", idx, ms, fps, det_count);
-            }
-            let total_ms: f32 = tile_times.iter().map(|(_, t, _)| t.as_secs_f32() * 1000.0).sum();
-            let avg_ms = total_ms / tile_times.len() as f32;
-            let avg_fps = 1000.0 / avg_ms;
-            log::info!("  Frame latency: {:.1}ms ({:.1} FPS)", avg_ms, avg_fps);
-            log::debug!("  Submit time: {:.1}ms", submit_time.as_secs_f32() * 1000.0);
-        }
-
-        let output = ExecutionOutput {
+        ExecutionOutput {
             detections: all_detections,
             original_width: input.original_width,
             original_height: input.original_height,
             resized_width: input.resized_width,
             resized_height: input.resized_height,
             resized_image: input.resized_image,
-        };
-
-        StageResult {
-            data: output,
-            stage_name: "Execution".to_string(),
-            duration_ms: start.elapsed().as_secs_f32() * 1000.0,
         }
     }
 }
@@ -748,9 +694,10 @@ impl PostprocessStage {
     }
 
     /// Run post-processing stage
-    pub async fn process(&self, input: ExecutionOutput) -> StageResult<PostprocessOutput> {
-        let start = Instant::now();
-
+    pub async fn process<F>(&self, input: ExecutionOutput, callback: F, pipeline_start_time: Instant) -> PipelineOutput
+    where
+        F: FnOnce(&PipelineOutput),
+    {
         let before_nms = input.detections.len();
 
         // Step 1: Apply NMS to remove duplicates based on IoU
@@ -776,7 +723,10 @@ impl PostprocessStage {
         }).await.unwrap();
         let nested_removed = before_nested_filter - filtered_detections.len();
 
-        let output = PostprocessOutput {
+        // Calculate total pipeline time
+        let pipeline_total_time_ms = pipeline_start_time.elapsed().as_secs_f32() * 1000.0;
+
+        let output = PipelineOutput {
             detections: filtered_detections,
             original_width: input.original_width,
             original_height: input.original_height,
@@ -785,13 +735,13 @@ impl PostprocessStage {
             resized_image: input.resized_image,
             duplicates_removed,
             nested_removed,
+            pipeline_total_time_ms,
         };
 
-        StageResult {
-            data: output,
-            stage_name: "Postprocess".to_string(),
-            duration_ms: start.elapsed().as_secs_f32() * 1000.0,
-        }
+        // Execute callback with final pipeline output
+        callback(&output);
+
+        output
     }
 }
 
@@ -814,6 +764,7 @@ impl Default for PipelineConfig {
 
 /// Detection pipeline that processes a single image through three stages
 /// The detector pool is shared across multiple pipeline executions
+#[derive(Clone)]
 pub struct DetectionPipeline {
     preprocess: PreprocessStage,
     execution: ExecutionStage,
@@ -837,117 +788,58 @@ impl DetectionPipeline {
         }
     }
 
-    /// Process image with detection completion callback (asynchronous)
-    /// Each stage executes asynchronously when its input becomes available
-    /// The callback is invoked immediately after detection completes, before returning results
-    pub async fn process_with_callback<F>(&self, img: RgbImage, callback: F) -> Result<PostprocessOutput, String>
+    pub async fn process_with_callback_local<F>(&self, img: RgbImage, callback: F)
     where
-        F: FnOnce(&[TileDetection], f32) + Send + 'static,
+        F: FnOnce(&PipelineOutput),
     {
-        let start_time = Instant::now();
+        let pipeline_start_time = Instant::now();
         
-        // Create channels for stage coordination
-        let (preprocess_tx, preprocess_rx) = oneshot::channel();
-        let (execution_tx, execution_rx) = oneshot::channel();
-        
-        // Stage 1: Preprocess (tile extraction + shadow removal)
-        let preprocess_stage = self.preprocess.clone();
-        let preprocess_handle = tokio::spawn(async move {
-            let result = preprocess_stage.process(img).await;
-            let _ = preprocess_tx.send(result.data);
-        });
-        
-        // Stage 2: Execution (batch detection via shared pool)
-        let execution_stage = self.execution.clone();
-        let execution_handle = tokio::spawn(async move {
-            match preprocess_rx.await {
-                Ok(preprocess_output) => {
-                    let result = execution_stage.process(preprocess_output).await;
-                    let _ = execution_tx.send(result.data);
-                }
-                Err(e) => {
-                    log::error!("Failed to receive preprocess output: {}", e);
-                }
-            }
-        });
-        
-        // Stage 3: Postprocess (NMS) - starts when execution completes
-        let postprocess_stage = self.postprocess.clone();
-        let postprocess_handle = tokio::spawn(async move {
-            match execution_rx.await {
-                Ok(execution_output) => {
-                    let result = postprocess_stage.process(execution_output).await;
-                    result.data
-                }
-                Err(e) => {
-                    log::error!("Failed to receive execution output: {}", e);
-                    // Return empty result on error
-                    PostprocessOutput {
-                        detections: Vec::new(),
-                        original_width: 0,
-                        original_height: 0,
-                        resized_width: 0,
-                        resized_height: 0,
-                        resized_image: image::RgbImage::new(1, 1),
-                        duplicates_removed: 0,
-                        nested_removed: 0,
-                    }
-                }
-            }
-        });
-
-        // Wait for all stages to complete
-        let _ = preprocess_handle.await.map_err(|e| format!("Preprocess failed: {}", e))?;
-        let _ = execution_handle.await.map_err(|e| format!("Execution failed: {}", e))?;
-        let postprocess_output = postprocess_handle.await.map_err(|e| format!("Postprocess failed: {}", e))?;
-
-        // Calculate processing time
-        let processing_time = start_time.elapsed().as_secs_f32();
-        
-        // Invoke callback with detections and processing time
-        callback(&postprocess_output.detections, processing_time);
-
-        Ok(postprocess_output)
-    }
-
-    /// Process image asynchronously: Preprocess → Execution → Postprocess
-    pub async fn process(&self, img: RgbImage) -> Result<PostprocessOutput, String> {
-        // Stage 1: Preprocess (tile extraction + shadow removal)
+        // Stage 1: Preprocess (await directly)
         let preprocess_result = self.preprocess.process(img).await;
 
-        // Stage 2: Execution (batch detection via shared pool)
-        let execution_result = self.execution.process(preprocess_result.data).await;
+        // Stage 2: Execution
+        let execution_result = self.execution.process(preprocess_result).await;
 
-        // Stage 3: Postprocess (NMS)
-        let postprocess_result = self.postprocess.process(execution_result.data).await;
-
-        Ok(postprocess_result.data)
+        // Stage 3: Postprocess
+        self.postprocess.process(execution_result, callback, pipeline_start_time).await;
     }
 
-    /// Blocking wrapper for process_with_callback for compatibility with sync code
-    /// This method blocks until the async processing completes
-    pub fn process_with_callback_blocking<F>(&self, img: &RgbImage, callback: F) -> Result<PostprocessOutput, String>
+    /// Synchronous version of process_with_callback for non-tokio contexts
+    /// This method runs all processing synchronously and calls the callback directly
+    pub fn process_with_callback<F>(&self, img: &RgbImage, callback: F)
     where
-        F: FnOnce(&[TileDetection], f32),
+        F: FnOnce(&PipelineOutput),
+    {
+        let img_clone = img.clone();
+        let pipeline_start_time = Instant::now();
+        
+        // Create a new runtime for this synchronous context
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        
+        rt.block_on(async {
+            // Stage 1: Preprocess
+            let preprocess_result = self.preprocess.process(img_clone).await;
+
+            // Stage 2: Execution
+            let execution_result = self.execution.process(preprocess_result).await;
+
+            // Stage 3: Postprocess
+            let _output = self.postprocess.process(execution_result, callback, pipeline_start_time).await;
+        });
+    }
+
+    /// Async fire-and-forget wrapper for process_with_callback 
+    /// This method starts the async processing and immediately returns without waiting
+    /// The callback will be executed asynchronously when processing completes
+    pub async fn process_with_callback_async<F>(&self, img: &RgbImage, callback: F)
+    where
+        // This async wrapper accepts non-'static callbacks (no Send bound).
+        F: FnOnce(&PipelineOutput),
     {
         let img_clone = img.clone();
         
-        // Run the async pipeline synchronously
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.process(img_clone).await
-            })
-        });
-        
-        match result {
-            Ok(output) => {
-                // Calculate processing time (approximation since we don't have the exact timing)
-                let processing_time = 0.0; // We could add timing here if needed
-                callback(&output.detections, processing_time);
-                Ok(output)
-            }
-            Err(e) => Err(e)
-        }
+        // Run the processing directly without spawning (caller handles async context)
+        self.process_with_callback_local(img_clone, callback).await;
     }
 
 }

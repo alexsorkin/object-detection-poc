@@ -1,4 +1,4 @@
-use crate::frame_pipeline::{DetectionPipeline, TileDetection};
+use crate::frame_pipeline::{DetectionPipeline, PipelineOutput, TileDetection};
 /// Video processing pipeline with async detection and temporal tracking
 ///
 /// Handles real-time video streams with:
@@ -30,6 +30,8 @@ pub struct FrameResult {
     pub is_extrapolated: bool,
     pub processing_time_ms: f32,
     pub latency_ms: f32,
+    pub duplicates_removed: usize,
+    pub nested_removed: usize,
 }
 
 /// Internal worker commands
@@ -72,12 +74,22 @@ impl VideoPipeline {
         let (command_tx, command_rx) = bounded::<WorkerCommand>(config.buffer_size);
         let (result_tx, result_rx) = bounded::<FrameResult>(config.buffer_size);
 
+        // Channel for sending detection outputs from callback to detection loop
+        let (detection_output_tx, detection_output_rx) =
+            bounded::<(u64, Instant, PipelineOutput)>(config.buffer_size);
+
         let tracker = UnifiedTracker::new(config.tracking_config);
         let detector = Arc::clone(&detection_pipeline);
         let max_latency = Duration::from_millis(config.max_latency_ms);
 
+        // Start detection loop thread with tracker - it sends results directly to result_tx
+        let result_tx_clone = result_tx.clone();
+        let _detection_handle = thread::spawn(move || {
+            Self::detection_loop(detection_output_rx, result_tx_clone, tracker);
+        });
+
         let worker_handle = thread::spawn(move || {
-            Self::worker_loop(command_rx, result_tx, tracker, detector, max_latency);
+            Self::worker_loop(command_rx, detector, detection_output_tx, max_latency);
         });
 
         Self {
@@ -87,34 +99,79 @@ impl VideoPipeline {
         }
     }
 
-    /// Worker thread: processes frames and manages unified tracker
-    fn worker_loop(
-        command_rx: Receiver<WorkerCommand>,
+    /// Detection loop: processes detection outputs and advance track commands
+    fn detection_loop(
+        output_rx: Receiver<(u64, Instant, PipelineOutput)>,
         result_tx: Sender<FrameResult>,
         mut tracker: UnifiedTracker,
+    ) {
+        log::info!("Detection loop started with {} tracker", tracker.method());
+        let mut last_process_time = Instant::now();
+
+        while let Ok((frame_id, timestamp, pipeline_output)) = output_rx.recv() {
+            let now = Instant::now();
+            let dt = now.duration_since(last_process_time).as_secs_f32();
+
+            let tracked_detections = tracker.update(&pipeline_output.detections, dt);
+
+            // Create frame result with extracted diagnostics
+            let result = FrameResult {
+                frame_id,
+                timestamp,
+                detections: tracked_detections,
+                is_extrapolated: false,
+                processing_time_ms: pipeline_output.pipeline_total_time_ms,
+                latency_ms: 0.0, // No latency in command-based processing
+                duplicates_removed: pipeline_output.duplicates_removed,
+                nested_removed: pipeline_output.nested_removed,
+            };
+
+            log::info!(
+                "Detection pipeline time: {:.1}ms",
+                pipeline_output.pipeline_total_time_ms
+            );
+
+            if let Err(e) = result_tx.send(result) {
+                log::warn!("Failed to send detection result: {}", e);
+                break;
+            }
+
+            log::debug!(
+                "Frame {} PROCESSED (processing: {:.1}ms, {} tracks)",
+                frame_id,
+                pipeline_output.pipeline_total_time_ms,
+                tracker.num_tracks()
+            );
+
+            last_process_time = now;
+        }
+
+        log::info!("Detection loop stopped");
+    }
+
+    /// Worker thread: handles commands and triggers detection
+    fn worker_loop(
+        command_rx: Receiver<WorkerCommand>,
         detector: Arc<DetectionPipeline>,
+        detection_output_tx: Sender<(u64, Instant, PipelineOutput)>,
         _max_latency: Duration,
     ) {
-        let mut last_process_time = Instant::now();
         let mut frames_processed = 0_u64;
         let frames_extrapolated = 0_u64;
 
-        log::info!(
-            "Video pipeline worker started with {} tracker",
-            tracker.method()
-        );
+        log::info!("Video pipeline worker started");
 
         while let Ok(command) = command_rx.recv() {
             match command {
                 WorkerCommand::AdvanceTracks => {
-                    // Just advance tracker predictions without processing
-                    tracker.update(&[], 0.04); // Assume ~25ms between frames for dt
+                    // TODO: Send advance tracks command to detection loop
                     log::debug!("Advanced tracker predictions (dropped frame)");
                     continue;
                 }
                 WorkerCommand::ProcessFrame(frame) => {
                     let now = Instant::now();
-                    let dt = now.duration_since(last_process_time).as_secs_f32();
+                    let frame_id = frame.sequence;
+                    let timestamp = now;
 
                     // Convert frame data to image for processing
                     let img_data = frame.data.clone();
@@ -130,54 +187,17 @@ impl VideoPipeline {
                         }
                     };
 
-                    // PROCESSING MODE: Run detection pipeline with tracker callback
-                    let process_start = Instant::now();
-
-                    // Use shared reference for callback results
-                    let mut tracked_detections = Vec::new();
-
-                    {
-                        // Create callback that updates tracker when detection completes
-                        let tracker_ref = &mut tracker;
-                        let tracked_detections_ref = &mut tracked_detections;
-                        let callback = |detections: &[TileDetection], _processing_time: f32| {
-                            // Update tracker immediately when detection completes
-                            *tracked_detections_ref = tracker_ref.update(detections, dt);
-                        };
-                        match detector.process_with_callback_blocking(&image, callback) {
-                            Ok(_) => {
-                                let processing_time =
-                                    process_start.elapsed().as_secs_f32() * 1000.0;
-
-                                let result = FrameResult {
-                                    frame_id: frame.sequence,
-                                    timestamp: now,
-                                    detections: tracked_detections.clone(),
-                                    is_extrapolated: false,
-                                    processing_time_ms: processing_time,
-                                    latency_ms: 0.0, // No latency in command-based processing
-                                };
-
-                                frames_processed += 1;
-                                if let Err(e) = result_tx.send(result) {
-                                    log::warn!("Failed to send detection result: {}", e);
-                                    break;
-                                }
-
-                                log::debug!(
-                                    "Frame {} PROCESSED (processing: {:.1}ms, {} tracks)",
-                                    frame.sequence,
-                                    processing_time,
-                                    tracker.num_tracks()
-                                );
-                            }
-                            Err(e) => {
-                                log::error!("Detection pipeline callback failed: {:?}", e);
-                            }
+                    // Trigger detection with callback that sends to detection loop
+                    let output_tx_clone = detection_output_tx.clone();
+                    detector.process_with_callback(&image, move |output: &PipelineOutput| {
+                        // Send frame context and pipeline output to detection loop
+                        if let Err(e) = output_tx_clone.send((frame_id, timestamp, output.clone()))
+                        {
+                            log::warn!("Failed to send detection output to detection loop: {}", e);
                         }
-                    }
+                    });
 
-                    last_process_time = now;
+                    frames_processed += 1;
 
                     // Log statistics every 100 frames
                     if (frames_processed + frames_extrapolated) % 100 == 0 {
