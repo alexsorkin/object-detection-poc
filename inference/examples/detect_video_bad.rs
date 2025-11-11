@@ -15,8 +15,6 @@
 /// Options (can be in any order):
 ///   --confidence <0-100>    Detection confidence threshold (default: 50)
 ///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
-///   --model <variant>       RT-DETR model variant (default: r18_fp32)
-///                           Available: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32
 ///   --headless              Run without display window (default: show window)
 ///
 /// Examples:
@@ -24,8 +22,6 @@
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- test_data/airport.mp4 --confidence 60 --headless
 ///   cargo run --release --features metal --example detect_video -- --headless --classes 0,2,5,7 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --model r50_fp32 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --model r18_fp16 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam
 use image::{Rgb, RgbImage};
 use military_target_detector::detector_trait::DetectorType;
@@ -35,7 +31,7 @@ use military_target_detector::image_utils::{
     draw_rect_batch, draw_text, draw_text_batch, generate_class_color,
 };
 use military_target_detector::kalman_tracker::KalmanConfig;
-use military_target_detector::types::{DetectorConfig, RTDETRModel};
+use military_target_detector::types::DetectorConfig;
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
 use opencv::{
     core::Mat,
@@ -97,7 +93,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut confidence_threshold = 0.50; // Default 50%
     let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
     let mut headless = false; // Default: show display window
-    let mut model_variant = RTDETRModel::R18VD_FP32; // Default: r18_fp32
     let mut video_source: Option<String> = None;
 
     // Parse all arguments in any order
@@ -133,23 +128,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--headless" => {
                 headless = true;
-            }
-            "--model" => {
-                i += 1;
-                if i < args.len() {
-                    match RTDETRModel::from_str(&args[i]) {
-                        Some(model) => {
-                            model_variant = model;
-                        }
-                        None => {
-                            eprintln!(
-                                "Invalid model variant '{}'. Valid options: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32",
-                                args[i]
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
             }
             arg => {
                 // If it doesn't start with --, treat it as the video source
@@ -211,11 +189,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let detector_type = DetectorType::RTDETR;
     let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
-    // Read model directory from environment variable or use default
-    let model_dir = env::var("DEFENITY_MODEL_DIR").unwrap_or_else(|_| "../models".to_string());
-
     let detector_config = DetectorConfig {
-        model_path: format!("{}/{}", model_dir, model_variant.filename()),
+        model_path: "../models/rtdetr_v2_r18vd_batch.onnx".to_string(),
         confidence_threshold,
         nms_threshold: 0.45,
         input_size: (640, 640),
@@ -224,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let executor_config = ExecutorConfig {
-        max_queue_depth: 1, // Drop frames if more than 2 pending (backpressure control)
+        max_queue_depth: 2, // Drop frames if more than 2 pending (backpressure control)
     };
     let max_queue_depth = executor_config.max_queue_depth; // Save before move
 
@@ -247,17 +222,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Create video pipeline with Kalman tracker
-    let buffer_size = 10; // Tiny buffer - only allow 10 frames queued max
+    let buffer_size = 10; // Tiny buffer - only allow 2 frames queued max
     let video_config = VideoPipelineConfig {
         max_latency_ms: 500,
         kalman_config: KalmanConfig {
-            max_age_ms: 500,              // 6 FPS = 166ms/frame, allow ~3 frames missing
-            iou_threshold: 0.10,          // Very low threshold for 6 FPS with prediction drift
-            max_centroid_distance: 300.0, // Large distance - predictions drift significantly at 6 FPS
-            process_noise_pos: 3.0,       // Moderate uncertainty for 166ms gaps
-            process_noise_vel: 5.0,       // Higher velocity uncertainty - acceleration in 166ms
-            measurement_noise: 3.0,       // Trust detector measurements
-            initial_covariance: 15.0,     // Moderate initial uncertainty
+            max_age_ms: 1000,             // Keep tracks for 1s (detection interval is ~600ms)
+            iou_threshold: 0.10, // Very low threshold - detections 350-400ms apart can drift significantly
+            max_centroid_distance: 150.0, // Match if centroids within 150px (for fast-moving objects)
+            process_noise_pos: 5.0,       // Higher position uncertainty for fast-moving objects
+            process_noise_vel: 10.0, // Much higher velocity uncertainty (fast aircraft/vehicles)
+            measurement_noise: 5.0,  // Higher detector noise tolerance
+            initial_covariance: 20.0, // Higher initial uncertainty
         },
         buffer_size,
     };
@@ -266,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("  ✓ Pipeline ready (with internal Kalman tracker)");
     eprintln!("\n💡 Configuration:");
-    eprintln!("  • Detector: {} (frame executor)", model_variant.name());
+    eprintln!("  • Detector: RT-DETR (frame executor)");
     eprintln!("  • Batch size: {}", batch_size);
     eprintln!("  • Queue depth: {} (backpressure)", max_queue_depth);
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
@@ -293,31 +268,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // We'll create the video writer after we get the first frame (to know actual dimensions)
     let output_path = "output_video.mp4";
-    let writer_initialized = std::cell::Cell::new(false);
-    let mut frame_tx: Option<std::sync::mpsc::SyncSender<Mat>> = None;
-    let mut writer_handle: Option<thread::JoinHandle<Result<(), String>>> = None;
 
     // Create window for display - will be resized after first frame to match video size (max 640p)
     if !headless {
         highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
     }
 
-    // Display update interval: update window every frame for smooth playback
-    let display_interval = 1; // Update display every frame
-
-    let mut frame_id = 0_u64;
-    let mut paused = false;
-
     // Thread-safe stats for detector thread
     let stats_processed = Arc::new(AtomicU32::new(0));
     let stats_extrapolated = Arc::new(AtomicU32::new(0));
     let stats_latency_sum = Arc::new(AtomicU32::new(0)); // Store as integer (sum of ms)
     let stats_start = Instant::now();
-
-    // Track latest detections from VideoPipeline (includes Kalman tracking)
-    let mut latest_detections: Vec<military_target_detector::frame_pipeline::TileDetection> =
-        Vec::new();
-    let mut num_tracks = 0;
 
     eprintln!(
         "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})",
@@ -379,13 +340,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_pipeline_for_detector = Arc::clone(&video_pipeline);
 
     let detector_handle = thread::spawn(move || {
-        let mut submitted_frame_id = 0_u64;
-        let mut input_frame_id = 0_u64;
+        let mut detector_frame_id = 0_u64;
+        let mut detect_frame_id = 0_u64;
 
         loop {
             let frame_start = Instant::now();
 
-            if let Ok(_) = detector_done_rx.try_recv() {
+            if detector_done_rx.try_recv().is_ok() {
                 log::debug!("Detector thread: End of video");
                 break;
             }
@@ -397,18 +358,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
                 latest_detector_frame = Some(frame_with_timestamp);
                 frames_drained += 1;
-                input_frame_id += 1;
+                detect_frame_id += 1;
             }
 
             if frames_drained > 1 {
                 log::debug!("Drained {} frames, using latest", frames_drained);
             }
-            log::debug!("Consuming frame {} for detect", input_frame_id);
+            log::debug!("Consuming frame {} for detect", detect_frame_id);
 
             // Submit latest detector frame if available
             if let Some((detector_frame, capture_time)) = latest_detector_frame {
                 let frame = Frame {
-                    frame_id: submitted_frame_id,
+                    frame_id: detector_frame_id,
                     image: detector_frame,
                     timestamp: capture_time,
                 };
@@ -416,8 +377,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
                 if video_pipeline_for_detector.try_submit_frame(frame) {
-                    log::debug!("Submitted frame {} for detect", submitted_frame_id);
-                    submitted_frame_id += 1;
+                    log::debug!("Submitted frame {} for detect", detector_frame_id);
+                    detector_frame_id += 1;
                 } else {
                     log::warn!("Pipeline busy, frame dropped");
                 }
@@ -444,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let results_handle = thread::spawn(move || {
         loop {
-            if let Ok(_) = results_done_rx.try_recv() {
+            if results_done_rx.try_recv().is_ok() {
                 log::debug!("Results thread: End of video");
                 break;
             }
@@ -460,7 +421,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stats_latency_for_results.fetch_add(result.latency_ms as u32, Ordering::Relaxed);
 
                 // Send detections to main thread (non-blocking)
-                let _ = detections_tx.try_send(result.detections);
+                let _ = detections_tx.try_send(result.detections).is_ok();
             }
 
             // Small sleep to avoid busy loop
@@ -468,273 +429,336 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut out_frame_id = 0_u64;
+    // === OUTPUT PROCESSING THREAD ===
+    // Handles: receiving raw frames, getting detections, annotation, Mat conversion, video writing
+    // This thread is completely independent from the main display loop
+    let (annotated_tx, annotated_rx) = sync_channel::<(Mat, u64)>(3); // Send annotated frames to main for display
+    let (window_size_tx, window_size_rx) = sync_channel::<(i32, i32)>(1); // Send window size to main thread for resize
 
-    // Pre-allocate Mat for reuse (optimization)
-    let mut display_mat = Mat::default();
+    let stats_processed_for_output = Arc::clone(&stats_processed);
+    let stats_frames_produced = Arc::new(AtomicU32::new(0)); // Track frames produced by output thread
+    let stats_frames_produced_for_output = Arc::clone(&stats_frames_produced);
+    let output_path_for_thread = output_path.to_string();
+    let fps_for_thread = fps;
+    let headless_for_output = headless;
 
-    // === OPTIMIZATION: Pre-compute color palette for all 80 COCO classes ===
-    let color_palette: Vec<Rgb<u8>> = (0..80)
-        .map(|class_id| generate_class_color(class_id))
-        .collect();
+    // Clone detections_rx for output thread
+    let detections_rx_for_output = detections_rx;
+
+    let output_processing_handle =
+        thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send>> {
+            let mut writer_initialized = false;
+            let mut frame_tx: Option<std::sync::mpsc::SyncSender<Mat>> = None;
+            let mut writer_handle: Option<thread::JoinHandle<Result<(), String>>> = None;
+            let mut display_mat = Mat::default();
+            let mut latest_detections: Vec<
+                military_target_detector::frame_pipeline::TileDetection,
+            > = Vec::new();
+            let mut frame_id = 0_u64;
+
+            // Pre-compute color palette for all 80 COCO classes
+            let color_palette: Vec<Rgb<u8>> = (0..80)
+                .map(|class_id| generate_class_color(class_id))
+                .collect();
+
+            let mut scale_x = 1.0_f32;
+            let mut scale_y = 1.0_f32;
+            let mut scale_computed = false;
+
+            let output_frame_duration = Duration::from_secs_f64(1.0 / fps_for_thread as f64);
+
+            loop {
+                let loop_start = Instant::now();
+
+                // Check if capture thread is done
+                if output_done_rx.try_recv().is_ok() {
+                    log::debug!("Output thread: End of video");
+                    break;
+                }
+
+                // Drain output_rx to get LATEST raw frame (drop old frames)
+                let mut latest_frame: Option<RgbImage> = None;
+                let mut frames_drained = 0;
+                while let Ok((frame, _timestamp)) = output_rx.try_recv() {
+                    latest_frame = Some(frame);
+                    frames_drained += 1;
+                }
+
+                if frames_drained > 1 {
+                    log::debug!(
+                        "Output thread: Drained {} frames, using latest",
+                        frames_drained
+                    );
+                }
+
+                // Get latest detections (non-blocking)
+                if let Ok(detections) = detections_rx_for_output.try_recv() {
+                    latest_detections = detections;
+                }
+
+                // Process the latest frame if available
+                if let Some(rgb_image) = latest_frame {
+                    let orig_width = rgb_image.width();
+                    let orig_height = rgb_image.height();
+
+                    // Initialize video writer on first frame
+                    if !writer_initialized {
+                        let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+                        let mut new_writer = VideoWriter::new(
+                            &output_path_for_thread,
+                            fourcc,
+                            fps_for_thread,
+                            opencv::core::Size::new(orig_width as i32, orig_height as i32),
+                            true,
+                        )
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
+                        if !new_writer
+                            .is_opened()
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?
+                        {
+                            eprintln!("❌ Failed to open video writer");
+                            return Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "Failed to open video writer",
+                            )));
+                        }
+                        eprintln!(
+                            "  ✓ Writing output to: {} ({}x{})\n",
+                            output_path_for_thread, orig_width, orig_height
+                        );
+
+                        // Calculate window size and send to main thread for resizing
+                        if !headless_for_output {
+                            let max_height = 640;
+                            let (window_width, window_height) = if orig_height > max_height {
+                                let scale = max_height as f32 / orig_height as f32;
+                                ((orig_width as f32 * scale) as i32, max_height as i32)
+                            } else {
+                                (orig_width as i32, orig_height as i32)
+                            };
+                            let _ = window_size_tx.send((window_width, window_height));
+                        }
+
+                        // Create async video writer thread with large buffer
+                        let (tx, rx) = sync_channel::<Mat>(120);
+                        let handle = thread::spawn(move || -> Result<(), String> {
+                            for mat in rx {
+                                new_writer.write(&mat).map_err(|e| e.to_string())?;
+                            }
+                            new_writer.release().map_err(|e| e.to_string())?;
+                            Ok(())
+                        });
+
+                        frame_tx = Some(tx);
+                        writer_initialized = true;
+                        writer_handle = Some(handle);
+                    }
+
+                    // Compute scale factors once
+                    if !scale_computed {
+                        let target_size = 640.0_f32;
+                        let scale = if orig_width > orig_height {
+                            (target_size / orig_width as f32).min(1.0)
+                        } else {
+                            (target_size / orig_height as f32).min(1.0)
+                        };
+
+                        let resized_width = (orig_width as f32 * scale) as u32;
+                        let resized_height = (orig_height as f32 * scale) as u32;
+
+                        scale_x = orig_width as f32 / resized_width as f32;
+                        scale_y = orig_height as f32 / resized_height as f32;
+                        scale_computed = true;
+                    }
+
+                    // Annotate frame with detections (PARALLEL)
+                    let mut annotated = rgb_image.clone();
+
+                    let annotation_data: Vec<_> = latest_detections
+                        .par_iter()
+                        .map(|det| {
+                            let color = color_palette[det.class_id as usize];
+                            let scaled_x = (det.x * scale_x) as i32;
+                            let scaled_y = (det.y * scale_y) as i32;
+                            let scaled_w = (det.w * scale_x) as u32;
+                            let scaled_h = (det.h * scale_y) as u32;
+
+                            let label = if let Some(track_id) = det.track_id {
+                                format!(
+                                    "#{} {} {:.0}%",
+                                    track_id,
+                                    det.class_name,
+                                    det.confidence * 100.0
+                                )
+                            } else {
+                                format!("{} {:.0}%", det.class_name, det.confidence * 100.0)
+                            };
+
+                            let show_label = scaled_h > 20 && scaled_w > 30;
+                            (
+                                scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label,
+                            )
+                        })
+                        .collect();
+
+                    // PARALLEL BATCH: Prepare rectangle and label data for batch drawing
+                    let rects: Vec<_> = annotation_data
+                        .iter()
+                        .map(|(x, y, w, h, color, _label, _show_label)| (*x, *y, *w, *h, *color, 2))
+                        .collect();
+
+                    let labels: Vec<_> = annotation_data
+                        .iter()
+                        .filter(|(_x, _y, _w, _h, _color, _label, show_label)| *show_label)
+                        .map(|(x, _y, _w, _h, _color, label, _show_label)| {
+                            (label.as_str(), x + 3, _y + 15, Rgb([255, 255, 255]), None)
+                        })
+                        .collect();
+
+                    // Draw all rectangles and labels in parallel
+                    draw_rect_batch(&mut annotated, &rects);
+                    draw_text_batch(&mut annotated, &labels);
+
+                    // Draw stats overlay
+                    let num_tracks = latest_detections
+                        .iter()
+                        .filter(|d| d.track_id.is_some())
+                        .count();
+                    let stats_text = format!(
+                        "Frame: {} | Tracks: {} | Detections: {}",
+                        frame_id,
+                        num_tracks,
+                        stats_processed_for_output.load(Ordering::Relaxed)
+                    );
+                    draw_text(
+                        &mut annotated,
+                        &stats_text,
+                        10,
+                        30,
+                        Rgb([255, 255, 255]),
+                        Some(Rgb([0, 0, 0])),
+                    );
+
+                    // Convert to Mat (need to copy data, not just reference)
+                    let display_width = annotated.width();
+                    let display_height = annotated.height();
+
+                    // Create a proper Mat by copying the data
+                    let mut mat = unsafe {
+                        Mat::new_rows_cols(
+                            display_height as i32,
+                            display_width as i32,
+                            opencv::core::CV_8UC3,
+                        )
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?
+                    };
+
+                    // Copy RGB data to Mat
+                    let data_slice = annotated.as_raw();
+                    mat.data_bytes_mut()
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?
+                        .copy_from_slice(data_slice);
+
+                    imgproc::cvt_color(
+                        &mat,
+                        &mut display_mat,
+                        imgproc::COLOR_RGB2BGR,
+                        0,
+                        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+                    )
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
+                    // Send to video writer (async, non-blocking)
+                    if let Some(ref tx) = frame_tx {
+                        let _ = tx.try_send(display_mat.clone()).is_ok();
+                    }
+
+                    // Send to main thread for display (non-blocking)
+                    let _ = annotated_tx
+                        .try_send((display_mat.clone(), frame_id))
+                        .is_ok();
+
+                    // Increment frames produced counter
+                    stats_frames_produced_for_output.fetch_add(1, Ordering::Relaxed);
+
+                    frame_id += 1;
+                }
+
+                // Pace output thread at video FPS
+                let elapsed = loop_start.elapsed();
+                if elapsed < output_frame_duration {
+                    std::thread::sleep(output_frame_duration - elapsed);
+                }
+            }
+
+            // Cleanup
+            eprintln!("\nClosing video writer...");
+            drop(frame_tx);
+            if let Some(handle) = writer_handle {
+                match handle.join() {
+                    Ok(Ok(())) => eprintln!("  ✓ Video writer finished successfully"),
+                    Ok(Err(e)) => eprintln!("⚠️  Writer thread error: {}", e),
+                    Err(e) => eprintln!("⚠️  Writer thread panicked: {:?}", e),
+                }
+            }
+
+            Ok(())
+        });
+
+    let mut paused = false;
+    let mut window_resized = false;
+    let mut frames_displayed = 0_u64;
+    let display_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
+    let mut no_frame_count = 0; // Count consecutive loop iterations with no frames
 
     loop {
-        if let Ok(_) = output_done_rx.try_recv() {
-            log::debug!("Main Loop: End of video (no frames captured)");
-            break;
+        let loop_start = Instant::now();
+
+        // Check if output thread sent window size for resizing (only once)
+        if !window_resized {
+            if let Ok((width, height)) = window_size_rx.try_recv() {
+                if !headless {
+                    highgui::resize_window("Detection", width, height)?;
+                    window_resized = true;
+                }
+            }
         }
 
-        // Try to get frame from OUTPUT queue with timeout
-        // This allows the loop to check for exit conditions periodically
-        // instead of blocking forever waiting for frames
-        let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok((frame, _timestamp)) => Some(frame),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // No frame yet, continue loop to check exit conditions
-                continue;
+        // Drain annotated_rx to get LATEST frame for display (drop old frames)
+        let mut latest_annotated: Option<(Mat, u64)> = None;
+        while let Ok((mat, fid)) = annotated_rx.try_recv() {
+            latest_annotated = Some((mat, fid));
+            no_frame_count = 0; // Reset counter when we get frames
+        }
+
+        // Display the latest frame if available
+        if let Some((annotated_mat, _)) = latest_annotated {
+            frames_displayed += 1;
+            if !headless {
+                highgui::imshow("Detection", &annotated_mat)?;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Channel closed - capture thread finished
-                log::info!("Output channel closed, ending video processing");
+        } else {
+            // No frame available, increment counter
+            no_frame_count += 1;
+
+            // If we haven't received frames for a while, check if processing is done
+            // This gives time for the last frames to propagate through the pipeline
+            if no_frame_count > 30 {
+                log::debug!(
+                    "Main loop: No frames for {} iterations, exiting",
+                    no_frame_count
+                );
                 break;
             }
-        };
-
-        let rgb_image = if let Some(frame) = new_captured_frame {
-            log::debug!("Consuming frame: {} for output", out_frame_id);
-            out_frame_id += 1;
-            frame
-        } else {
-            log::warn!("No more frames available, ending video processing");
-            break;
-        };
-
-        // Initialize video writer on first frame (now we know actual dimensions)
-        let orig_width = rgb_image.width();
-        let orig_height = rgb_image.height();
-
-        if !writer_initialized.get() {
-            let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')?;
-            let mut new_writer = VideoWriter::new(
-                output_path,
-                fourcc,
-                fps,
-                opencv::core::Size::new(orig_width as i32, orig_height as i32),
-                true,
-            )?;
-
-            if !new_writer.is_opened()? {
-                eprintln!("❌ Failed to open video writer");
-                io::stderr().flush()?;
-                return Ok(());
-            }
-
-            eprintln!(
-                "  ✓ Writing output to: {} ({}x{})\n",
-                output_path, orig_width, orig_height
-            );
-            io::stderr().flush()?;
-
-            // Resize display window to match video size (capped at 640p)
-            if !headless {
-                let max_height = 640;
-                let (window_width, window_height) = if orig_height > max_height {
-                    // Scale down to 640p preserving aspect ratio
-                    let scale = max_height as f32 / orig_height as f32;
-                    ((orig_width as f32 * scale) as i32, max_height as i32)
-                } else {
-                    // Use native resolution
-                    (orig_width as i32, orig_height as i32)
-                };
-                highgui::resize_window("Detection", window_width, window_height)?;
-            }
-
-            // Create async video writer thread with large buffer
-            let (tx, rx) = sync_channel::<Mat>(120); // Buffer ~5 seconds at 24fps
-            let handle = thread::spawn(move || -> Result<(), String> {
-                for mat in rx {
-                    new_writer.write(&mat).map_err(|e| e.to_string())?;
-                }
-                new_writer.release().map_err(|e| e.to_string())?;
-                Ok(())
-            });
-
-            frame_tx = Some(tx);
-            writer_initialized.set(true);
-            writer_handle = Some(handle);
-        }
-
-        // === OPTIMIZATION: Pre-compute scale factors ONCE (after first frame) ===
-        // These don't change between frames, so calculate once and reuse
-        let (scale_x, scale_y) = {
-            let target_size = 640.0_f32;
-            let scale = if orig_width > orig_height {
-                (target_size / orig_width as f32).min(1.0)
-            } else {
-                (target_size / orig_height as f32).min(1.0)
-            };
-
-            let resized_width = (orig_width as f32 * scale) as u32;
-            let resized_height = (orig_height as f32 * scale) as u32;
-
-            (
-                orig_width as f32 / resized_width as f32,
-                orig_height as f32 / resized_height as f32,
-            )
-        };
-
-        // Get latest detections from results thread (non-blocking)
-        if let Ok(detections) = detections_rx.try_recv() {
-            latest_detections = detections;
-            num_tracks = latest_detections
-                .iter()
-                .filter(|d| d.track_id.is_some())
-                .count();
-        }
-
-        // Annotate current frame with latest detections (from VideoPipeline with Kalman)
-        let mut annotated = rgb_image.clone();
-
-        // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
-        // Uses pre-computed scale_x, scale_y and color_palette
-        let annotation_data: Vec<_> = latest_detections
-            .par_iter()
-            .map(|det| {
-                let color = color_palette[det.class_id as usize]; // Lookup, not compute
-                let scaled_x = (det.x * scale_x) as i32;
-                let scaled_y = (det.y * scale_y) as i32;
-                let scaled_w = (det.w * scale_x) as u32;
-                let scaled_h = (det.h * scale_y) as u32;
-
-                let label = if let Some(track_id) = det.track_id {
-                    format!(
-                        "#{} {} {:.0}%",
-                        track_id,
-                        det.class_name,
-                        det.confidence * 100.0
-                    )
-                } else {
-                    format!("{} {:.0}%", det.class_name, det.confidence * 100.0)
-                };
-
-                let show_label = scaled_h > 20 && scaled_w > 30;
-
-                (
-                    scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label,
-                )
-            })
-            .collect();
-
-        // PARALLEL BATCH: Prepare rectangle and label data for batch drawing
-        let rects: Vec<_> = annotation_data
-            .iter()
-            .map(|(x, y, w, h, color, _label, _show_label)| (*x, *y, *w, *h, *color, 2))
-            .collect();
-
-        let labels: Vec<_> = annotation_data
-            .iter()
-            .filter(|(_x, _y, _w, _h, _color, _label, show_label)| *show_label)
-            .map(|(x, _y, _w, _h, _color, label, _show_label)| {
-                (label.as_str(), x + 3, _y + 15, Rgb([255, 255, 255]), None)
-            })
-            .collect();
-
-        // Draw all rectangles and labels in parallel
-        draw_rect_batch(&mut annotated, &rects);
-        draw_text_batch(&mut annotated, &labels);
-
-        // Draw stats overlay (only when displaying to reduce overhead)
-        if frame_id % display_interval == 0 {
-            let stats_text = format!(
-                "Frame: {} | Tracks: {} | Detections: {} RT-DETR",
-                frame_id,
-                num_tracks,
-                stats_processed.load(Ordering::Relaxed)
-            );
-
-            draw_text(
-                &mut annotated,
-                &stats_text,
-                10,
-                30,
-                Rgb([255, 255, 255]),
-                Some(Rgb([0, 0, 0])),
-            );
-        }
-
-        // Convert annotated frame to Mat for display and writing
-        let display_width = annotated.width();
-        let display_height = annotated.height();
-
-        // Create Mat from RGB data - opencv expects CV_8UC3 format
-        let data_slice = annotated.as_raw();
-        let mat = unsafe {
-            Mat::new_rows_cols_with_data_unsafe(
-                display_height as i32,
-                display_width as i32,
-                opencv::core::CV_8UC3,
-                data_slice.as_ptr() as *mut _,
-                opencv::core::Mat_AUTO_STEP,
-            )?
-        };
-
-        // Reuse pre-allocated display_mat buffer for BGR conversion
-        imgproc::cvt_color(
-            &mat,
-            &mut display_mat,
-            imgproc::COLOR_RGB2BGR,
-            0,
-            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-        )?;
-
-        // Display (every Nth frame to reduce overhead)
-        if !headless && frame_id % display_interval == 0 {
-            highgui::imshow("Detection", &display_mat)?;
-        }
-
-        // Write ALL frames to output video (async, non-blocking)
-        if let Some(ref tx) = frame_tx {
-            // Use try_send to avoid blocking the main loop
-            // If queue is full, skip this frame (writer can't keep up)
-            let _ = tx.try_send(display_mat.clone());
-        }
-
-        frame_id += 1;
-
-        // Print progress every N frames (based on FPS)
-        let progress_interval = (fps as u64).max(24);
-        if frame_id % progress_interval == 0 {
-            let elapsed = stats_start.elapsed().as_secs_f32();
-            let avg_fps = frame_id as f32 / elapsed;
-            let processed = stats_processed.load(Ordering::Relaxed);
-            let extrapolated = stats_extrapolated.load(Ordering::Relaxed);
-            let total = processed + extrapolated;
-            let avg_latency = if total > 0 {
-                stats_latency_sum.load(Ordering::Relaxed) as f32 / total as f32
-            } else {
-                0.0
-            };
-
-            log::debug!(
-                "Frame {}: {:.1} FPS | Tracks: {}",
-                frame_id,
-                avg_fps,
-                num_tracks,
-            );
-            log::debug!(
-                "Real detections: {} | Avg Latency: {:.0}ms",
-                processed,
-                avg_latency
-            );
-            io::stderr().flush().ok();
         }
 
         // Handle keyboard input with minimal delay (1ms for UI responsiveness)
         if !headless {
             let key = highgui::wait_key(1)?;
             if key == 'q' as i32 {
-                eprintln!("\n⏹️  Stopped by user");
-                io::stderr().flush()?;
+                log::debug!("Stopped by user");
                 break;
             } else if key == 'p' as i32 {
                 paused = !paused;
@@ -748,42 +772,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("▶️  Resumed");
                 io::stderr().flush()?;
             }
-        } else {
-            // In headless mode, add a small sleep to prevent busy loop
-            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Pace to target FPS - sleep for remaining time in this frame period
+        let elapsed = loop_start.elapsed();
+        if elapsed < display_frame_duration {
+            std::thread::sleep(display_frame_duration - elapsed);
         }
     }
 
+    // Calculate final statistics
     let total_time = stats_start.elapsed().as_secs_f32();
     let processed = stats_processed.load(Ordering::Relaxed);
     let extrapolated = stats_extrapolated.load(Ordering::Relaxed);
     let total = processed + extrapolated;
-    let avg_fps = frame_id as f32 / total_time;
+    let frames_produced = stats_frames_produced.load(Ordering::Relaxed);
+    let avg_fps = frames_displayed as f32 / total_time;
     let avg_latency = if total > 0 {
         stats_latency_sum.load(Ordering::Relaxed) as f32 / total as f32
     } else {
         0.0
     };
 
-    // Close video writer channel and wait for thread to finish
-    drop(frame_tx);
-    if let Some(handle) = writer_handle {
-        match handle.join() {
-            Ok(Ok(())) => {
-                log::debug!("Video writer finished successfully");
-            }
-            Ok(Err(e)) => {
-                eprintln!("⚠️  Writer thread error: {}", e);
-                io::stderr().flush()?;
-            }
-            Err(e) => {
-                eprintln!("⚠️  Writer thread panicked: {:?}", e);
-                io::stderr().flush()?;
-            }
-        }
-    }
-
     eprintln!("\n🧹 Waiting for threads to finish...");
+    io::stderr().flush()?;
 
     // Wait for threads to finish
     if let Err(e) = capture_handle.join() {
@@ -801,6 +813,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         eprintln!("  ✓ Results thread finished");
     }
+    if let Err(e) = output_processing_handle.join() {
+        eprintln!("⚠️  Output processing thread error: {:?}", e);
+    } else {
+        eprintln!("  ✓ Output processing thread finished");
+    }
     io::stderr().flush()?;
 
     log::debug!("Output video saved: {}", output_path);
@@ -808,23 +825,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n");
     eprintln!("===============================================================================");
     eprintln!(
-        "Finished with: frame_id={}, total_time={}, processed={}, extrapolated={}",
-        frame_id, total_time, processed, extrapolated
+        "Finished with: frames_displayed={}, total_time={}, processed={}, extrapolated={}",
+        frames_displayed, total_time, processed, extrapolated
     );
     eprintln!("===============================================================================");
+    io::stderr().flush()?;
 
     eprintln!("\n");
     eprintln!("===================================================");
     eprintln!("FINAL STATISTICS:");
     eprintln!("===================================================");
-    eprintln!("Total frames displayed: {}", frame_id);
+    eprintln!("Frames displayed (main loop): {}", frames_displayed);
+    eprintln!("Frames produced (output thread): {}", frames_produced);
     eprintln!("Duration: {:.1}s", total_time);
-    eprintln!("Average FPS: {:.1}", avg_fps);
+    eprintln!("Display FPS: {:.1}", avg_fps);
     eprintln!("");
     eprintln!("Detection Stats:");
     eprintln!("  Real detections: {}", processed);
+    eprintln!("  Extrapolated: {}", extrapolated);
     eprintln!("  Average latency: {:.0}ms", avg_latency);
-    eprintln!("===================================================\n");
+    eprintln!("===================================================");
+    eprintln!("");
     io::stderr().flush()?;
 
     if !headless {

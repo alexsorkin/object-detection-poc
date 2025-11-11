@@ -878,53 +878,76 @@ impl ImageData {
 
 /// RT-DETR model variants with their corresponding ONNX file paths
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[allow(non_camel_case_types)]
 pub enum RTDETRModel {
-    /// RT-DETR v2 with ResNet-18 backbone
-    R18VD,
-    /// RT-DETR v2 with ResNet-34 backbone  
-    R34VD,
-    /// RT-DETR v2 with ResNet-50 backbone
-    R50VD,
+    /// RT-DETR v2 with ResNet-18 backbone (FP16)
+    R18VD_FP16,
+    /// RT-DETR v2 with ResNet-18 backbone (FP32)
+    R18VD_FP32,
+    /// RT-DETR v2 with ResNet-34 backbone (FP16)
+    R34VD_FP16,
+    /// RT-DETR v2 with ResNet-34 backbone (FP32)
+    R34VD_FP32,
+    /// RT-DETR v2 with ResNet-50 backbone (FP16)
+    R50VD_FP16,
+    /// RT-DETR v2 with ResNet-50 backbone (FP32)
+    R50VD_FP32,
 }
 
 impl RTDETRModel {
     /// Get the model file name for this variant
     pub fn filename(&self) -> &'static str {
         match self {
-            Self::R18VD => "rtdetr_v2_r18vd_batch.onnx",
-            Self::R34VD => "rtdetr_v2_r34vd_batch.onnx",
-            Self::R50VD => "rtdetr_v2_r50vd_batch.onnx",
+            Self::R18VD_FP16 => "rtdetr_v2_r18vd_fp16.onnx",
+            Self::R18VD_FP32 => "rtdetr_v2_r18vd_fp32.onnx",
+            Self::R34VD_FP16 => "rtdetr_v2_r34vd_fp16.onnx",
+            Self::R34VD_FP32 => "rtdetr_v2_r34vd_fp32.onnx",
+            Self::R50VD_FP16 => "rtdetr_v2_r50vd_fp16.onnx",
+            Self::R50VD_FP32 => "rtdetr_v2_r50vd_fp32.onnx",
         }
     }
 
     /// Get the model name as a string
     pub fn name(&self) -> &'static str {
         match self {
-            Self::R18VD => "RT-DETR v2 R18",
-            Self::R34VD => "RT-DETR v2 R34",
-            Self::R50VD => "RT-DETR v2 R50",
+            Self::R18VD_FP16 => "RT-DETR v2 R18 (FP16)",
+            Self::R18VD_FP32 => "RT-DETR v2 R18 (FP32)",
+            Self::R34VD_FP16 => "RT-DETR v2 R34 (FP16)",
+            Self::R34VD_FP32 => "RT-DETR v2 R34 (FP32)",
+            Self::R50VD_FP16 => "RT-DETR v2 R50 (FP16)",
+            Self::R50VD_FP32 => "RT-DETR v2 R50 (FP32)",
         }
     }
 
     /// Parse from string (case-insensitive)
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "r18vd" | "r18" => Some(Self::R18VD),
-            "r34vd" | "r34" => Some(Self::R34VD),
-            "r50vd" | "r50" => Some(Self::R50VD),
+            "r18vd_fp16" | "r18_fp16" | "r18-fp16" => Some(Self::R18VD_FP16),
+            "r18vd_fp32" | "r18_fp32" | "r18-fp32" | "r18vd" | "r18" => Some(Self::R18VD_FP32),
+            "r34vd_fp16" | "r34_fp16" | "r34-fp16" => Some(Self::R34VD_FP16),
+            "r34vd_fp32" | "r34_fp32" | "r34-fp32" | "r34vd" | "r34" => Some(Self::R34VD_FP32),
+            "r50vd_fp16" | "r50_fp16" | "r50-fp16" => Some(Self::R50VD_FP16),
+            "r50vd_fp32" | "r50_fp32" | "r50-fp32" | "r50vd" | "r50" => Some(Self::R50VD_FP32),
             _ => None,
         }
     }
 
     /// Get all available model variants
     pub fn all() -> Vec<Self> {
-        vec![Self::R18VD, Self::R34VD, Self::R50VD]
+        vec![
+            Self::R18VD_FP16,
+            Self::R18VD_FP32,
+            Self::R34VD_FP16,
+            Self::R34VD_FP32,
+            Self::R50VD_FP16,
+            Self::R50VD_FP32,
+        ]
     }
 }
 
 impl Default for RTDETRModel {
     fn default() -> Self {
-        Self::R18VD // Smallest/fastest model as default
+        Self::R18VD_FP32 // Smallest model with FP32 precision as default
     }
 }
 

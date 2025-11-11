@@ -337,9 +337,13 @@ impl MultiObjectTracker {
         // Build cost matrix using pathfinding::matrix::Matrix with integer costs
         // Scale IoU by 10000 to preserve precision as integers
         let scale = 10000_i32;
-        let cost_matrix = Mutex::new(pathfinding::matrix::Matrix::new(rows, cols, scale));
+        let max_cost = scale * 100; // Very high cost for unmatched pairs
+        let cost_matrix = Mutex::new(pathfinding::matrix::Matrix::new(rows, cols, max_cost));
 
         // PARALLEL: Compute costs for all detection-track pairs
+        let class_mismatches = std::sync::atomic::AtomicUsize::new(0);
+        let costs_set = std::sync::atomic::AtomicUsize::new(0);
+
         detections
             .par_iter()
             .enumerate()
@@ -350,16 +354,32 @@ impl MultiObjectTracker {
                         let iou = Self::calculate_iou(det, track);
                         let centroid_dist = Self::calculate_centroid_distance(det, track);
 
-                        // Compute cost: prefer IoU, but use distance if IoU is zero
-                        let cost = if iou > 0.01 {
-                            // IoU-based cost (lower is better)
+                        // Hybrid matching: use IoU primarily, but allow distance-based matching
+                        // for cases where Kalman prediction has drifted (low IoU but close centroids)
+                        let cost = if iou >= self.config.iou_threshold {
+                            // Good IoU overlap - use IoU-based cost (lower is better)
                             ((1.0 - iou) * scale as f32) as i32
+                        } else if centroid_dist < self.config.max_centroid_distance {
+                            // Low IoU but close centroids - use distance-based cost
+                            // Add penalty to prefer IoU matches over distance matches
+                            let normalized_dist = centroid_dist / self.config.max_centroid_distance;
+                            ((normalized_dist + 0.5) * scale as f32) as i32 // Range: 5000-15000
                         } else {
-                            // Distance-based cost normalized to similar range
-                            let normalized_dist =
-                                (centroid_dist / self.config.max_centroid_distance).min(2.0);
-                            (normalized_dist * scale as f32) as i32
+                            // Both IoU and distance too high - don't match
+                            max_cost
                         };
+
+                        // Debug: log first few costs
+                        if det_idx < 2 && track_idx < 2 {
+                            log::debug!(
+                                "      det[{}] vs track[{}]: IoU={:.2}, dist={:.1}px, cost={}",
+                                det_idx,
+                                track_idx,
+                                iou,
+                                centroid_dist,
+                                cost
+                            );
+                        }
 
                         // Place cost in correct position depending on transpose
                         let mut matrix = cost_matrix.lock().unwrap();
@@ -368,14 +388,48 @@ impl MultiObjectTracker {
                         } else {
                             matrix[(det_idx, track_idx)] = cost;
                         }
+                        costs_set.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        class_mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             });
+
+        let costs_set_count = costs_set.load(std::sync::atomic::Ordering::Relaxed);
+        let class_mismatch_count = class_mismatches.load(std::sync::atomic::Ordering::Relaxed);
+
+        log::debug!(
+            "  Cost computation: {} costs set, {} class mismatches (total pairs: {})",
+            costs_set_count,
+            class_mismatch_count,
+            num_detections * num_tracks
+        );
 
         let cost_matrix = cost_matrix.into_inner().unwrap();
 
         // Use Hungarian algorithm for optimal assignment
         let (_total_cost, assignments) = pathfinding::kuhn_munkres::kuhn_munkres(&cost_matrix);
+
+        log::debug!(
+            "  Hungarian: {} rows, {} cols, {} assignments (transpose={})",
+            rows,
+            cols,
+            assignments.len(),
+            transpose
+        );
+
+        // Debug: print cost matrix for first few items
+        if log::log_enabled!(log::Level::Debug) && !self.tracks.is_empty() && !detections.is_empty()
+        {
+            log::debug!("  Cost matrix (first 3x3):");
+            for r in 0..rows.min(3) {
+                let mut row_str = String::new();
+                for c in 0..cols.min(3) {
+                    row_str.push_str(&format!("{:6} ", cost_matrix[(r, c)]));
+                }
+                log::debug!("    [{}]", row_str);
+            }
+        }
 
         // PARALLEL: Filter matches by cost threshold and convert from transpose if needed
         let matches: Vec<(usize, usize)> = assignments
@@ -390,6 +444,13 @@ impl MultiObjectTracker {
 
                 // Check if this is a valid match within bounds
                 if det_idx >= num_detections || track_idx >= num_tracks {
+                    log::debug!(
+                        "    Reject: out of bounds (det={}, track={}, max_det={}, max_track={})",
+                        det_idx,
+                        track_idx,
+                        num_detections,
+                        num_tracks
+                    );
                     return None;
                 }
 
@@ -399,11 +460,23 @@ impl MultiObjectTracker {
                     cost_matrix[(det_idx, track_idx)]
                 };
 
-                // Accept match if cost is reasonable (< 2.0 * scale means distance or IoU based match is valid)
-                // This allows both IoU-based and centroid-distance-based matches
-                if cost < 2 * scale {
+                // Accept match if cost is reasonable (< max_cost)
+                // This filters out dummy assignments and IoU-too-low matches
+                if cost < max_cost {
+                    log::debug!(
+                        "    ✓ Accept: det {} → track {} (cost={})",
+                        det_idx,
+                        track_idx,
+                        cost
+                    );
                     Some((det_idx, track_idx))
                 } else {
+                    log::debug!(
+                        "    ✗ Reject: det {} → track {} (cost={} >= max_cost)",
+                        det_idx,
+                        track_idx,
+                        cost
+                    );
                     None
                 }
             })
@@ -423,15 +496,28 @@ impl MultiObjectTracker {
         // Associate detections to tracks (uses parallel cost matrix computation)
         let matches = self.associate_detections(detections);
 
+        log::debug!(
+            "🔍 Kalman Update: {} detections, {} tracks, {} matches (dt={:.3}s)",
+            detections.len(),
+            self.tracks.len(),
+            matches.len(),
+            dt
+        );
+
         let mut matched_detections = vec![false; detections.len()];
         let mut matched_tracks = vec![false; self.tracks.len()];
 
         // Update matched tracks
         for (det_idx, track_idx) in &matches {
+            let iou = Self::calculate_iou(&detections[*det_idx], &self.tracks[*track_idx]);
+            let dist =
+                Self::calculate_centroid_distance(&detections[*det_idx], &self.tracks[*track_idx]);
             log::debug!(
-                "✓ Matched detection {} → track_id={}",
+                "  ✓ Matched detection {} → track_id={} (IoU={:.2}, dist={:.1}px)",
                 det_idx,
-                self.tracks[*track_idx].track_id
+                self.tracks[*track_idx].track_id,
+                iou,
+                dist
             );
             self.tracks[*track_idx].update(&detections[*det_idx]);
             matched_detections[*det_idx] = true;
@@ -441,11 +527,39 @@ impl MultiObjectTracker {
         // Create new tracks for unmatched detections
         for (det_idx, det) in detections.iter().enumerate() {
             if !matched_detections[det_idx] {
+                // Log why this detection didn't match any existing tracks
+                let mut closest_match_info = String::from("no existing tracks");
+                if !self.tracks.is_empty() {
+                    let mut min_dist = f32::MAX;
+                    let mut best_iou = 0.0f32;
+                    for track in &self.tracks {
+                        if track.class_id == det.class_id {
+                            let iou = Self::calculate_iou(det, track);
+                            let dist = Self::calculate_centroid_distance(det, track);
+                            if dist < min_dist {
+                                min_dist = dist;
+                                best_iou = iou;
+                            }
+                        }
+                    }
+                    if min_dist < f32::MAX {
+                        closest_match_info = format!(
+                            "closest: IoU={:.2}, dist={:.1}px (threshold: IoU>{:.2}, dist<{:.1}px)",
+                            best_iou,
+                            min_dist,
+                            self.config.iou_threshold,
+                            self.config.max_centroid_distance
+                        );
+                    }
+                }
+
                 log::debug!(
-                    "✨ Creating NEW track_id={} for unmatched detection {} (class={})",
+                    "  ✨ NEW track_id={} for detection {} ({}, conf={:.2}) - {}",
                     self.next_track_id,
                     det_idx,
-                    det.class_name
+                    det.class_name,
+                    det.confidence,
+                    closest_match_info
                 );
                 let track = TrackedObject::new(self.next_track_id, det, &self.config);
                 self.tracks.push(track);
