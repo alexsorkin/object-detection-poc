@@ -132,12 +132,18 @@ impl VideoPipeline {
                     match command {
                         TrackerCommand::ProcessOutput(frame_id, timestamp, pipeline_output) => {
                             // Calculate dt from frame timestamp to last processed frame
-                            let dt = timestamp.duration_since(last_frame_timestamp).as_secs_f32()
+                            let dt = timestamp
+                                .duration_since(last_frame_timestamp)
+                                .as_secs_f32()
                                 .max(0.001) // Minimum 1ms to avoid zero dt
-                                .min(0.2);  // Maximum 200ms to avoid huge jumps
-                            
-                            log::debug!("Tracker update: frame_id={}, dt={:.3}s, {} detections", 
-                                frame_id, dt, pipeline_output.detections.len());
+                                .min(0.2); // Maximum 200ms to avoid huge jumps
+
+                            log::debug!(
+                                "Tracker update: frame_id={}, dt={:.3}s, {} detections",
+                                frame_id,
+                                dt,
+                                pipeline_output.detections.len()
+                            );
 
                             let tracked_detections =
                                 tracker.update(&pipeline_output.detections, dt);
@@ -174,12 +180,17 @@ impl VideoPipeline {
                             last_frame_timestamp = timestamp;
                         }
                         TrackerCommand::AdvanceTracks => {
-                            let dt = 0.033; // Assume ~30fps for advance timing
+                            let now = Instant::now();
+
+                            let dt = now
+                                .duration_since(last_frame_timestamp)
+                                .as_secs_f32()
+                                .max(0.001) // Minimum 1ms to avoid zero dt
+                                .min(0.2); // Maximum 200ms to avoid huge jumps
 
                             // Clear and reuse pre-allocated buffer for empty detections
                             empty_detections_buffer.clear();
 
-                            // Update tracker with empty detections to advance predictions
                             let tracked_predictions = tracker.update(&empty_detections_buffer, dt);
 
                             log::debug!(
@@ -219,9 +230,6 @@ impl VideoPipeline {
                             if frames_extrapolated % 50 == 0 {
                                 log::debug!("Dropped frames handled: {}", frames_extrapolated);
                             }
-
-                            // Update timestamp for next frame spacing calculation
-                            last_frame_timestamp = Instant::now();
                         }
                         TrackerCommand::Shutdown => {
                             log::info!("Tracker loop received shutdown command");

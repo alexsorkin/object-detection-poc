@@ -435,11 +435,66 @@ impl UnifiedTracker {
         }
     }
 
-    /// Get current predictions (not directly supported by unified interface)
-    pub fn get_predictions(&self) -> Vec<TileDetection> {
-        // The unified interface doesn't expose direct prediction access
-        // For now, return empty vec. In practice, use update() to get results
-        Vec::new()
+    /// Get predictions from tracker with optional custom detection array
+    /// If None is provided, uses empty detections for pure prediction
+    pub fn get_predictions(
+        &mut self,
+        detection_array: Option<ndarray::Array2<f32>>,
+    ) -> Vec<TileDetection> {
+        let detections = detection_array.unwrap_or_else(|| ndarray::Array2::zeros((0, 5)));
+
+        // Check if we have any tracks to predict from
+        if self.tracker.num_tracklets() == 0 {
+            log::debug!("No tracks available for prediction");
+            return Vec::new();
+        }
+
+        log::debug!(
+            "Getting predictions from {} existing tracks",
+            self.tracker.num_tracklets()
+        );
+
+        // Use the tracker's update method with empty/provided detections
+        // Parameters: (detections, return_all=true, return_indices=false)
+        // return_all=true ensures we get all tracks, including tentative ones
+        match self.tracker.update(detections.view(), true, false) {
+            Ok(tracks) => {
+                if tracks.is_empty() {
+                    log::debug!("Tracker returned no predictions");
+                    return Vec::new();
+                }
+
+                log::debug!("Got {} predictions from tracker", tracks.nrows());
+
+                // Convert tracker output to TileDetection format
+                let mut predictions = tracker_output_to_tile_detection(&tracks);
+
+                // Apply stored metadata to predictions
+                for prediction in &mut predictions {
+                    if let Some(track_id) = prediction.track_id {
+                        if let Some(metadata) = self.track_metadata.get(&track_id) {
+                            prediction.class_id = metadata.class_id;
+                            prediction.class_name = metadata.class_name.clone();
+                            prediction.confidence = metadata.last_confidence;
+
+                            log::debug!(
+                                "Applied metadata to prediction track {}: class={}, confidence={:.3}",
+                                track_id, metadata.class_id, metadata.last_confidence
+                            );
+                        } else {
+                            log::debug!("No metadata found for prediction track {}", track_id);
+                        }
+                    }
+                }
+
+                log::debug!("Returning {} predictions with metadata", predictions.len());
+                predictions
+            }
+            Err(e) => {
+                log::error!("Failed to get predictions from tracker: {:?}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Get number of active tracks

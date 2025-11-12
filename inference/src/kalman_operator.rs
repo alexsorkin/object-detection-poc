@@ -221,7 +221,7 @@ impl KalmanOperator {
                     let detection_array = tile_detection_to_tracker_format(&detections);
 
                     let mut tracker = tracker.lock().unwrap();
-                    match tracker.update(detection_array.view(), false, false) {
+                    match tracker.update(detection_array.view(), true, false) {
                         Ok(tracks) => {
                             // Convert tracking results back to TileDetection format and store
                             let tracked_detections = tracker_output_to_tile_detection(&tracks);
