@@ -71,8 +71,8 @@ impl HungarianSolver {
         // Solve using Hungarian algorithm
         let (total_cost, raw_assignments) = kuhn_munkres(&int_cost_matrix);
 
-        // Parallel processing of assignment results
-        let assignment_data: Vec<Option<(usize, usize)>> = raw_assignments
+        // Process assignment results and filter by threshold
+        let assignments: Vec<(usize, usize)> = raw_assignments
             .par_iter()
             .enumerate()
             .filter_map(|(det_idx, &track_idx)| {
@@ -85,10 +85,7 @@ impl HungarianSolver {
                     None
                 }
             })
-            .map(Some)
             .collect();
-
-        let assignments: Vec<(usize, usize)> = assignment_data.into_iter().flatten().collect();
 
         // Parallel determination of assigned indices
         let assigned_detections: Vec<bool> = (0..num_detections)

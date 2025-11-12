@@ -186,9 +186,10 @@ impl UnifiedTracker {
         self.update_count += 1;
 
         // For real detections (non-empty), purge tracks older than 1 frames
-        if !detections.is_empty() {
+        /*if !detections.is_empty() {
             self.purge_old_tracks(1);
         }
+        */
 
         if detections.is_empty() {
             log::debug!(
@@ -377,20 +378,29 @@ impl UnifiedTracker {
             })
             .collect();
 
-        // Find best matches (sequential, as this needs coordination)
-        let mut best_matches: HashMap<u32, (usize, f32)> =
-            HashMap::with_capacity(tracked_detections.len());
-
-        for iou_match in iou_results {
-            let current_best = best_matches.get(&iou_match.track_id);
-
-            if current_best.map_or(true, |(_, current_iou)| iou_match.iou_score > *current_iou) {
-                best_matches.insert(
-                    iou_match.track_id,
-                    (iou_match.detection_idx, iou_match.iou_score),
-                );
-            }
-        }
+        // Find best matches using parallel grouping and reduction
+        let best_matches: HashMap<u32, (usize, f32)> = iou_results
+            .into_par_iter()
+            .fold(HashMap::<u32, (usize, f32)>::new, |mut acc, iou_match| {
+                let current_best = acc.get(&iou_match.track_id);
+                if current_best.map_or(true, |(_, current_iou)| iou_match.iou_score > *current_iou)
+                {
+                    acc.insert(
+                        iou_match.track_id,
+                        (iou_match.detection_idx, iou_match.iou_score),
+                    );
+                }
+                acc
+            })
+            .reduce(HashMap::<u32, (usize, f32)>::new, |mut acc1, acc2| {
+                for (track_id, (det_idx, iou_score)) in acc2 {
+                    let current_best = acc1.get(&track_id);
+                    if current_best.map_or(true, |(_, current_iou)| iou_score > *current_iou) {
+                        acc1.insert(track_id, (det_idx, iou_score));
+                    }
+                }
+                acc1
+            });
 
         // Update metadata based on best matches
         for (track_id, (det_idx, iou_score)) in best_matches {
@@ -443,10 +453,11 @@ impl UnifiedTracker {
     }
 
     /// Purge tracks older than the specified max age (in frames)
-    fn purge_old_tracks(&mut self, max_age: u32) {
+    fn _purge_old_tracks(&mut self, max_age: u32) {
+        // Parallel filtering to find old tracks
         let old_track_ids: Vec<u32> = self
             .track_ages
-            .iter()
+            .par_iter()
             .filter_map(
                 |(&track_id, &age)| {
                     if age > max_age {
@@ -476,28 +487,46 @@ impl UnifiedTracker {
 
     /// Age all tracks by 1 frame (called when no detections are present)
     fn age_all_tracks(&mut self) {
-        for age in self.track_ages.values_mut() {
-            *age += 1;
-        }
+        // Convert to parallel iterator for aging all tracks
+        let updated_ages: HashMap<u32, u32> = self
+            .track_ages
+            .par_iter()
+            .map(|(&track_id, &age)| (track_id, age + 1))
+            .collect();
+
+        self.track_ages = updated_ages;
     }
 
     /// Update track ages based on current active tracks
     fn update_track_ages(&mut self, active_track_ids: &[u32]) {
-        // Age all tracks by 1 frame
-        for age in self.track_ages.values_mut() {
-            *age += 1;
-        }
+        // Parallel aging of all tracks by 1 frame
+        let mut updated_ages: HashMap<u32, u32> = self
+            .track_ages
+            .par_iter()
+            .map(|(&track_id, &age)| (track_id, age + 1))
+            .collect();
 
-        // Reset age to 0 for tracks that were matched with detections
+        // Sequential update for matched tracks (HashMap mutation not thread-safe)
         for &track_id in active_track_ids {
-            self.track_ages.insert(track_id, 0);
+            updated_ages.insert(track_id, 0);
         }
 
-        // Clean up track ages for tracks that no longer exist
+        // Parallel filtering to keep only existing tracks
         let existing_track_ids: std::collections::HashSet<u32> =
-            active_track_ids.iter().copied().collect();
-        self.track_ages
-            .retain(|track_id, _| existing_track_ids.contains(track_id));
+            active_track_ids.par_iter().copied().collect();
+
+        let filtered_ages: HashMap<u32, u32> = updated_ages
+            .par_iter()
+            .filter_map(|(&track_id, &age)| {
+                if existing_track_ids.contains(&track_id) {
+                    Some((track_id, age))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.track_ages = filtered_ages;
     }
 }
 

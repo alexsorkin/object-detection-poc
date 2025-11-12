@@ -120,8 +120,8 @@ impl VideoPipeline {
             "Unified tracker loop started with {} tracker",
             tracker.method()
         );
-        let mut last_process_time = Instant::now();
         let mut frames_extrapolated = 0_u64;
+        let mut last_frame_timestamp = Instant::now();
 
         // Pre-allocated buffers for better runtime performance
         let mut empty_detections_buffer = Vec::<TileDetection>::new();
@@ -131,8 +131,13 @@ impl VideoPipeline {
                 Ok(command) => {
                     match command {
                         TrackerCommand::ProcessOutput(frame_id, timestamp, pipeline_output) => {
-                            let now = Instant::now();
-                            let dt = now.duration_since(last_process_time).as_secs_f32();
+                            // Calculate dt from frame timestamp to last processed frame
+                            let dt = timestamp.duration_since(last_frame_timestamp).as_secs_f32()
+                                .max(0.001) // Minimum 1ms to avoid zero dt
+                                .min(0.2);  // Maximum 200ms to avoid huge jumps
+                            
+                            log::debug!("Tracker update: frame_id={}, dt={:.3}s, {} detections", 
+                                frame_id, dt, pipeline_output.detections.len());
 
                             let tracked_detections =
                                 tracker.update(&pipeline_output.detections, dt);
@@ -166,7 +171,7 @@ impl VideoPipeline {
                                 tracker.num_tracks()
                             );
 
-                            last_process_time = now;
+                            last_frame_timestamp = timestamp;
                         }
                         TrackerCommand::AdvanceTracks => {
                             let dt = 0.033; // Assume ~30fps for advance timing
@@ -183,7 +188,30 @@ impl VideoPipeline {
                                 dt
                             );
 
-                            log::warn!("Advancing trackers for dropped frame (pipeline busy)");
+                            // CREATE A RESULT WITH THE KALMAN/BYTETRACK PREDICTIONS!
+                            let result = FrameResult {
+                                frame_id: frames_extrapolated, // Use extrapolation count as frame ID
+                                timestamp: Instant::now(),
+                                detections: tracked_predictions, // Use the predictions!
+                                is_extrapolated: true,           // Mark as extrapolated
+                                processing_time_ms: 0.0,         // No detection processing
+                                latency_ms: 0.0,                 // Instant extrapolation
+                                duplicates_removed: 0,
+                                nested_removed: 0,
+                            };
+
+                            // SEND THE PREDICTED TRACKS TO THE RESULT CHANNEL
+                            let num_predictions = result.detections.len();
+                            if let Err(e) = result_tx.try_send(result) {
+                                log::warn!("Failed to send extrapolated result: {}", e);
+                            } else {
+                                log::debug!(
+                                    "Sent {} predicted tracks as extrapolated result",
+                                    num_predictions
+                                );
+                            }
+
+                            //log::warn!("Advancing trackers for dropped frame (pipeline busy)");
 
                             frames_extrapolated += 1;
 
@@ -192,7 +220,8 @@ impl VideoPipeline {
                                 log::debug!("Dropped frames handled: {}", frames_extrapolated);
                             }
 
-                            last_process_time = Instant::now();
+                            // Update timestamp for next frame spacing calculation
+                            last_frame_timestamp = Instant::now();
                         }
                         TrackerCommand::Shutdown => {
                             log::info!("Tracker loop received shutdown command");
