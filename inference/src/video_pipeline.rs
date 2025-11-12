@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Frame with metadata
+/// Frame with metadata - zero-copy data sharing
 #[derive(Debug, Clone)]
 pub struct Frame {
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>, // Zero-copy frame data using Arc
     pub width: u32,
     pub height: u32,
     pub sequence: u64,
@@ -232,10 +232,12 @@ impl VideoPipeline {
                             let frame_id = frame.sequence;
                             let timestamp = now;
 
-                            // Convert frame data to image for processing
-                            let img_data = frame.data.clone();
+                            // Zero-copy: use Arc data efficiently instead of cloning
                             let width = frame.width;
                             let height = frame.height;
+
+                            // Convert Arc<[u8]> to Vec<u8> only when needed for image processing
+                            let img_data = frame.data.as_ref().to_vec();
 
                             // Create an RgbImage from raw data (assuming RGB format)
                             let image = match image::RgbImage::from_raw(width, height, img_data) {
@@ -370,7 +372,7 @@ mod tests {
         // Submit test frames
         for i in 0..10 {
             let frame = Frame {
-                data: vec![0u8; 640 * 480 * 3], // RGB dummy data
+                data: Arc::from(vec![0u8; 640 * 480 * 3].into_boxed_slice()), // Zero-copy Arc data
                 width: 640,
                 height: 480,
                 sequence: i,

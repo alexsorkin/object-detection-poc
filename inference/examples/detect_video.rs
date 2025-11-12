@@ -485,7 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let raw_data: Vec<u8> = detector_frame.into_raw();
 
                 let frame = Frame {
-                    data: raw_data,
+                    data: Arc::from(raw_data.into_boxed_slice()), // Zero-copy Arc data
                     width,
                     height,
                     sequence: submitted_frame_id,

@@ -128,8 +128,14 @@ let rt_pipeline = RealtimePipeline::new(pipeline, rt_config);
 
 // Process video
 for frame_id in 0.. {
-    let frame = capture_frame()?;
-    if !rt_pipeline.submit_frame(Frame { frame_id, image: frame, timestamp: Instant::now() }) {
+    let image_data = capture_frame()?; // Assume this returns Vec<u8>
+    let frame = Frame {
+        data: Arc::from(image_data.into_boxed_slice()),
+        width: 640,
+        height: 480,
+        sequence: frame_id,
+    };
+    if !rt_pipeline.submit_frame(frame) {
         // Frame was dropped due to backpressure, advance tracker
         rt_pipeline.advance_tracks();
     }
