@@ -5,6 +5,7 @@ use crate::frame_pipeline::{DetectionPipeline, PipelineOutput, TileDetection};
 /// - Async frame detection with backpressure
 /// - Multiple tracking algorithms (Kalman filter or ByteTrack)
 /// - Extrapolation when detection latency is high
+/// - Pre-allocated buffers for optimal runtime performance
 use crate::tracking::{TrackingConfig, UnifiedTracker};
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 
@@ -38,6 +39,12 @@ pub struct FrameResult {
 #[derive(Debug)]
 enum WorkerCommand {
     ProcessFrame(Frame),
+    Shutdown,
+}
+
+/// Internal tracker commands
+enum TrackerCommand {
+    ProcessOutput(u64, Instant, PipelineOutput),
     AdvanceTracks,
     Shutdown,
 }
@@ -67,83 +74,68 @@ impl Default for VideoPipelineConfig {
 /// - Non-blocking shutdown attempts
 pub struct VideoPipeline {
     command_tx: Sender<WorkerCommand>,
-    dropped_tx: Sender<WorkerCommand>,
+    tracker_tx: Sender<TrackerCommand>,
     result_rx: Receiver<FrameResult>,
-    shutdown_tx: Sender<()>,
     _worker_handle: thread::JoinHandle<()>,
-    _dropped_handle: thread::JoinHandle<()>,
-    _detection_handle: thread::JoinHandle<()>,
+    _tracker_handle: thread::JoinHandle<()>,
 }
 
 impl VideoPipeline {
     /// Create new video processing pipeline
     pub fn new(detection_pipeline: Arc<DetectionPipeline>, config: VideoPipelineConfig) -> Self {
         let (command_tx, command_rx) = bounded::<WorkerCommand>(config.buffer_size);
-        let (dropped_tx, dropped_rx) = unbounded::<WorkerCommand>();
+        let (tracker_tx, tracker_rx) = unbounded::<TrackerCommand>();
 
         let (result_tx, result_rx) = unbounded::<FrameResult>();
-        let (output_tx, output_rx) = unbounded::<(u64, Instant, PipelineOutput)>();
-
-        // Shutdown channels
-        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
-        let shutdown_rx_detection = shutdown_rx.clone();
-        let shutdown_rx_dropped = shutdown_rx.clone();
 
         let tracker = UnifiedTracker::new(config.tracking_config);
         let detector = Arc::clone(&detection_pipeline);
 
-        // Start output loop thread with tracker - it sends results directly to result_tx
-        let result_tx_clone = result_tx.clone();
-        let tracker_det_clone = tracker.clone();
-        let detection_handle = thread::spawn(move || {
-            Self::output_loop(
-                output_rx,
-                result_tx_clone,
-                tracker_det_clone,
-                shutdown_rx_detection,
-            );
+        // Start unified tracker loop thread - handles both detection results and advance tracks
+        let tracker_handle = thread::spawn(move || {
+            Self::tracker_loop(tracker_rx, result_tx, tracker);
         });
 
-        // Start dedicated dropped frames loop
-        let tracker_drop_clone = tracker.clone();
-        let dropped_handle = thread::spawn(move || {
-            Self::dropped_frames_loop(dropped_rx, tracker_drop_clone, shutdown_rx_dropped);
-        });
-
+        let tracker_tx_worker = tracker_tx.clone();
         let worker_handle = thread::spawn(move || {
-            Self::worker_loop(command_rx, detector, output_tx, shutdown_rx);
+            Self::worker_loop(command_rx, detector, tracker_tx_worker);
         });
 
         Self {
             command_tx,
-            dropped_tx,
+            tracker_tx,
             result_rx,
-            shutdown_tx,
             _worker_handle: worker_handle,
-            _dropped_handle: dropped_handle,
-            _detection_handle: detection_handle,
+            _tracker_handle: tracker_handle,
         }
     }
 
-    /// Output loop: processes detection outputs and advance track commands
-    fn output_loop(
-        output_rx: Receiver<(u64, Instant, PipelineOutput)>,
+    /// Unified tracker loop: handles both detection outputs and advance track commands
+    fn tracker_loop(
+        tracker_rx: Receiver<TrackerCommand>,
         result_tx: Sender<FrameResult>,
         mut tracker: UnifiedTracker,
-        shutdown_rx: Receiver<()>,
     ) {
-        log::info!("Output loop started with {} tracker", tracker.method());
+        log::info!(
+            "Unified tracker loop started with {} tracker",
+            tracker.method()
+        );
         let mut last_process_time = Instant::now();
+        let mut frames_extrapolated = 0_u64;
+
+        // Pre-allocated buffers for better runtime performance
+        let mut empty_detections_buffer = Vec::<TileDetection>::new();
 
         loop {
-            crossbeam::select! {
-                recv(output_rx) -> msg => {
-                    match msg {
-                        Ok((frame_id, timestamp, pipeline_output)) => {
+            match tracker_rx.recv() {
+                Ok(command) => {
+                    match command {
+                        TrackerCommand::ProcessOutput(frame_id, timestamp, pipeline_output) => {
                             let now = Instant::now();
                             let dt = now.duration_since(last_process_time).as_secs_f32();
 
-                            let tracked_detections = tracker.update(&pipeline_output.detections, dt);
+                            let tracked_detections =
+                                tracker.update(&pipeline_output.detections, dt);
 
                             // Create frame result with extracted diagnostics
                             let result = FrameResult {
@@ -176,82 +168,47 @@ impl VideoPipeline {
 
                             last_process_time = now;
                         }
-                        Err(_) => {
-                            log::info!("Detection output channel closed");
-                            break;
-                        }
-                    }
-                }
-                recv(shutdown_rx) -> _ => {
-                    log::info!("Output loop received shutdown signal");
-                    break;
-                }
-            }
-        }
+                        TrackerCommand::AdvanceTracks => {
+                            let dt = 0.033; // Assume ~30fps for advance timing
 
-        log::info!("Output loop stopped");
-    }
+                            // Clear and reuse pre-allocated buffer for empty detections
+                            empty_detections_buffer.clear();
 
-    /// Dropped frames loop: handles advancing tracks for dropped frames
-    fn dropped_frames_loop(
-        dropped_rx: Receiver<WorkerCommand>,
-        mut tracker: UnifiedTracker,
-        shutdown_rx: Receiver<()>,
-    ) {
-        log::info!("Dropped frames loop started");
-        let mut frames_extrapolated = 0_u64;
+                            // Update tracker with empty detections to advance predictions
+                            let tracked_predictions = tracker.update(&empty_detections_buffer, dt);
 
-        loop {
-            crossbeam::select! {
-                recv(dropped_rx) -> msg => {
-                    match msg {
-                        Ok(command) => {
-                            match command {
-                                WorkerCommand::AdvanceTracks => {
-                                    let dt = 0.033; // Assume ~30fps for advance timing
+                            log::debug!(
+                                "Advanced tracks: {} predictions, dt={:.3}s",
+                                tracked_predictions.len(),
+                                dt
+                            );
 
-                                    // Update tracker with empty detections to advance predictions
-                                    let tracked_predictions = tracker.update(&[], dt);
+                            log::warn!("Advancing trackers for dropped frame (pipeline busy)");
 
-                                    log::debug!(
-                                        "Advanced tracks: {} predictions, dt={:.3}s",
-                                        tracked_predictions.len(),
-                                        dt
-                                    );
+                            frames_extrapolated += 1;
 
-                                    log::warn!("Advancing trackers for dropped frame (pipeline busy)");
-
-                                    frames_extrapolated += 1;
-
-                                    // Log statistics every 50 dropped frames
-                                    if frames_extrapolated % 50 == 0 {
-                                        log::debug!("Dropped frames handled: {}", frames_extrapolated);
-                                    }
-                                }
-                                WorkerCommand::ProcessFrame(_) => {
-                                    log::warn!("Received ProcessFrame command in dropped frames loop - ignoring");
-                                }
-                                WorkerCommand::Shutdown => {
-                                    log::info!("Dropped frames loop received shutdown command");
-                                    break;
-                                }
+                            // Log statistics every 50 dropped frames
+                            if frames_extrapolated % 50 == 0 {
+                                log::debug!("Dropped frames handled: {}", frames_extrapolated);
                             }
+
+                            last_process_time = Instant::now();
                         }
-                        Err(_) => {
-                            log::info!("Dropped frame command channel closed");
+                        TrackerCommand::Shutdown => {
+                            log::info!("Tracker loop received shutdown command");
                             break;
                         }
                     }
                 }
-                recv(shutdown_rx) -> _ => {
-                    log::info!("Dropped frames loop received shutdown signal");
+                Err(_) => {
+                    log::info!("Tracker command channel closed");
                     break;
                 }
             }
         }
 
         log::info!(
-            "Dropped frames loop stopped (total extrapolated: {})",
+            "Unified tracker loop stopped (total extrapolated: {})",
             frames_extrapolated
         );
     }
@@ -260,75 +217,71 @@ impl VideoPipeline {
     fn worker_loop(
         command_rx: Receiver<WorkerCommand>,
         detector: Arc<DetectionPipeline>,
-        output_tx: Sender<(u64, Instant, PipelineOutput)>,
-        shutdown_rx: Receiver<()>,
+        tracker_tx: Sender<TrackerCommand>,
     ) {
         let mut frames_processed = 0_u64;
 
         log::info!("Video pipeline worker started");
 
         loop {
-            crossbeam::select! {
-                recv(command_rx) -> msg => {
-                    match msg {
-                        Ok(command) => {
-                            match command {
-                                WorkerCommand::ProcessFrame(frame) => {
-                                    let now = Instant::now();
-                                    let frame_id = frame.sequence;
-                                    let timestamp = now;
+            match command_rx.recv() {
+                Ok(command) => {
+                    match command {
+                        WorkerCommand::ProcessFrame(frame) => {
+                            let now = Instant::now();
+                            let frame_id = frame.sequence;
+                            let timestamp = now;
 
-                                    // Convert frame data to image for processing
-                                    let img_data = frame.data.clone();
-                                    let width = frame.width;
-                                    let height = frame.height;
+                            // Convert frame data to image for processing
+                            let img_data = frame.data.clone();
+                            let width = frame.width;
+                            let height = frame.height;
 
-                                    // Create an RgbImage from raw data (assuming RGB format)
-                                    let image = match image::RgbImage::from_raw(width, height, img_data) {
-                                        Some(img) => img,
-                                        None => {
-                                            log::error!("Failed to create image from frame data");
-                                            continue;
-                                        }
-                                    };
+                            // Create an RgbImage from raw data (assuming RGB format)
+                            let image = match image::RgbImage::from_raw(width, height, img_data) {
+                                Some(img) => img,
+                                None => {
+                                    log::error!("Failed to create image from frame data");
+                                    continue;
+                                }
+                            };
 
-                                    // Trigger detection with callback that sends to output loop
-                                    let output_tx_clone = output_tx.clone();
-                                    detector.process_with_callback(&image, move |output: &PipelineOutput| {
-                                        // Send frame context and pipeline output to output loop
-                                        if let Err(e) = output_tx_clone.try_send((frame_id, timestamp, output.clone()))
-                                        {
-                                            log::warn!("Failed to send detection output: {}", e);
-                                        }
-                                    });
-
-                                    frames_processed += 1;
-
-                                    // Log statistics every 100 frames
-                                    if frames_processed % 100 == 0 {
-                                        log::info!(
-                                            "Worker pipeline stats: {} frames processed",
-                                            frames_processed
-                                        );
+                            // Trigger detection with callback that sends to tracker loop
+                            let tracker_tx_clone = tracker_tx.clone();
+                            detector.process_with_callback(
+                                &image,
+                                move |output: &PipelineOutput| {
+                                    // Send frame context and pipeline output to tracker loop
+                                    if let Err(e) =
+                                        tracker_tx_clone.try_send(TrackerCommand::ProcessOutput(
+                                            frame_id,
+                                            timestamp,
+                                            output.clone(),
+                                        ))
+                                    {
+                                        log::warn!("Failed to send detection output: {}", e);
                                     }
-                                }
-                                WorkerCommand::AdvanceTracks => {
-                                    log::warn!("Received AdvanceTracks command in worker loop - should go to dropped frames loop");
-                                }
-                                WorkerCommand::Shutdown => {
-                                    log::info!("Worker loop received shutdown command");
-                                    break;
-                                }
+                                },
+                            );
+
+                            frames_processed += 1;
+
+                            // Log statistics every 100 frames
+                            if frames_processed % 100 == 0 {
+                                log::info!(
+                                    "Worker pipeline stats: {} frames processed",
+                                    frames_processed
+                                );
                             }
                         }
-                        Err(_) => {
-                            log::info!("Command channel closed");
+                        WorkerCommand::Shutdown => {
+                            log::info!("Worker loop received shutdown command");
                             break;
                         }
                     }
                 }
-                recv(shutdown_rx) -> _ => {
-                    log::info!("Worker loop received shutdown signal");
+                Err(_) => {
+                    log::info!("Command channel closed");
                     break;
                 }
             }
@@ -337,38 +290,24 @@ impl VideoPipeline {
         log::info!("Video processor pipeline stopped");
     }
 
-    /// Submit frame for processing
-    pub fn submit_frame(&self, frame: Frame) -> Result<(), String> {
-        self.command_tx
-            .send(WorkerCommand::ProcessFrame(frame))
-            .map_err(|e| format!("Failed to submit frame: {}", e))
-    }
-
-    /// Try to submit frame (non-blocking, returns false if buffer full)
-    pub fn try_submit_frame(&self, frame: Frame) -> bool {
+    /// Submit frame for processing (non-blocking, returns false if buffer full)
+    pub fn submit_frame(&self, frame: Frame) -> bool {
         self.command_tx
             .try_send(WorkerCommand::ProcessFrame(frame))
             .is_ok()
     }
 
-    /// Get next result (blocking)
-    pub fn get_result(&self) -> Result<FrameResult, String> {
-        self.result_rx
-            .recv()
-            .map_err(|e| format!("Failed to receive result: {}", e))
-    }
-
-    /// Try to get next result (non-blocking)
-    pub fn try_get_result(&self) -> Option<FrameResult> {
+    /// Get next result (non-blocking)
+    pub fn get_result(&self) -> Option<FrameResult> {
         self.result_rx.try_recv().ok()
     }
 
     /// Advance tracker predictions for dropped frames (async, non-blocking)
     /// This advances the tracker's motion models without processing a frame
     pub fn advance_tracks(&self) -> bool {
-        // Send a command to advance tracker predictions to the dedicated dropped frames loop
-        self.dropped_tx
-            .try_send(WorkerCommand::AdvanceTracks)
+        // Send a command to advance tracker predictions to the unified tracker loop
+        self.tracker_tx
+            .try_send(TrackerCommand::AdvanceTracks)
             .is_ok()
     }
 
@@ -380,11 +319,8 @@ impl VideoPipeline {
         // Send shutdown command to worker
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
 
-        // Send shutdown command to dropped frame loop
-        let _ = self.dropped_tx.send(WorkerCommand::Shutdown);
-
-        // Send shutdown signal to all threads
-        let _ = self.shutdown_tx.send(());
+        // Send shutdown command to tracker loop
+        let _ = self.tracker_tx.send(TrackerCommand::Shutdown);
     }
 }
 
@@ -392,10 +328,9 @@ impl Drop for VideoPipeline {
     fn drop(&mut self) {
         log::warn!("VideoPipeline dropping - shutting down threads");
 
-        // Send shutdown signals
+        // Send shutdown signals using poison pill pattern
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
-        let _ = self.dropped_tx.send(WorkerCommand::Shutdown);
-        let _ = self.shutdown_tx.send(());
+        let _ = self.tracker_tx.send(TrackerCommand::Shutdown);
 
         // Give threads a moment to shutdown gracefully
         std::thread::sleep(Duration::from_millis(100));
@@ -440,12 +375,12 @@ mod tests {
                 height: 480,
                 sequence: i,
             };
-            video_pipeline.submit_frame(frame).unwrap();
+            assert!(video_pipeline.submit_frame(frame), "Failed to submit frame");
         }
 
         // Get results
         for i in 0..10 {
-            let result = video_pipeline.get_result().unwrap();
+            let result = video_pipeline.get_result().expect("Should have result");
             println!(
                 "Frame {}: {} detections, extrapolated: {}",
                 result.frame_id,

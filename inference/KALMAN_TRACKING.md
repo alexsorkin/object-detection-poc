@@ -69,9 +69,10 @@ let rt_pipeline = RealtimePipeline::new(pipeline, rt_config);
 rt_pipeline.submit_frame(frame)?;
 
 // Get results (real or extrapolated)
-let result = rt_pipeline.get_result()?;
-if result.is_extrapolated {
-    println!("Kalman prediction");
+if let Some(result) = rt_pipeline.get_result() {
+    if result.is_extrapolated {
+        println!("Kalman prediction");
+    } else {
 } else {
     println!("Real detection");
 }
@@ -128,9 +129,12 @@ let rt_pipeline = RealtimePipeline::new(pipeline, rt_config);
 // Process video
 for frame_id in 0.. {
     let frame = capture_frame()?;
-    rt_pipeline.submit_frame(Frame { frame_id, image: frame, timestamp: Instant::now() })?;
+    if !rt_pipeline.submit_frame(Frame { frame_id, image: frame, timestamp: Instant::now() }) {
+        // Frame was dropped due to backpressure, advance tracker
+        rt_pipeline.advance_tracks();
+    }
     
-    if let Some(result) = rt_pipeline.try_get_result() {
+    if let Some(result) = rt_pipeline.get_result() {
         visualize(result.detections, result.is_extrapolated);
     }
 }

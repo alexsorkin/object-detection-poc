@@ -491,9 +491,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sequence: submitted_frame_id,
                 };
 
-                // try_submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
+                // submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
-                if video_pipeline_for_detector.try_submit_frame(frame) {
+                if video_pipeline_for_detector.submit_frame(frame) {
                     log::debug!("Submitted frame {} for detect", submitted_frame_id);
                     submitted_frame_id += 1;
                 } else {
@@ -534,28 +534,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Non-blocking check for results
-            if let Some(result) = video_pipeline_for_results.try_get_result() {
-                // Update stats
-                if result.is_extrapolated {
-                    let new_extrapolated =
-                        stats_extrapolated_for_results.fetch_add(1, Ordering::Relaxed) + 1;
-                    log::debug!(
-                        "Got extrapolated result, total extrapolated: {}",
-                        new_extrapolated
-                    );
-                } else {
-                    let new_processed =
-                        stats_processed_for_results.fetch_add(1, Ordering::Relaxed) + 1;
-                    log::debug!("Got processed result, total processed: {}", new_processed);
-                }
-                stats_latency_for_results.fetch_add(result.latency_ms as u32, Ordering::Relaxed);
+            match video_pipeline_for_results.get_result() {
+                Some(result) => {
+                    // Update stats
+                    if result.is_extrapolated {
+                        let new_extrapolated =
+                            stats_extrapolated_for_results.fetch_add(1, Ordering::Relaxed) + 1;
+                        log::debug!(
+                            "Got extrapolated result, total extrapolated: {}",
+                            new_extrapolated
+                        );
+                    } else {
+                        let new_processed =
+                            stats_processed_for_results.fetch_add(1, Ordering::Relaxed) + 1;
+                        log::debug!("Got processed result, total processed: {}", new_processed);
+                    }
+                    stats_latency_for_results
+                        .fetch_add(result.latency_ms as u32, Ordering::Relaxed);
 
-                // Send tracker predictions to main thread (non-blocking)
-                let _ = predictions_tx.try_send(result.detections);
+                    // Send tracker predictions to main thread (non-blocking)
+                    let _ = predictions_tx.try_send(result.detections);
+                }
+                None => {
+                    // No result available yet
+                }
             }
 
             // Small sleep to avoid busy loop
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(10));
         }
     });
 

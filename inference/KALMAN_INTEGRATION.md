@@ -136,7 +136,7 @@ let mut kalman_tracker = MultiObjectTracker::new(KalmanConfig::default());
 
 loop {
     // 1. Get results from detection pipeline
-    while let Some(result) = rt_pipeline.try_get_result() {
+    while let Some(result) = rt_pipeline.get_result() {
         if !result.is_extrapolated {
             // Update Kalman with real detections (synchronous)
             let dt = frame_start.duration_since(last_kalman_update).as_secs_f32();
@@ -147,7 +147,7 @@ loop {
 
     // 2. Submit detection every 40th frame
     if frame_id % 40 == 0 && pending_count < max_pending {
-        rt_pipeline.try_submit_frame(frame);
+        rt_pipeline.submit_frame(frame);
     }
 
     // 3. Get Kalman predictions for display (synchronous)
