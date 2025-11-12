@@ -302,7 +302,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let video_config = VideoPipelineConfig {
-        max_latency_ms: 500,
         tracking_config,
         buffer_size,
     };

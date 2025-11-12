@@ -6,7 +6,7 @@ use crate::frame_pipeline::{DetectionPipeline, PipelineOutput, TileDetection};
 /// - Multiple tracking algorithms (Kalman filter or ByteTrack)
 /// - Extrapolation when detection latency is high
 use crate::tracking::{TrackingConfig, UnifiedTracker};
-use crossbeam::channel::{bounded, Receiver, Sender};
+use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 
 use std::sync::Arc;
 use std::thread;
@@ -38,20 +38,12 @@ pub struct FrameResult {
 #[derive(Debug)]
 enum WorkerCommand {
     ProcessFrame(Frame),
-    Shutdown,
-}
-
-/// Internal dropped frames commands
-#[derive(Debug)]
-enum DroppedFrameCommand {
     AdvanceTracks,
     Shutdown,
 }
 
 /// Video pipeline configuration
 pub struct VideoPipelineConfig {
-    /// Maximum latency before switching to extrapolation-only mode (ms)
-    pub max_latency_ms: u64,
     /// Tracking configuration (Kalman or ByteTrack)
     pub tracking_config: TrackingConfig,
     /// Frame buffer size (number of frames to queue)
@@ -61,7 +53,6 @@ pub struct VideoPipelineConfig {
 impl Default for VideoPipelineConfig {
     fn default() -> Self {
         Self {
-            max_latency_ms: 500,
             tracking_config: TrackingConfig::default(),
             buffer_size: 2,
         }
@@ -76,7 +67,7 @@ impl Default for VideoPipelineConfig {
 /// - Non-blocking shutdown attempts
 pub struct VideoPipeline {
     command_tx: Sender<WorkerCommand>,
-    dropped_tx: Sender<DroppedFrameCommand>,
+    dropped_tx: Sender<WorkerCommand>,
     result_rx: Receiver<FrameResult>,
     shutdown_tx: Sender<()>,
     _worker_handle: thread::JoinHandle<()>,
@@ -88,10 +79,10 @@ impl VideoPipeline {
     /// Create new video processing pipeline
     pub fn new(detection_pipeline: Arc<DetectionPipeline>, config: VideoPipelineConfig) -> Self {
         let (command_tx, command_rx) = bounded::<WorkerCommand>(config.buffer_size);
+        let (dropped_tx, dropped_rx) = unbounded::<WorkerCommand>();
 
-        let (dropped_tx, dropped_rx) = bounded::<DroppedFrameCommand>(1);
-        let (result_tx, result_rx) = bounded::<FrameResult>(1);
-        let (output_tx, output_rx) = bounded::<(u64, Instant, PipelineOutput)>(1);
+        let (result_tx, result_rx) = unbounded::<FrameResult>();
+        let (output_tx, output_rx) = unbounded::<(u64, Instant, PipelineOutput)>();
 
         // Shutdown channels
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
@@ -100,7 +91,6 @@ impl VideoPipeline {
 
         let tracker = UnifiedTracker::new(config.tracking_config);
         let detector = Arc::clone(&detection_pipeline);
-        let max_latency = Duration::from_millis(config.max_latency_ms);
 
         // Start output loop thread with tracker - it sends results directly to result_tx
         let result_tx_clone = result_tx.clone();
@@ -121,7 +111,7 @@ impl VideoPipeline {
         });
 
         let worker_handle = thread::spawn(move || {
-            Self::worker_loop(command_rx, detector, output_tx, max_latency, shutdown_rx);
+            Self::worker_loop(command_rx, detector, output_tx, shutdown_rx);
         });
 
         Self {
@@ -204,7 +194,7 @@ impl VideoPipeline {
 
     /// Dropped frames loop: handles advancing tracks for dropped frames
     fn dropped_frames_loop(
-        dropped_rx: Receiver<DroppedFrameCommand>,
+        dropped_rx: Receiver<WorkerCommand>,
         mut tracker: UnifiedTracker,
         shutdown_rx: Receiver<()>,
     ) {
@@ -217,10 +207,8 @@ impl VideoPipeline {
                     match msg {
                         Ok(command) => {
                             match command {
-                                DroppedFrameCommand::AdvanceTracks => {
-                                    let now = Instant::now();
-                                    let timestamp = Instant::now();
-                                    let dt = now.duration_since(timestamp).as_secs_f32();
+                                WorkerCommand::AdvanceTracks => {
+                                    let dt = 0.033; // Assume ~30fps for advance timing
 
                                     // Update tracker with empty detections to advance predictions
                                     let tracked_predictions = tracker.update(&[], dt);
@@ -240,7 +228,10 @@ impl VideoPipeline {
                                         log::debug!("Dropped frames handled: {}", frames_extrapolated);
                                     }
                                 }
-                                DroppedFrameCommand::Shutdown => {
+                                WorkerCommand::ProcessFrame(_) => {
+                                    log::warn!("Received ProcessFrame command in dropped frames loop - ignoring");
+                                }
+                                WorkerCommand::Shutdown => {
                                     log::info!("Dropped frames loop received shutdown command");
                                     break;
                                 }
@@ -270,7 +261,6 @@ impl VideoPipeline {
         command_rx: Receiver<WorkerCommand>,
         detector: Arc<DetectionPipeline>,
         output_tx: Sender<(u64, Instant, PipelineOutput)>,
-        _max_latency: Duration,
         shutdown_rx: Receiver<()>,
     ) {
         let mut frames_processed = 0_u64;
@@ -322,6 +312,9 @@ impl VideoPipeline {
                                         );
                                     }
                                 }
+                                WorkerCommand::AdvanceTracks => {
+                                    log::warn!("Received AdvanceTracks command in worker loop - should go to dropped frames loop");
+                                }
                                 WorkerCommand::Shutdown => {
                                     log::info!("Worker loop received shutdown command");
                                     break;
@@ -370,19 +363,12 @@ impl VideoPipeline {
         self.result_rx.try_recv().ok()
     }
 
-    /// Get result with timeout
-    pub fn get_result_timeout(&self, timeout: Duration) -> Result<FrameResult, String> {
-        self.result_rx
-            .recv_timeout(timeout)
-            .map_err(|e| format!("Timeout waiting for result: {}", e))
-    }
-
     /// Advance tracker predictions for dropped frames (async, non-blocking)
     /// This advances the tracker's motion models without processing a frame
     pub fn advance_tracks(&self) -> bool {
         // Send a command to advance tracker predictions to the dedicated dropped frames loop
         self.dropped_tx
-            .try_send(DroppedFrameCommand::AdvanceTracks)
+            .try_send(WorkerCommand::AdvanceTracks)
             .is_ok()
     }
 
@@ -395,32 +381,10 @@ impl VideoPipeline {
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
 
         // Send shutdown command to dropped frame loop
-        let _ = self.dropped_tx.send(DroppedFrameCommand::Shutdown);
+        let _ = self.dropped_tx.send(WorkerCommand::Shutdown);
 
         // Send shutdown signal to all threads
         let _ = self.shutdown_tx.send(());
-    }
-
-    /// Try to shutdown the pipeline (non-blocking)
-    pub fn try_shutdown(&self) -> bool {
-        log::debug!("Attempting non-blocking video pipeline shutdown");
-
-        // Try to send shutdown command to worker
-        if self.command_tx.try_send(WorkerCommand::Shutdown).is_err() {
-            return false;
-        }
-
-        // Try to send shutdown command to dropped frame loop
-        if self
-            .dropped_tx
-            .try_send(DroppedFrameCommand::Shutdown)
-            .is_err()
-        {
-            return false;
-        }
-
-        // Try to send shutdown signal
-        self.shutdown_tx.try_send(()).is_ok()
     }
 }
 
@@ -430,7 +394,7 @@ impl Drop for VideoPipeline {
 
         // Send shutdown signals
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
-        let _ = self.dropped_tx.send(DroppedFrameCommand::Shutdown);
+        let _ = self.dropped_tx.send(WorkerCommand::Shutdown);
         let _ = self.shutdown_tx.send(());
 
         // Give threads a moment to shutdown gracefully
@@ -481,9 +445,7 @@ mod tests {
 
         // Get results
         for i in 0..10 {
-            let result = video_pipeline
-                .get_result_timeout(Duration::from_secs(5))
-                .unwrap();
+            let result = video_pipeline.get_result().unwrap();
             println!(
                 "Frame {}: {} detections, extrapolated: {}",
                 result.frame_id,
