@@ -273,7 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Create video pipeline with selected tracker
-    let buffer_size = 1; // Tiny buffer - only allow 1 frame queued max
+    let buffer_size = 1; // Tiny buffer - only allow 2 frames queued max
 
     // Configure tracking based on selected method
     let tracking_config = match tracking_method {
@@ -465,7 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // If we already have a frame, the previous one becomes a dropped frame
                 if latest_detector_frame.is_some() {
                     // Advance tracker for the dropped frame (async, non-blocking)
-                    let _ = video_pipeline_for_detector.advance_tracks();
+                    video_pipeline_for_detector.advance_tracks();
                     log::warn!("Advanced tracker for dropped frame (rt fps missed)");
                 }
 
@@ -498,7 +498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("Submitted frame {} for detect", submitted_frame_id);
                     submitted_frame_id += 1;
                 } else {
-                    let _ = video_pipeline_for_detector.advance_tracks();
+                    video_pipeline_for_detector.advance_tracks();
                 }
             }
 

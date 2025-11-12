@@ -6,7 +6,7 @@ use crate::frame_pipeline::{DetectionPipeline, PipelineOutput, TileDetection};
 /// - Multiple tracking algorithms (Kalman filter or ByteTrack)
 /// - Extrapolation when detection latency is high
 use crate::tracking::{TrackingConfig, UnifiedTracker};
-use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam::channel::{bounded, Receiver, Sender};
 
 use std::sync::Arc;
 use std::thread;
@@ -89,9 +89,9 @@ impl VideoPipeline {
     pub fn new(detection_pipeline: Arc<DetectionPipeline>, config: VideoPipelineConfig) -> Self {
         let (command_tx, command_rx) = bounded::<WorkerCommand>(config.buffer_size);
 
-        let (dropped_tx, dropped_rx) = unbounded::<DroppedFrameCommand>();
-        let (result_tx, result_rx) = unbounded::<FrameResult>();
-        let (output_tx, output_rx) = unbounded::<(u64, Instant, PipelineOutput)>();
+        let (dropped_tx, dropped_rx) = bounded::<DroppedFrameCommand>(1);
+        let (result_tx, result_rx) = bounded::<FrameResult>(1);
+        let (output_tx, output_rx) = bounded::<(u64, Instant, PipelineOutput)>(1);
 
         // Shutdown channels
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
@@ -104,14 +104,20 @@ impl VideoPipeline {
 
         // Start output loop thread with tracker - it sends results directly to result_tx
         let result_tx_clone = result_tx.clone();
+        let tracker_det_clone = tracker.clone();
         let detection_handle = thread::spawn(move || {
-            Self::output_loop(output_rx, result_tx_clone, tracker, shutdown_rx_detection);
+            Self::output_loop(
+                output_rx,
+                result_tx_clone,
+                tracker_det_clone,
+                shutdown_rx_detection,
+            );
         });
 
         // Start dedicated dropped frames loop
-        let output_tx_dropped = output_tx.clone();
+        let tracker_drop_clone = tracker.clone();
         let dropped_handle = thread::spawn(move || {
-            Self::dropped_frames_loop(dropped_rx, output_tx_dropped, shutdown_rx_dropped);
+            Self::dropped_frames_loop(dropped_rx, tracker_drop_clone, shutdown_rx_dropped);
         });
 
         let worker_handle = thread::spawn(move || {
@@ -147,40 +153,6 @@ impl VideoPipeline {
                             let now = Instant::now();
                             let dt = now.duration_since(last_process_time).as_secs_f32();
 
-                            // Check if this is an advance tracks command (special frame_id)
-                            if frame_id == u64::MAX {
-                                // Update tracker with empty detections to advance predictions
-                                let tracked_predictions = tracker.update(&[], dt);
-
-                                log::debug!(
-                                    "Advanced tracks: {} predictions, dt={:.3}s",
-                                    tracked_predictions.len(),
-                                    dt
-                                );
-
-                                // Optionally send extrapolated result if there are predictions
-                                if !tracked_predictions.is_empty() {
-                                    let result = FrameResult {
-                                        frame_id: 0, // No frame ID for extrapolated tracks
-                                        timestamp,
-                                        detections: tracked_predictions,
-                                        is_extrapolated: true,
-                                        processing_time_ms: 0.0,
-                                        latency_ms: 0.0,
-                                        duplicates_removed: 0,
-                                        nested_removed: 0,
-                                    };
-
-                                    if let Err(e) = result_tx.send(result) {
-                                        log::warn!("Failed to send extrapolated result: {}", e);
-                                        break;
-                                    }
-                                }
-
-                                last_process_time = now;
-                                continue;
-                            }
-
                             let tracked_detections = tracker.update(&pipeline_output.detections, dt);
 
                             // Create frame result with extracted diagnostics
@@ -200,7 +172,7 @@ impl VideoPipeline {
                                 pipeline_output.pipeline_total_time_ms
                             );
 
-                            if let Err(e) = result_tx.send(result) {
+                            if let Err(e) = result_tx.try_send(result) {
                                 log::warn!("Failed to send detection result: {}", e);
                                 break;
                             }
@@ -233,7 +205,7 @@ impl VideoPipeline {
     /// Dropped frames loop: handles advancing tracks for dropped frames
     fn dropped_frames_loop(
         dropped_rx: Receiver<DroppedFrameCommand>,
-        output_tx: Sender<(u64, Instant, PipelineOutput)>,
+        mut tracker: UnifiedTracker,
         shutdown_rx: Receiver<()>,
     ) {
         log::info!("Dropped frames loop started");
@@ -247,13 +219,17 @@ impl VideoPipeline {
                             match command {
                                 DroppedFrameCommand::AdvanceTracks => {
                                     let now = Instant::now();
+                                    let timestamp = Instant::now();
+                                    let dt = now.duration_since(timestamp).as_secs_f32();
 
-                                    if let Err(e) =
-                                        output_tx.send((u64::MAX, now, PipelineOutput::default()))
-                                    {
-                                        log::warn!("Failed to send advance tracks to output loop: {}", e);
-                                        break;
-                                    }
+                                    // Update tracker with empty detections to advance predictions
+                                    let tracked_predictions = tracker.update(&[], dt);
+
+                                    log::debug!(
+                                        "Advanced tracks: {} predictions, dt={:.3}s",
+                                        tracked_predictions.len(),
+                                        dt
+                                    );
 
                                     log::warn!("Advancing trackers for dropped frame (pipeline busy)");
 
@@ -261,7 +237,7 @@ impl VideoPipeline {
 
                                     // Log statistics every 50 dropped frames
                                     if frames_extrapolated % 50 == 0 {
-                                        log::info!("Dropped frames handled: {}", frames_extrapolated);
+                                        log::debug!("Dropped frames handled: {}", frames_extrapolated);
                                     }
                                 }
                                 DroppedFrameCommand::Shutdown => {
@@ -330,7 +306,7 @@ impl VideoPipeline {
                                     let output_tx_clone = output_tx.clone();
                                     detector.process_with_callback(&image, move |output: &PipelineOutput| {
                                         // Send frame context and pipeline output to output loop
-                                        if let Err(e) = output_tx_clone.send((frame_id, timestamp, output.clone()))
+                                        if let Err(e) = output_tx_clone.try_send((frame_id, timestamp, output.clone()))
                                         {
                                             log::warn!("Failed to send detection output: {}", e);
                                         }

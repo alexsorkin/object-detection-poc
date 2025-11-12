@@ -98,6 +98,46 @@ struct IoUMatch {
     iou_score: f32,
 }
 
+impl std::fmt::Debug for UnifiedTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnifiedTracker")
+            .field("method", &self.method)
+            .field("track_metadata", &self.track_metadata)
+            .field("track_ages", &self.track_ages)
+            .field("update_count", &self.update_count)
+            .field("num_tracks", &self.tracker.num_tracklets())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for UnifiedTracker {
+    fn clone(&self) -> Self {
+        // We need to recreate the tracker since Box<dyn Trait> can't be cloned
+        // For now, create a new tracker with default config of the same method
+        let config = match self.method {
+            TrackingMethod::Kalman => {
+                TrackingConfig::Kalman(crate::kalman_operator::KalmanConfig::default())
+            }
+            TrackingMethod::ByteTrack => {
+                TrackingConfig::ByteTrack(crate::bytetrack_operator::ByteTrackConfig::default())
+            }
+        };
+
+        let new_tracker = Self::new(config);
+
+        // Note: We lose the internal state of the tracker when cloning
+        // This is a limitation of the trait object approach
+        Self {
+            tracker: new_tracker.tracker,
+            method: self.method,
+            track_metadata: self.track_metadata.clone(),
+            track_ages: self.track_ages.clone(),
+            update_count: self.update_count,
+            temp_iou_results: Vec::with_capacity(128),
+        }
+    }
+}
+
 impl UnifiedTracker {
     /// Create new tracker from config
     pub fn new(config: TrackingConfig) -> Self {
@@ -145,9 +185,9 @@ impl UnifiedTracker {
     pub fn update(&mut self, detections: &[TileDetection], _dt: f32) -> Vec<TileDetection> {
         self.update_count += 1;
 
-        // For real detections (non-empty), purge tracks older than 3 frames
+        // For real detections (non-empty), purge tracks older than 1 frames
         if !detections.is_empty() {
-            self.purge_old_tracks(5);
+            self.purge_old_tracks(1);
         }
 
         if detections.is_empty() {
