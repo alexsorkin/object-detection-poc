@@ -152,10 +152,10 @@ impl UnifiedTracker {
         // Create tokio runtime for maintenance
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
-            .thread_name("unified-tracker-maintenance")
+            .thread_name("tracker-maintenance")
             .enable_all()
             .build()
-            .expect("Failed to create UnifiedTracker maintenance runtime");
+            .expect("Failed to create UnifiedTracker maintenance thread");
 
         // Spawn command processor thread
         let tracker_clone = Arc::clone(&tracker_arc);
@@ -327,9 +327,9 @@ impl UnifiedTracker {
         tracker: Arc<Mutex<Box<dyn MultiObjectTracker>>>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
-        log::info!("UnifiedTracker maintenance thread started (checking every 100ms)");
+        log::info!("UnifiedTracker maintenance thread started (checking every 10ms)");
 
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
         let mut maintenance_cycles = 0_u64;
 
         loop {
@@ -346,20 +346,20 @@ impl UnifiedTracker {
                     // Periodic status log
                     if maintenance_cycles % 100 == 0 {
                         log::debug!(
-                            "UnifiedTracker maintenance: {} cycles, {} active tracks",
+                            "UnifiedTracker: maintenance: {} cycles, {} active tracks",
                             maintenance_cycles,
                             track_count
                         );
                     }
                 }
                 _ = &mut shutdown_rx => {
-                    log::debug!("UnifiedTracker maintenance received shutdown signal");
+                    log::debug!("UnifiedTracker: maintenance received shutdown signal");
                     break;
                 }
             }
         }
 
-        log::info!("UnifiedTracker maintenance thread stopped");
+        log::info!("UnifiedTracker: maintenance thread stopped");
     }
 
     /// Update track metadata for tracked detections

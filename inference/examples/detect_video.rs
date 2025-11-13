@@ -463,7 +463,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // If we already have a frame, the previous one becomes a dropped frame
                 if latest_detector_frame.is_some() {
                     // Advance tracker for the dropped frame (async, non-blocking)
-                    video_pipeline_for_detector.advance_tracks();
+                    //video_pipeline_for_detector.advance_tracks();
                     log::warn!("Advanced tracker for dropped frame (rt fps missed)");
                 }
 
@@ -496,7 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("Submitted frame {} for detect", submitted_frame_id);
                     submitted_frame_id += 1;
                 } else {
-                    video_pipeline_for_detector.advance_tracks();
+                    //video_pipeline_for_detector.advance_tracks();
                 }
             }
 
@@ -562,9 +562,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display_mat = Mat::default();
 
     // === OPTIMIZATION: Pre-compute color palette for all 80 COCO classes ===
-    let color_palette: Vec<Rgb<u8>> = (0..80)
-        .map(|class_id| generate_class_color(class_id))
-        .collect();
+    let color_palette = Arc::new(
+        (0..80)
+            .map(|class_id| generate_class_color(class_id))
+            .collect::<Vec<Rgb<u8>>>(),
+    );
 
     loop {
         if let Ok(_) = output_done_rx.try_recv() {
@@ -604,18 +606,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let rgb_image = if let Some(frame_arc) = new_captured_frame {
+        let frame_arc = if let Some(frame_arc) = new_captured_frame {
             log::debug!("Consuming frame: {} for output", out_frame_id);
             out_frame_id += 1;
-            frame_arc.as_ref().clone() // Clone the image data only when needed for annotation
+            frame_arc // Keep as Arc, clone only when needed
         } else {
             log::warn!("No more frames available, ending video processing");
             break;
         };
 
         // Initialize video writer on first frame (now we know actual dimensions)
-        let orig_width = rgb_image.width();
-        let orig_height = rgb_image.height();
+        let orig_width = frame_arc.width();
+        let orig_height = frame_arc.height();
 
         if !writer_initialized.get() {
             let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')?;
@@ -696,7 +698,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .count();
 
         // Annotate current frame with latest tracker predictions (from VideoPipeline with tracking)
-        let mut annotated = rgb_image.clone();
+        let mut annotated = frame_arc.as_ref().clone(); // Clone only once when we need to annotate
 
         // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
         // Uses pre-computed scale_x, scale_y and color_palette
