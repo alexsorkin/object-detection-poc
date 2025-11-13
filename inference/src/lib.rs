@@ -33,6 +33,7 @@ pub mod frame_pipeline;
 pub mod bytetrack_operator;
 pub mod kalman_operator;
 pub mod tracking;
+pub mod tracking_types;
 pub mod tracking_utils;
 
 pub mod video_pipeline;

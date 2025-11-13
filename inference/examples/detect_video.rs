@@ -31,15 +31,14 @@
 ///   cargo run --release --features metal --example detect_video -- --tracker kalman test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam
 use image::{Rgb, RgbImage};
-use military_target_detector::bytetrack_operator::ByteTrackConfig;
 use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{
     draw_rect_batch, draw_text, draw_text_batch, generate_class_color,
 };
-use military_target_detector::kalman_operator::KalmanConfig;
 use military_target_detector::tracking::{TrackingConfig, TrackingMethod};
+use military_target_detector::tracking_types::{ByteTrackConfig, KalmanConfig};
 use military_target_detector::types::{DetectorConfig, RTDETRModel};
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
 use opencv::{
@@ -279,8 +278,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracking_config = match tracking_method {
         TrackingMethod::Kalman => {
             TrackingConfig::Kalman(KalmanConfig {
-                max_age: 3,                                // frames to keep track alive without detections
-                min_hits: 1,        // REDUCED from 3 to test track position updates
+                max_age: 10,                  // frames to keep track alive without detections
+                min_hits: 1,                  // REDUCED from 3 to test track position updates
                 iou_threshold: 0.1, // REDUCED from 0.3 to be more permissive for association
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
                 measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise covariance
@@ -289,7 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         TrackingMethod::ByteTrack => {
             TrackingConfig::ByteTrack(ByteTrackConfig {
-                max_age: 3,                                              // frames to keep track alive
+                max_age: 10,                                             // frames to keep track alive
                 min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // IoU threshold for association (standard value)
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
@@ -311,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shutdown channels for coordinating thread shutdown
     let (shutdown_tx_capture, shutdown_rx_capture) = sync_channel::<()>(1);
     let (shutdown_tx_detector, shutdown_rx_detector) = sync_channel::<()>(1);
-    let (shutdown_tx_results, shutdown_rx_results) = sync_channel::<()>(1);
+    let (shutdown_tx_stats, shutdown_rx_stats) = sync_channel::<()>(1);
 
     eprintln!("  ✓ Pipeline ready (with {} tracker)", tracking_method);
     eprintln!("\n💡 Configuration:");
@@ -364,9 +363,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_start = Instant::now();
 
     // Track latest tracker predictions from VideoPipeline (includes Kalman tracking)
-    let mut latest_predictions: Vec<military_target_detector::frame_pipeline::TileDetection> =
-        Vec::new();
-    let mut num_tracks = 0;
+    let mut latest_predictions: Vec<military_target_detector::frame_pipeline::TileDetection>;
+    let mut num_tracks;
 
     eprintln!(
         "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})",
@@ -382,7 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (detector_tx, detector_rx) = sync_channel::<(RgbImage, Instant)>(3); // Detector queue with timestamp
     let (output_tx, output_rx) = sync_channel::<(RgbImage, Instant)>(3); // Output queue - must process all
     let (output_done_tx, output_done_rx) = sync_channel::<()>(1); // Signal for end of video
-    let (results_done_tx, results_done_rx) = sync_channel::<()>(1); // Signal for end of video
+    let (stats_done_tx, stats_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let (detector_done_tx, detector_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
 
@@ -421,7 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("Capture thread: End of video");
                     let _ = output_done_tx.send(()); // Signal main thread
                     let _ = detector_done_tx.send(()); // Signal main thread
-                    let _ = results_done_tx.send(()); // Signal main thread
+                    let _ = stats_done_tx.send(()); // Signal main thread
                     break;
                 }
             }
@@ -509,54 +507,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create result collector thread - consumes tracker predictions asynchronously
-    // This prevents result retrieval from blocking the main display loop
-    let video_pipeline_for_results = Arc::clone(&video_pipeline);
-    let stats_processed_for_results = Arc::clone(&stats_processed);
-    let stats_extrapolated_for_results = Arc::clone(&stats_extrapolated);
-    let stats_latency_for_results = Arc::clone(&stats_latency_sum);
+    // Create stats collector thread - consumes tracker predictions asynchronously
+    // This prevents stats retrieval from blocking the main display loop
+    let video_pipeline_for_stats = Arc::clone(&video_pipeline);
+    let stats_processed_for_stats = Arc::clone(&stats_processed);
+    let stats_extrapolated_for_stats = Arc::clone(&stats_extrapolated);
+    let stats_latency_for_stats = Arc::clone(&stats_latency_sum);
 
-    // Channel to send latest tracker predictions to main thread for display
-    let (predictions_tx, predictions_rx) =
-        sync_channel::<Vec<military_target_detector::frame_pipeline::TileDetection>>(2);
-
-    let results_handle = thread::spawn(move || {
+    let stats_handle = thread::spawn(move || {
         loop {
             // Check for shutdown signal (non-blocking)
-            if let Ok(_) = shutdown_rx_results.try_recv() {
+            if let Ok(_) = shutdown_rx_stats.try_recv() {
                 log::info!("Results thread received shutdown signal");
                 break;
             }
 
-            if let Ok(_) = results_done_rx.try_recv() {
+            if let Ok(_) = stats_done_rx.try_recv() {
                 log::debug!("Results thread: End of video");
                 break;
             }
 
-            // Non-blocking check for results
-            match video_pipeline_for_results.get_result() {
-                Some(result) => {
+            // Non-blocking check for stats
+            match video_pipeline_for_stats.get_result() {
+                Some(stats) => {
                     // Update stats
-                    if result.is_extrapolated {
+                    if stats.is_extrapolated {
                         let new_extrapolated =
-                            stats_extrapolated_for_results.fetch_add(1, Ordering::Relaxed) + 1;
+                            stats_extrapolated_for_stats.fetch_add(1, Ordering::Relaxed) + 1;
                         log::debug!(
-                            "Got extrapolated result, total extrapolated: {}",
+                            "Got extrapolated stats, total extrapolated: {}",
                             new_extrapolated
                         );
                     } else {
                         let new_processed =
-                            stats_processed_for_results.fetch_add(1, Ordering::Relaxed) + 1;
-                        log::debug!("Got processed result, total processed: {}", new_processed);
+                            stats_processed_for_stats.fetch_add(1, Ordering::Relaxed) + 1;
+                        log::debug!("Got processed stats, total processed: {}", new_processed);
                     }
-                    stats_latency_for_results
-                        .fetch_add(result.latency_ms as u32, Ordering::Relaxed);
-
-                    // Send tracker predictions to main thread (non-blocking)
-                    let _ = predictions_tx.try_send(result.detections);
+                    stats_latency_for_stats.fetch_add(stats.latency_ms as u32, Ordering::Relaxed);
                 }
                 None => {
-                    // No result available yet
+                    // No stats available yet
                 }
             }
 
@@ -582,7 +572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Send shutdown signals to all threads
             let _ = shutdown_tx_capture.send(());
             let _ = shutdown_tx_detector.send(());
-            let _ = shutdown_tx_results.send(());
+            let _ = shutdown_tx_stats.send(());
 
             // Shutdown video pipeline
             video_pipeline.shutdown();
@@ -592,7 +582,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Try to get frame from OUTPUT queue with timeout
         // This allows the loop to check for exit conditions periodically
         // instead of blocking forever waiting for frames
-        let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(5)) {
+        let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(2)) {
             Ok((frame, _timestamp)) => Some(frame),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // No frame yet, continue loop to check exit conditions
@@ -605,7 +595,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Send shutdown signals to all threads
                 let _ = shutdown_tx_capture.send(());
                 let _ = shutdown_tx_detector.send(());
-                let _ = shutdown_tx_results.send(());
+                let _ = shutdown_tx_stats.send(());
 
                 // Shutdown video pipeline
                 video_pipeline.shutdown();
@@ -649,7 +639,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             io::stderr().flush()?;
 
             // Resize display window to match video size (capped at 640p)
-            if headless {
+            if !headless {
                 let max_height = 640;
                 let (window_width, window_height) = if orig_height > max_height {
                     // Scale down to 640p preserving aspect ratio
@@ -696,14 +686,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
 
-        // Get latest tracker predictions from results thread (non-blocking)
-        if let Ok(predictions) = predictions_rx.try_recv() {
-            latest_predictions = predictions;
-            num_tracks = latest_predictions
-                .iter()
-                .filter(|d| d.track_id.is_some())
-                .count();
-        }
+        // Get latest tracker predictions directly from video pipeline cache (synchronous)
+        // This bypasses the channel and gets predictions immediately from tracker cache
+        latest_predictions = video_pipeline.get_predictions();
+        num_tracks = latest_predictions
+            .iter()
+            .filter(|d| d.track_id.is_some())
+            .count();
 
         // Annotate current frame with latest tracker predictions (from VideoPipeline with tracking)
         let mut annotated = rgb_image.clone();
@@ -838,7 +827,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if total == 0 {
                 log::warn!(
-                    "⚠️  No detection results yet (processed: {}, extrapolated: {}) - check for ONNX errors",
+                    "⚠️  No detection stats yet (processed: {}, extrapolated: {}) - check for ONNX errors",
                     processed, extrapolated
                 );
             } else {
@@ -862,7 +851,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Send shutdown signals to all threads
                 let _ = shutdown_tx_capture.send(());
                 let _ = shutdown_tx_detector.send(());
-                let _ = shutdown_tx_results.send(());
+                let _ = shutdown_tx_stats.send(());
 
                 // Shutdown video pipeline
                 video_pipeline.shutdown();
@@ -889,7 +878,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Main loop ended, shutting down all threads");
     let _ = shutdown_tx_capture.send(());
     let _ = shutdown_tx_detector.send(());
-    let _ = shutdown_tx_results.send(());
+    let _ = shutdown_tx_stats.send(());
 
     // Shutdown video pipeline
     video_pipeline.shutdown();
@@ -936,7 +925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         eprintln!("  ✓ Detector thread finished");
     }
-    if let Err(e) = results_handle.join() {
+    if let Err(e) = stats_handle.join() {
         eprintln!("⚠️  Results thread error: {:?}", e);
     } else {
         eprintln!("  ✓ Results thread finished");

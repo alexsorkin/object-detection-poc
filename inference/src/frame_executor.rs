@@ -105,7 +105,7 @@ impl FrameExecutor {
         {
             Ok(_) => Some(response_rx),
             Err(_) => {
-                log::error!("❌ Frame executor disconnected");
+                log::error!("❌ FrameExecutor: channel disconnected");
                 None
             }
         }
@@ -115,10 +115,10 @@ impl FrameExecutor {
     pub fn detect(&self, image: ImageData) -> Result<Vec<Detection>, String> {
         let response_rx = self
             .detect_async(image)
-            .ok_or_else(|| "Frame executor disconnected".to_string())?;
+            .ok_or_else(|| "FrameExecutor: channel disconnected".to_string())?;
         response_rx
             .recv()
-            .map_err(|e| format!("Failed to receive response: {}", e))?
+            .map_err(|e| format!("FrameExecutor: failed to receive response: {}", e))?
     }
 
     /// Shutdown the executor
@@ -132,7 +132,7 @@ impl FrameExecutor {
         command_rx: Receiver<FrameCommand>,
         max_queue_depth: usize,
     ) {
-        log::info!("Frame executor started");
+        log::info!("FrameExecutor: executor loop started");
         let mut frames_processed = 0_u64;
         let mut frames_dropped = 0_u64;
 
@@ -155,7 +155,8 @@ impl FrameExecutor {
                     let dropped = commands.remove(0);
                     if let FrameCommand::Detect { response_tx, .. } = dropped {
                         frames_dropped += 1;
-                        let _ = response_tx.send(Err("Frame dropped (too old)".to_string()));
+                        let _ = response_tx
+                            .send(Err("FrameExecutor: frame dropped (too old)".to_string()));
                     }
                 }
             }
@@ -172,22 +173,24 @@ impl FrameExecutor {
                             } = old_cmd
                             {
                                 frames_dropped += 1;
-                                let _ = old_tx
-                                    .send(Err("Frame dropped (newer frame available)".to_string()));
+                                let _ = old_tx.send(Err(
+                                    "FrameExecutor: frame dropped (newer frame available)"
+                                        .to_string(),
+                                ));
                             }
                         }
 
                         // Execute detection on latest frame
                         let result = detector
                             .detect(&image)
-                            .map_err(|e| format!("Detection error: {}", e));
+                            .map_err(|e| format!("FrameExecutor: detection error: {}", e));
 
                         let _ = response_tx.send(result);
                         frames_processed += 1;
 
                         if frames_processed % 100 == 0 {
                             log::info!(
-                                "Frame executor: {} processed, {} dropped",
+                                "FrameExecutor: {} processed, {} dropped",
                                 frames_processed,
                                 frames_dropped
                             );
@@ -195,7 +198,7 @@ impl FrameExecutor {
                     }
                     FrameCommand::Shutdown => {
                         log::info!(
-                            "Frame executor shutting down: {} processed, {} dropped",
+                            "FrameExecutor: shutting down: {} processed, {} dropped",
                             frames_processed,
                             frames_dropped
                         );
@@ -205,7 +208,7 @@ impl FrameExecutor {
             }
         }
 
-        log::info!("Frame executor stopped");
+        log::info!("FrameExecutor: executor stopped");
     }
 }
 

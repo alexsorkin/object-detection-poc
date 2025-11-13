@@ -76,6 +76,7 @@ pub struct VideoPipeline {
     command_tx: Sender<WorkerCommand>,
     tracker_tx: Sender<TrackerCommand>,
     result_rx: Receiver<FrameResult>,
+    tracker: Arc<UnifiedTracker>, // Shared reference to tracker for direct access
     _worker_handle: thread::JoinHandle<()>,
     _tracker_handle: thread::JoinHandle<()>,
 }
@@ -88,12 +89,13 @@ impl VideoPipeline {
 
         let (result_tx, result_rx) = unbounded::<FrameResult>();
 
-        let tracker = UnifiedTracker::new(config.tracking_config);
+        let tracker = Arc::new(UnifiedTracker::new(config.tracking_config));
         let detector = Arc::clone(&detection_pipeline);
 
         // Start unified tracker loop thread - handles both detection results and advance tracks
+        let tracker_clone = Arc::clone(&tracker);
         let tracker_handle = thread::spawn(move || {
-            Self::tracker_loop(tracker_rx, result_tx, tracker);
+            Self::tracker_loop(tracker_rx, result_tx, tracker_clone);
         });
 
         let tracker_tx_worker = tracker_tx.clone();
@@ -105,6 +107,7 @@ impl VideoPipeline {
             command_tx,
             tracker_tx,
             result_rx,
+            tracker,
             _worker_handle: worker_handle,
             _tracker_handle: tracker_handle,
         }
@@ -114,7 +117,7 @@ impl VideoPipeline {
     fn tracker_loop(
         tracker_rx: Receiver<TrackerCommand>,
         result_tx: Sender<FrameResult>,
-        mut tracker: UnifiedTracker,
+        tracker: Arc<UnifiedTracker>,
     ) {
         log::info!(
             "Unified tracker loop started with {} tracker",
@@ -124,7 +127,7 @@ impl VideoPipeline {
         let mut last_frame_timestamp = Instant::now();
 
         // Pre-allocated buffers for better runtime performance
-        let mut empty_detections_buffer = Vec::<TileDetection>::new();
+        let _empty_detections_buffer = Vec::<TileDetection>::new();
 
         loop {
             match tracker_rx.recv() {
@@ -145,8 +148,15 @@ impl VideoPipeline {
                                 pipeline_output.detections.len()
                             );
 
-                            let tracked_detections =
-                                tracker.update(&pipeline_output.detections, dt);
+                            // Send update command to async tracker
+                            if let Err(e) =
+                                tracker.send_update(pipeline_output.detections.clone(), dt)
+                            {
+                                log::error!("Failed to send update to tracker: {}", e);
+                            }
+
+                            // Get current cached predictions from tracker
+                            let tracked_detections = tracker.get_predictions();
 
                             // Create frame result with extracted diagnostics
                             let result = FrameResult {
@@ -188,10 +198,13 @@ impl VideoPipeline {
                                 .max(0.001) // Minimum 1ms to avoid zero dt
                                 .min(0.2); // Maximum 200ms to avoid huge jumps
 
-                            // Clear and reuse pre-allocated buffer for empty detections
-                            empty_detections_buffer.clear();
+                            // Send predict command to async tracker
+                            if let Err(e) = tracker.send_predict(dt) {
+                                log::error!("Failed to send predict to tracker: {}", e);
+                            }
 
-                            let tracked_predictions = tracker.update(&empty_detections_buffer, dt);
+                            // Get current cached predictions from tracker
+                            let tracked_predictions = tracker.get_predictions();
 
                             log::debug!(
                                 "Advanced tracks: {} predictions, dt={:.3}s",
@@ -232,7 +245,7 @@ impl VideoPipeline {
                             }
                         }
                         TrackerCommand::Shutdown => {
-                            log::info!("Tracker loop received shutdown command");
+                            log::debug!("Tracker loop received shutdown command");
                             break;
                         }
                     }
@@ -245,7 +258,7 @@ impl VideoPipeline {
         }
 
         log::info!(
-            "Unified tracker loop stopped (total extrapolated: {})",
+            "UnifiedTracker: tracker loop stopped (total extrapolated: {})",
             frames_extrapolated
         );
     }
@@ -314,7 +327,7 @@ impl VideoPipeline {
                             }
                         }
                         WorkerCommand::Shutdown => {
-                            log::info!("Worker loop received shutdown command");
+                            log::debug!("Worker loop received shutdown command");
                             break;
                         }
                     }
@@ -339,6 +352,14 @@ impl VideoPipeline {
     /// Get next result (non-blocking)
     pub fn get_result(&self) -> Option<FrameResult> {
         self.result_rx.try_recv().ok()
+    }
+
+    /// Get current predictions directly from tracker cache (synchronous)
+    /// Returns immediately with cached tracker predictions
+    pub fn get_predictions(&self) -> Vec<TileDetection> {
+        // Get predictions directly from tracker cache
+        // This is always synchronous and returns immediately
+        self.tracker.get_predictions()
     }
 
     /// Advance tracker predictions for dropped frames (async, non-blocking)
