@@ -4,7 +4,7 @@ use crate::tracking_utils::{
     calculate_iou, tile_detection_to_tracker_format, tracker_output_to_tile_detection, BoundingBox,
 };
 use crossbeam::channel::{self, Receiver, Sender};
-use ioutrack::{ByteMultiTracker, KalmanMultiTracker, MultiObjectTracker};
+use ioutrack::{ByteMultiTracker, HungarianSolver, KalmanMultiTracker, MultiObjectTracker};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -340,7 +340,7 @@ impl UnifiedTracker {
 
                     match tracker.update(empty_detections.view(), true, false) {
                         Ok(tracks) => {
-                            log::info!("UnifiedTracker: predict got {} tracks", tracks.nrows());
+                            log::debug!("UnifiedTracker: predict got {} tracks", tracks.nrows());
                             let mut predictions = tracker_output_to_tile_detection(&tracks);
 
                             // Debug: Log prediction results before metadata application
@@ -449,7 +449,7 @@ impl UnifiedTracker {
         log::info!("UnifiedTracker: maintenance thread stopped");
     }
 
-    /// Update track metadata for tracked detections
+    /// Update track metadata for tracked detections using Hungarian algorithm
     fn update_track_metadata(
         detections: &[TileDetection],
         tracked_detections: &mut [TileDetection],
@@ -459,51 +459,55 @@ impl UnifiedTracker {
             return;
         }
 
-        // Simple IoU matching for metadata assignment
-        for tracked_det in tracked_detections.iter_mut() {
-            if let Some(track_id) = tracked_det.track_id {
-                // Find best matching detection
-                let mut best_match = None;
-                let mut best_iou = 0.3; // Minimum IoU threshold
+        // Create IoU matrix: rows = detections, cols = tracked_detections
+        let num_detections = detections.len();
+        let num_tracks = tracked_detections.len();
+        let mut iou_matrix = ndarray::Array2::zeros((num_detections, num_tracks));
 
-                for (det_idx, detection) in detections.iter().enumerate() {
-                    let det_box = BoundingBox {
-                        x1: detection.x,
-                        y1: detection.y,
-                        x2: detection.x + detection.w,
-                        y2: detection.y + detection.h,
+        // Calculate IoU between all detection-track pairs
+        for (det_idx, detection) in detections.iter().enumerate() {
+            let det_box = BoundingBox {
+                x1: detection.x,
+                y1: detection.y,
+                x2: detection.x + detection.w,
+                y2: detection.y + detection.h,
+            };
+
+            for (track_idx, tracked_det) in tracked_detections.iter().enumerate() {
+                let track_box = BoundingBox {
+                    x1: tracked_det.x,
+                    y1: tracked_det.y,
+                    x2: tracked_det.x + tracked_det.w,
+                    y2: tracked_det.y + tracked_det.h,
+                };
+
+                let iou = calculate_iou(&det_box, &track_box);
+                iou_matrix[[det_idx, track_idx]] = iou;
+            }
+        }
+
+        // Use Hungarian algorithm for optimal assignment
+        let assignment_result = HungarianSolver::solve_iou(iou_matrix.view(), 0.3);
+
+        // Apply metadata for valid assignments
+        for (det_idx, track_idx) in assignment_result.assignments {
+            if let (Some(detection), Some(tracked_det)) = (
+                detections.get(det_idx),
+                tracked_detections.get_mut(track_idx),
+            ) {
+                if let Some(track_id) = tracked_det.track_id {
+                    let metadata = TrackMetadata {
+                        class_id: detection.class_id,
+                        class_name: Arc::new(detection.class_name.clone()),
+                        last_confidence: detection.confidence,
                     };
 
-                    let track_box = BoundingBox {
-                        x1: tracked_det.x,
-                        y1: tracked_det.y,
-                        x2: tracked_det.x + tracked_det.w,
-                        y2: tracked_det.y + tracked_det.h,
-                    };
+                    track_metadata.insert(track_id, metadata.clone());
 
-                    let iou = calculate_iou(&det_box, &track_box);
-                    if iou > best_iou {
-                        best_iou = iou;
-                        best_match = Some(det_idx);
-                    }
-                }
-
-                // Update metadata if we found a good match
-                if let Some(det_idx) = best_match {
-                    if let Some(detection) = detections.get(det_idx) {
-                        let metadata = TrackMetadata {
-                            class_id: detection.class_id,
-                            class_name: Arc::new(detection.class_name.clone()),
-                            last_confidence: detection.confidence,
-                        };
-
-                        track_metadata.insert(track_id, metadata.clone());
-
-                        // Apply metadata to tracked detection
-                        tracked_det.class_id = metadata.class_id;
-                        tracked_det.class_name = (*metadata.class_name).clone();
-                        tracked_det.confidence = metadata.last_confidence;
-                    }
+                    // Apply metadata to tracked detection
+                    tracked_det.class_id = metadata.class_id;
+                    tracked_det.class_name = (*metadata.class_name).clone();
+                    tracked_det.confidence = metadata.last_confidence;
                 }
             }
         }

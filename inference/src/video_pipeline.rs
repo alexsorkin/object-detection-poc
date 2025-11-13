@@ -184,7 +184,7 @@ impl VideoPipeline {
                             };
 
                             log::info!(
-                                "Detection pipeline time: {:.1}ms",
+                                "Detection pipeline time: {:.2}ms",
                                 processed_detections.pipeline_total_time_ms
                             );
 

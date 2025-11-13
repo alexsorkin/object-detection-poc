@@ -35,7 +35,7 @@ use military_target_detector::detector_trait::DetectorType;
 use military_target_detector::frame_executor::{ExecutorConfig, FrameExecutor};
 use military_target_detector::frame_pipeline::{DetectionPipeline, PipelineConfig};
 use military_target_detector::image_utils::{
-    draw_rect_batch, draw_text, draw_text_batch, generate_class_color,
+    calculate_scale_factors, draw_rect_batch, draw_text, draw_text_batch, prepare_annotation_data,
 };
 use military_target_detector::tracking::{TrackingConfig, TrackingMethod};
 use military_target_detector::tracking_types::{ByteTrackConfig, KalmanConfig};
@@ -47,7 +47,6 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, VideoWriter},
 };
-use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -217,12 +216,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cap.set(videoio::CAP_PROP_FPS, fps)?;
     }
 
-    let frame_width = cap.get(videoio::CAP_PROP_FRAME_WIDTH).unwrap_or(1920.0) as i32;
-    let frame_height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT).unwrap_or(1080.0) as i32;
     let total_frames = cap.get(videoio::CAP_PROP_FRAME_COUNT).unwrap_or(0.0) as i32;
 
     eprintln!("✓");
-    eprintln!("  • Resolution: {}x{}", frame_width, frame_height);
     eprintln!("  • FPS: {:.1}", fps);
     if total_frames > 0 {
         eprintln!("  • Total frames: {}", total_frames);
@@ -311,6 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx_capture, shutdown_rx_capture) = sync_channel::<()>(1);
     let (shutdown_tx_detector, shutdown_rx_detector) = sync_channel::<()>(1);
     let (shutdown_tx_stats, shutdown_rx_stats) = sync_channel::<()>(1);
+    let (shutdown_tx_writer, shutdown_rx_writer) = sync_channel::<()>(1);
 
     eprintln!("  ✓ Pipeline ready (with {} tracker)", tracking_method);
     eprintln!("\n💡 Configuration:");
@@ -341,9 +338,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // We'll create the video writer after we get the first frame (to know actual dimensions)
     let output_path = "output_video.mp4";
-    let writer_initialized = std::cell::Cell::new(false);
-    let mut frame_tx: Option<std::sync::mpsc::SyncSender<Mat>> = None;
-    let mut writer_handle: Option<thread::JoinHandle<Result<(), String>>> = None;
 
     // Create window for display - will be resized after first frame to match video size (max 640p)
     if !headless {
@@ -353,7 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_id = 0_u64;
     let mut paused = false;
 
-    // Thread-safe stats for detector thread
+    // Create clones of Arc for threads - these will all share the same atomic
     let stats_processed = Arc::new(AtomicU32::new(0));
     let stats_extrapolated = Arc::new(AtomicU32::new(0));
     let stats_latency_sum = Arc::new(AtomicU32::new(0)); // Store as integer (sum of ms)
@@ -379,6 +373,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (output_done_tx, output_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let (stats_done_tx, stats_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let (detector_done_tx, detector_done_rx) = sync_channel::<()>(1); // Signal for end of video
+    let (writer_tx, writer_rx) = sync_channel::<(Mat, u32, u32)>(100);
+    let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(3);
     let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
 
     let capture_handle = thread::spawn(move || {
@@ -555,18 +551,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut out_frame_id = 0_u64;
 
+    let writer_handle = thread::spawn(move || {
+        let mut file_writer: Option<VideoWriter> = None;
+
+        loop {
+            if let Ok(_) = shutdown_rx_writer.try_recv() {
+                log::info!("Writer thread received shutdown signal");
+                //while let Ok(mat) = writer_rx.try_recv() {
+                //    let _ = writer.write(&mat).is_ok();
+                //}
+                break;
+            }
+            match writer_rx.try_recv() {
+                Ok((mat, width, height)) => {
+                    if let Some(writer) = &mut file_writer {
+                        log::info!("Writing frame to output video file");
+                        let _ = writer.write(&mat).is_ok();
+                    } else {
+                        file_writer = match VideoWriter::new(
+                            output_path,
+                            VideoWriter::fourcc('a', 'v', 'c', '1').unwrap(),
+                            fps,
+                            opencv::core::Size::new(width as i32, height as i32),
+                            true,
+                        ) {
+                            Ok(writer) => Some(writer),
+                            Err(e) => {
+                                eprintln!("❌ Failed to open video writer: {}", e);
+                                break;
+                            }
+                        };
+                        log::info!("Writing first frame to output video file");
+                        let _ = file_writer.as_mut().unwrap().write(&mat).is_ok();
+                    }
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+        if let Some(writer) = &mut file_writer {
+            log::info!("Releasing video writer");
+            let _ = writer.release().map_err(|e| e.to_string());
+        }
+    });
+
     // Pre-allocate Mat for reuse (optimization)
     let mut display_mat = Mat::default();
+    let display_initialized = std::cell::Cell::new(false);
 
     loop {
+        log::debug!("Main Loop: Starting iteration, checking for frames...");
         if let Ok(_) = output_done_rx.try_recv() {
             log::debug!("Main Loop: End of video (no frames captured)");
-
-            // Send shutdown signals to all threads
-            let _ = shutdown_tx_capture.send(());
-            let _ = shutdown_tx_detector.send(());
-            let _ = shutdown_tx_stats.send(());
-
             // Shutdown video pipeline
             video_pipeline.shutdown();
             break;
@@ -584,12 +621,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed - capture thread finished
                 log::info!("Output channel closed, ending video processing");
-
-                // Send shutdown signals to all threads
-                let _ = shutdown_tx_capture.send(());
-                let _ = shutdown_tx_detector.send(());
-                let _ = shutdown_tx_stats.send(());
-
                 // Shutdown video pipeline
                 video_pipeline.shutdown();
                 break;
@@ -604,80 +635,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log::warn!("No more frames available, ending video processing");
             break;
         };
-
-        // Initialize video writer on first frame (now we know actual dimensions)
-        let orig_width = frame_arc.width();
-        let orig_height = frame_arc.height();
-
-        if !writer_initialized.get() {
-            let fourcc = VideoWriter::fourcc('a', 'v', 'c', '1')?;
-            let mut new_writer = VideoWriter::new(
-                output_path,
-                fourcc,
-                fps,
-                opencv::core::Size::new(orig_width as i32, orig_height as i32),
-                true,
-            )?;
-
-            if !new_writer.is_opened()? {
-                eprintln!("❌ Failed to open video writer");
-                io::stderr().flush()?;
-                return Ok(());
-            }
-
-            eprintln!(
-                "  ✓ Writing output to: {} ({}x{})\n",
-                output_path, orig_width, orig_height
-            );
-            io::stderr().flush()?;
-
-            // Resize display window to match video size (capped at 640p)
-            if !headless {
-                let max_height = 640;
-                let (window_width, window_height) = if orig_height > max_height {
-                    // Scale down to 640p preserving aspect ratio
-                    let scale = max_height as f32 / orig_height as f32;
-                    ((orig_width as f32 * scale) as i32, max_height as i32)
-                } else {
-                    // Use native resolution
-                    (orig_width as i32, orig_height as i32)
-                };
-                highgui::resize_window("Detection", window_width, window_height)?;
-            }
-
-            // Create async video writer thread with large buffer
-            let (tx, rx) = sync_channel::<Mat>(120); // Buffer ~5 seconds at 24fps
-            let handle = thread::spawn(move || -> Result<(), String> {
-                for mat in rx {
-                    new_writer.write(&mat).map_err(|e| e.to_string())?;
-                }
-                new_writer.release().map_err(|e| e.to_string())?;
-                Ok(())
-            });
-
-            frame_tx = Some(tx);
-            writer_initialized.set(true);
-            writer_handle = Some(handle);
-        }
+        let origin_frame_width = frame_arc.width();
+        let origin_frame_height = frame_arc.height();
 
         // === OPTIMIZATION: Pre-compute scale factors ONCE (after first frame) ===
         // These don't change between frames, so calculate once and reuse
-        let (scale_x, scale_y) = {
-            let target_size = 640.0_f32;
-            let scale = if orig_width > orig_height {
-                (target_size / orig_width as f32).min(1.0)
-            } else {
-                (target_size / orig_height as f32).min(1.0)
-            };
-
-            let resized_width = (orig_width as f32 * scale) as u32;
-            let resized_height = (orig_height as f32 * scale) as u32;
-
-            (
-                orig_width as f32 / resized_width as f32,
-                orig_height as f32 / resized_height as f32,
-            )
-        };
+        let (scale_x, scale_y) =
+            calculate_scale_factors(origin_frame_width, origin_frame_height, 640.0);
 
         // Get latest tracker predictions directly from video pipeline cache (synchronous)
         // This bypasses the channel and gets predictions immediately from tracker cache
@@ -691,33 +655,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut annotated = frame_arc.as_ref().clone(); // Clone only once when we need to annotate
 
         // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
-        let annotation_data: Vec<_> = latest_predictions
-            .par_iter()
-            .map(|det| {
-                let color = generate_class_color(det.class_id);
-                let scaled_x = (det.x * scale_x) as i32;
-                let scaled_y = (det.y * scale_y) as i32;
-                let scaled_w = (det.w * scale_x) as u32;
-                let scaled_h = (det.h * scale_y) as u32;
-
-                let label = if let Some(track_id) = det.track_id {
-                    format!(
-                        "#{} {} {:.0}%",
-                        track_id,
-                        det.class_name,
-                        det.confidence * 100.0
-                    )
-                } else {
-                    format!("{} {:.0}%", det.class_name, det.confidence * 100.0)
-                };
-
-                let show_label = scaled_h > 20 && scaled_w > 30;
-
-                (
-                    scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label,
-                )
-            })
-            .collect();
+        let annotation_data: Vec<_> =
+            prepare_annotation_data(&latest_predictions, scale_x, scale_y);
 
         // PARALLEL BATCH: Prepare rectangle and label data for batch drawing
         let rects: Vec<_> = annotation_data
@@ -740,7 +679,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Draw stats overlay
         {
             let stats_text = format!(
-                "Frame: {} | Tracks: {} | RT-DETR Runs: {}",
+                "Frame: {} # Tracks: {} # RT-DETR Runs: {}",
                 frame_id,
                 num_tracks,
                 stats_processed.load(Ordering::Relaxed)
@@ -782,15 +721,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         if !headless {
-            highgui::imshow("Detection", &display_mat)?;
+            while let Ok((mat, width, height)) = display_rx.try_recv() {
+                if !display_initialized.get() {
+                    let max_height = 640;
+                    let (window_width, window_height) = if height > max_height {
+                        // Scale down to 640p preserving aspect ratio
+                        let scale = max_height as f32 / height as f32;
+                        ((width as f32 * scale) as i32, max_height as i32)
+                    } else {
+                        // Use native resolution
+                        (width as i32, height as i32)
+                    };
+                    let _ =
+                        highgui::resize_window("Detection", window_width, window_height).is_ok();
+                    display_initialized.set(true);
+                }
+                let _ = highgui::imshow("Detection", &mat).is_ok();
+            }
         }
 
+        let _ = display_tx
+            .try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()))
+            .is_ok();
+
         // Write ALL frames to output video (async, non-blocking)
-        if let Some(ref tx) = frame_tx {
-            // Use try_send to avoid blocking the main loop
-            // If queue is full, skip this frame (writer can't keep up)
-            let _ = tx.try_send(display_mat.clone());
-        }
+        let _ = writer_tx
+            .try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()))
+            .is_ok();
 
         frame_id += 1;
 
@@ -838,14 +795,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if key == 'q' as i32 {
                 eprintln!("\n⏹️  Stopped by user");
                 io::stderr().flush()?;
-
-                // Send shutdown signals to all threads
-                let _ = shutdown_tx_capture.send(());
-                let _ = shutdown_tx_detector.send(());
-                let _ = shutdown_tx_stats.send(());
-
-                // Shutdown video pipeline
-                video_pipeline.shutdown();
                 break;
             } else if key == 'p' as i32 {
                 paused = !paused;
@@ -870,6 +819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = shutdown_tx_capture.send(());
     let _ = shutdown_tx_detector.send(());
     let _ = shutdown_tx_stats.send(());
+    let _ = shutdown_tx_writer.send(());
 
     // Shutdown video pipeline
     video_pipeline.shutdown();
@@ -886,23 +836,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Close video writer channel and wait for thread to finish
-    drop(frame_tx);
-    if let Some(handle) = writer_handle {
-        match handle.join() {
-            Ok(Ok(())) => {
-                log::debug!("Video writer finished successfully");
-            }
-            Ok(Err(e)) => {
-                eprintln!("⚠️  Writer thread error: {}", e);
-                io::stderr().flush()?;
-            }
-            Err(e) => {
-                eprintln!("⚠️  Writer thread panicked: {:?}", e);
-                io::stderr().flush()?;
-            }
-        }
-    }
-
     eprintln!("\n🧹 Waiting for threads to finish...");
 
     // Wait for threads to finish
@@ -917,10 +850,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  ✓ Detector thread finished");
     }
     if let Err(e) = stats_handle.join() {
-        eprintln!("⚠️  Results thread error: {:?}", e);
+        eprintln!("⚠️  Stats thread error: {:?}", e);
     } else {
-        eprintln!("  ✓ Results thread finished");
+        eprintln!("  ✓ Stats thread finished");
     }
+    if let Err(e) = writer_handle.join() {
+        eprintln!("⚠️  Writer thread error: {:?}", e);
+    } else {
+        eprintln!("  ✓ Writer thread finished");
+    }
+
     io::stderr().flush()?;
 
     log::debug!("Output video saved: {}", output_path);

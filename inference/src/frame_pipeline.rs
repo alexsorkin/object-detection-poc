@@ -764,10 +764,9 @@ impl PostprocessStage {
         };
 
         log::info!(
-            "{} detections, {} duplicates removed, {} nested removed, time: {:.2} ms",
+            "{} detected, {} filtered out, time: {:.2} ms",
             detections_count,
-            duplicates_removed,
-            nested_removed,
+            duplicates_removed + nested_removed,
             pipeline_total_time_ms,
         );
         // Execute callback with final pipeline output

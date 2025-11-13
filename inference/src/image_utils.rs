@@ -1,6 +1,133 @@
 /// Image utilities for drawing and labeling detections
 use image::{Rgb, RgbImage};
 
+// Import for TileDetection trait implementation
+use crate::frame_pipeline::TileDetection;
+
+/// Calculate scale factors for resizing image to target size while preserving aspect ratio
+///
+/// # Arguments
+/// * `width` - Original image width
+/// * `height` - Original image height
+/// * `target_size` - Target size for the largest dimension
+///
+/// # Returns
+/// A tuple (scale_x, scale_y) representing the scale factors for x and y dimensions
+pub fn calculate_scale_factors(width: u32, height: u32, target_size: f32) -> (f32, f32) {
+    let scale = if width > height {
+        (target_size / width as f32).min(1.0)
+    } else {
+        (target_size / height as f32).min(1.0)
+    };
+
+    let resized_width = (width as f32 * scale) as u32;
+    let resized_height = (height as f32 * scale) as u32;
+
+    (
+        width as f32 / resized_width as f32,
+        height as f32 / resized_height as f32,
+    )
+}
+
+/// Prepare annotation data for detection results in parallel
+///
+/// # Arguments
+/// * `predictions` - Vector of detection predictions  
+/// * `scale_x` - X scale factor for coordinate transformation
+/// * `scale_y` - Y scale factor for coordinate transformation
+///
+/// # Returns
+/// Vector of annotation data tuples (scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label)
+pub fn prepare_annotation_data<T>(
+    predictions: &[T],
+    scale_x: f32,
+    scale_y: f32,
+) -> Vec<(i32, i32, u32, u32, Rgb<u8>, String, bool)>
+where
+    T: DetectionData + Sync,
+{
+    use rayon::prelude::*;
+
+    predictions
+        .par_iter()
+        .map(|det| {
+            let color = generate_class_color(det.get_class_id());
+            let scaled_x = (det.get_x() * scale_x) as i32;
+            let scaled_y = (det.get_y() * scale_y) as i32;
+            let scaled_w = (det.get_w() * scale_x) as u32;
+            let scaled_h = (det.get_h() * scale_y) as u32;
+
+            let label = if let Some(track_id) = det.get_track_id() {
+                format!(
+                    "#{} {} {:.0}%",
+                    track_id,
+                    det.get_class_name(),
+                    det.get_confidence() * 100.0
+                )
+            } else {
+                format!(
+                    "{} {:.0}%",
+                    det.get_class_name(),
+                    det.get_confidence() * 100.0
+                )
+            };
+
+            let show_label = scaled_h > 20 && scaled_w > 30;
+
+            (
+                scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label,
+            )
+        })
+        .collect()
+}
+
+/// Trait for accessing detection data in a generic way
+pub trait DetectionData {
+    fn get_class_id(&self) -> u32;
+    fn get_x(&self) -> f32;
+    fn get_y(&self) -> f32;
+    fn get_w(&self) -> f32;
+    fn get_h(&self) -> f32;
+    fn get_track_id(&self) -> Option<u32>;
+    fn get_class_name(&self) -> &str;
+    fn get_confidence(&self) -> f32;
+}
+
+/// Implementation of DetectionData trait for TileDetection
+impl DetectionData for TileDetection {
+    fn get_class_id(&self) -> u32 {
+        self.class_id
+    }
+
+    fn get_x(&self) -> f32 {
+        self.x
+    }
+
+    fn get_y(&self) -> f32 {
+        self.y
+    }
+
+    fn get_w(&self) -> f32 {
+        self.w
+    }
+
+    fn get_h(&self) -> f32 {
+        self.h
+    }
+
+    fn get_track_id(&self) -> Option<u32> {
+        self.track_id
+    }
+
+    fn get_class_name(&self) -> &str {
+        &self.class_name
+    }
+
+    fn get_confidence(&self) -> f32 {
+        self.confidence
+    }
+}
+
 /// Get 5x7 bitmap pattern for a character
 fn get_char_pattern(ch: char) -> [u8; 7] {
     match ch {
@@ -303,10 +430,7 @@ pub fn draw_rect(
 /// # Arguments
 /// * `img` - The image to draw on
 /// * `labels` - Vector of (text, x, y, color, bg_color) tuples
-pub fn draw_text_batch(
-    img: &mut RgbImage,
-    labels: &[(&str, i32, i32, Rgb<u8>, Option<Rgb<u8>>)],
-) {
+pub fn draw_text_batch(img: &mut RgbImage, labels: &[(&str, i32, i32, Rgb<u8>, Option<Rgb<u8>>)]) {
     use rayon::prelude::*;
 
     // Collect all pixel modifications in parallel
@@ -326,7 +450,11 @@ pub fn draw_text_batch(
                     for dx in 0..text_width {
                         let px = x + dx;
                         let py = y + dy;
-                        if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        if px >= 0
+                            && py >= 0
+                            && (px as u32) < img.width()
+                            && (py as u32) < img.height()
+                        {
                             pixels.push((px as u32, py as u32, *bg));
                         }
                     }
@@ -344,7 +472,11 @@ pub fn draw_text_batch(
                         if (bits >> (4 - col)) & 1 == 1 {
                             let px = char_x + col;
                             let py = char_y + row as i32;
-                            if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                            if px >= 0
+                                && py >= 0
+                                && (px as u32) < img.width()
+                                && (py as u32) < img.height()
+                            {
                                 pixels.push((px as u32, py as u32, *color));
                             }
                         }
@@ -369,10 +501,7 @@ pub fn draw_text_batch(
 /// # Arguments
 /// * `img` - The image to draw on
 /// * `rects` - Vector of (x, y, width, height, color, thickness) tuples
-pub fn draw_rect_batch(
-    img: &mut RgbImage,
-    rects: &[(i32, i32, u32, u32, Rgb<u8>, i32)],
-) {
+pub fn draw_rect_batch(img: &mut RgbImage, rects: &[(i32, i32, u32, u32, Rgb<u8>, i32)]) {
     use imageproc::rect::Rect;
     use rayon::prelude::*;
 
@@ -385,18 +514,18 @@ pub fn draw_rect_batch(
 
             // Collect pixels for all thickness layers
             for offset in 0..*thickness {
-                let expanded_rect = Rect::at(rect.left() - offset, rect.top() - offset)
-                    .of_size(
-                        rect.width() + (offset * 2) as u32,
-                        rect.height() + (offset * 2) as u32,
-                    );
+                let expanded_rect = Rect::at(rect.left() - offset, rect.top() - offset).of_size(
+                    rect.width() + (offset * 2) as u32,
+                    rect.height() + (offset * 2) as u32,
+                );
 
                 // Collect hollow rectangle pixels
                 // Top edge
                 for dx in 0..expanded_rect.width() {
                     let px = expanded_rect.left() + dx as i32;
                     let py = expanded_rect.top();
-                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height()
+                    {
                         pixels.push((px as u32, py as u32, *color));
                     }
                 }
@@ -404,7 +533,8 @@ pub fn draw_rect_batch(
                 for dx in 0..expanded_rect.width() {
                     let px = expanded_rect.left() + dx as i32;
                     let py = expanded_rect.bottom() - 1;
-                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height()
+                    {
                         pixels.push((px as u32, py as u32, *color));
                     }
                 }
@@ -412,7 +542,8 @@ pub fn draw_rect_batch(
                 for dy in 0..expanded_rect.height() {
                     let px = expanded_rect.left();
                     let py = expanded_rect.top() + dy as i32;
-                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height()
+                    {
                         pixels.push((px as u32, py as u32, *color));
                     }
                 }
@@ -420,7 +551,8 @@ pub fn draw_rect_batch(
                 for dy in 0..expanded_rect.height() {
                     let px = expanded_rect.right() - 1;
                     let py = expanded_rect.top() + dy as i32;
-                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height()
+                    {
                         pixels.push((px as u32, py as u32, *color));
                     }
                 }
