@@ -363,7 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_start = Instant::now();
 
     // Track latest tracker predictions from VideoPipeline (includes Kalman tracking)
-    let mut latest_predictions: Vec<military_target_detector::frame_pipeline::TileDetection>;
+    let mut latest_predictions: Arc<Vec<military_target_detector::frame_pipeline::TileDetection>>;
     let mut num_tracks;
 
     eprintln!(

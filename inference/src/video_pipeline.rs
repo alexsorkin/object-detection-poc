@@ -162,7 +162,7 @@ impl VideoPipeline {
                             let result = FrameResult {
                                 frame_id,
                                 timestamp,
-                                detections: tracked_detections,
+                                detections: (*tracked_detections).clone(), // Clone only when creating FrameResult
                                 is_extrapolated: false,
                                 processing_time_ms: pipeline_output.pipeline_total_time_ms,
                                 latency_ms: 0.0, // No latency in command-based processing
@@ -216,10 +216,10 @@ impl VideoPipeline {
                             let result = FrameResult {
                                 frame_id: frames_extrapolated, // Use extrapolation count as frame ID
                                 timestamp: Instant::now(),
-                                detections: tracked_predictions, // Use the predictions!
-                                is_extrapolated: true,           // Mark as extrapolated
-                                processing_time_ms: 0.0,         // No detection processing
-                                latency_ms: 0.0,                 // Instant extrapolation
+                                detections: (*tracked_predictions).clone(), // Clone only when creating FrameResult
+                                is_extrapolated: true,                      // Mark as extrapolated
+                                processing_time_ms: 0.0, // No detection processing
+                                latency_ms: 0.0,         // Instant extrapolation
                                 duplicates_removed: 0,
                                 nested_removed: 0,
                             };
@@ -356,7 +356,7 @@ impl VideoPipeline {
 
     /// Get current predictions directly from tracker cache (synchronous)
     /// Returns immediately with cached tracker predictions
-    pub fn get_predictions(&self) -> Vec<TileDetection> {
+    pub fn get_predictions(&self) -> Arc<Vec<TileDetection>> {
         // Get predictions directly from tracker cache
         // This is always synchronous and returns immediately
         self.tracker.get_predictions()
