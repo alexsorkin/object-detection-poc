@@ -44,9 +44,18 @@ enum WorkerCommand {
 
 /// Internal tracker commands
 enum TrackerCommand {
-    ProcessOutput(u64, Instant, PipelineOutput),
+    ProcessOutput(u64, Instant, ProcessedDetections),
     AdvanceTracks,
     Shutdown,
+}
+
+/// Lightweight structure containing only the data needed for tracking
+#[derive(Debug)]
+struct ProcessedDetections {
+    detections: Arc<Vec<TileDetection>>,
+    pipeline_total_time_ms: f32,
+    duplicates_removed: usize,
+    nested_removed: usize,
 }
 
 /// Video pipeline configuration
@@ -133,7 +142,11 @@ impl VideoPipeline {
             match tracker_rx.recv() {
                 Ok(command) => {
                     match command {
-                        TrackerCommand::ProcessOutput(frame_id, timestamp, pipeline_output) => {
+                        TrackerCommand::ProcessOutput(
+                            frame_id,
+                            timestamp,
+                            processed_detections,
+                        ) => {
                             // Calculate dt from frame timestamp to last processed frame
                             let dt = timestamp
                                 .duration_since(last_frame_timestamp)
@@ -145,12 +158,12 @@ impl VideoPipeline {
                                 "Tracker update: frame_id={}, dt={:.3}s, {} detections",
                                 frame_id,
                                 dt,
-                                pipeline_output.detections.len()
+                                processed_detections.detections.len()
                             );
 
                             // Send update command to async tracker
-                            if let Err(e) =
-                                tracker.send_update(pipeline_output.detections.clone(), dt)
+                            if let Err(e) = tracker
+                                .send_update_arc(Arc::clone(&processed_detections.detections), dt)
                             {
                                 log::error!("Failed to send update to tracker: {}", e);
                             }
@@ -164,15 +177,15 @@ impl VideoPipeline {
                                 timestamp,
                                 detections: (*tracked_detections).clone(), // Clone only when creating FrameResult
                                 is_extrapolated: false,
-                                processing_time_ms: pipeline_output.pipeline_total_time_ms,
+                                processing_time_ms: processed_detections.pipeline_total_time_ms,
                                 latency_ms: 0.0, // No latency in command-based processing
-                                duplicates_removed: pipeline_output.duplicates_removed,
-                                nested_removed: pipeline_output.nested_removed,
+                                duplicates_removed: processed_detections.duplicates_removed,
+                                nested_removed: processed_detections.nested_removed,
                             };
 
                             log::info!(
                                 "Detection pipeline time: {:.1}ms",
-                                pipeline_output.pipeline_total_time_ms
+                                processed_detections.pipeline_total_time_ms
                             );
 
                             if let Err(e) = result_tx.try_send(result) {
@@ -183,7 +196,7 @@ impl VideoPipeline {
                             log::debug!(
                                 "Frame {} PROCESSED (processing: {:.1}ms, {} tracks)",
                                 frame_id,
-                                pipeline_output.pipeline_total_time_ms,
+                                processed_detections.pipeline_total_time_ms,
                                 tracker.num_tracks()
                             );
 
@@ -303,12 +316,18 @@ impl VideoPipeline {
                             detector.process_with_callback(
                                 &image,
                                 move |output: &PipelineOutput| {
-                                    // Send frame context and pipeline output to tracker loop
+                                    // Create lightweight structure with only needed data
+                                    let processed = ProcessedDetections {
+                                        detections: Arc::new(output.detections.clone()), // One clone here
+                                        pipeline_total_time_ms: output.pipeline_total_time_ms,
+                                        duplicates_removed: output.duplicates_removed,
+                                        nested_removed: output.nested_removed,
+                                    };
+
+                                    // Send frame context and processed detections to tracker loop
                                     if let Err(e) =
                                         tracker_tx_clone.try_send(TrackerCommand::ProcessOutput(
-                                            frame_id,
-                                            timestamp,
-                                            output.clone(),
+                                            frame_id, timestamp, processed,
                                         ))
                                     {
                                         log::warn!("Failed to send detection output: {}", e);
