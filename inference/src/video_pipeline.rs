@@ -358,7 +358,7 @@ impl VideoPipeline {
             }
         }
 
-        log::info!("VideoProcessor: pipeline stopped");
+        log::debug!("VideoProcessor: pipeline stopped");
     }
 
     /// Submit frame for processing (non-blocking, returns false if buffer full)

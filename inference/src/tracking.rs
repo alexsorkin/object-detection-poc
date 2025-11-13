@@ -401,7 +401,7 @@ impl UnifiedTracker {
             }
         }
 
-        log::info!("UnifiedTracker: command processor stopped");
+        log::debug!("UnifiedTracker: command processor stopped");
     }
 
     /// Maintenance loop - periodic cleanup and logging
@@ -446,7 +446,7 @@ impl UnifiedTracker {
             }
         }
 
-        log::info!("UnifiedTracker: maintenance thread stopped");
+        log::debug!("UnifiedTracker: maintenance thread stopped");
     }
 
     /// Update track metadata for tracked detections using Hungarian algorithm

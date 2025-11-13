@@ -208,7 +208,7 @@ impl FrameExecutor {
             }
         }
 
-        log::info!("FrameExecutor: executor stopped");
+        log::debug!("FrameExecutor: executor stopped");
     }
 }
 
