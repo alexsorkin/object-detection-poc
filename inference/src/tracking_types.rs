@@ -23,7 +23,7 @@ pub struct KalmanConfig {
 impl Default for KalmanConfig {
     fn default() -> Self {
         Self {
-            max_age: 2,
+            max_age: 10, // Allow 300ms without detection at 50Hz prediction rate (15 * 20ms)
             min_hits: 1, // Allow immediate track creation (lowered from 2)
             iou_threshold: 0.3,
             init_tracker_min_score: 0.3, // Match RT-DETR confidence levels (~30-40%)
@@ -57,7 +57,7 @@ pub struct ByteTrackConfig {
 impl Default for ByteTrackConfig {
     fn default() -> Self {
         Self {
-            max_age: 2,
+            max_age: 10, // Allow 300ms without detection at 50Hz prediction rate (15 * 20ms)
             min_hits: 1, // Allow immediate track creation (lowered from 3)
             iou_threshold: 0.3,
             init_tracker_min_score: 0.3, // Match RT-DETR confidence levels (~30-40%)

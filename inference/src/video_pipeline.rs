@@ -154,22 +154,22 @@ impl VideoPipeline {
                                 .max(0.001) // Minimum 1ms to avoid zero dt
                                 .min(0.2); // Maximum 200ms to avoid huge jumps
 
-                            log::debug!(
+                            log::info!(
                                 "Tracker update: frame_id={}, dt={:.3}s, {} detections",
                                 frame_id,
                                 dt,
                                 processed_detections.detections.len()
                             );
 
-                            // Send update command to async tracker
-                            if let Err(e) = tracker
-                                .send_update_arc(Arc::clone(&processed_detections.detections), dt)
+                            let tracked_detections: Arc<Vec<TileDetection>> = match tracker
+                                .update_sync(processed_detections.detections.to_vec(), dt)
                             {
-                                log::error!("Failed to send update to tracker: {}", e);
-                            }
-
-                            // Get current cached predictions from tracker
-                            let tracked_detections = tracker.get_predictions();
+                                Ok(predictions) => predictions,
+                                Err(e) => {
+                                    log::error!("Failed to update tracker: {}", e);
+                                    Arc::new(Vec::new())
+                                }
+                            };
 
                             // Create frame result with extracted diagnostics
                             let result = FrameResult {
@@ -358,7 +358,7 @@ impl VideoPipeline {
             }
         }
 
-        log::info!("Video processor pipeline stopped");
+        log::info!("VideoProcessor: pipeline stopped");
     }
 
     /// Submit frame for processing (non-blocking, returns false if buffer full)

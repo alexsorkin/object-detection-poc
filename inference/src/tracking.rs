@@ -165,10 +165,9 @@ impl UnifiedTracker {
 
         // Spawn maintenance thread
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let tracker_clone = Arc::clone(&tracker_arc);
-        let predictions_clone = Arc::clone(&last_predictions);
+        let command_tx_for_maintenance = command_tx.clone();
         runtime.spawn(async move {
-            Self::maintenance_loop(tracker_clone, predictions_clone, shutdown_rx).await;
+            Self::maintenance_loop(&command_tx_for_maintenance, shutdown_rx).await;
         });
 
         Self {
@@ -212,6 +211,23 @@ impl UnifiedTracker {
     /// Get cached predictions (synchronous, fast)
     pub fn get_predictions(&self) -> Arc<Vec<TileDetection>> {
         Arc::clone(&*self.last_predictions.lock().unwrap())
+    }
+
+    /// Synchronous update with immediate results
+    /// Sends update command and waits briefly for processing, then returns current predictions
+    pub fn update_sync(
+        &self,
+        detections: Vec<TileDetection>,
+        dt: f32,
+    ) -> Result<Arc<Vec<TileDetection>>, String> {
+        // Send the update command
+        self.send_update(detections, dt)?;
+
+        // Give the async processor a moment to process the update
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Return the updated predictions
+        Ok(self.get_predictions())
     }
 
     /// Shutdown the tracker gracefully
@@ -324,13 +340,13 @@ impl UnifiedTracker {
 
                     match tracker.update(empty_detections.view(), true, false) {
                         Ok(tracks) => {
-                            log::debug!("UnifiedTracker: predict got {} tracks", tracks.nrows());
+                            log::info!("UnifiedTracker: predict got {} tracks", tracks.nrows());
                             let mut predictions = tracker_output_to_tile_detection(&tracks);
 
                             // Debug: Log prediction results before metadata application
                             for prediction in &predictions {
                                 if let Some(track_id) = prediction.track_id {
-                                    log::debug!(
+                                    log::trace!(
                                         "Track {} predict: pos=({:.1}, {:.1}) size=({:.1}x{:.1}) before metadata",
                                         track_id, prediction.x, prediction.y, prediction.w, prediction.h
                                     );
@@ -345,12 +361,12 @@ impl UnifiedTracker {
                                         prediction.class_name = (*metadata.class_name).clone();
                                         prediction.confidence = metadata.last_confidence;
 
-                                        log::debug!(
+                                        log::trace!(
                                             "Track {} predict: applied metadata class_id={} confidence={:.2}",
                                             track_id, metadata.class_id, metadata.last_confidence
                                         );
                                     } else {
-                                        log::debug!(
+                                        log::trace!(
                                             "Track {} predict: no metadata found",
                                             track_id
                                         );
@@ -372,8 +388,8 @@ impl UnifiedTracker {
                     commands_processed += 1;
                 }
                 Ok(TrackingCommand::Shutdown) => {
-                    log::info!(
-                        "UnifiedTracker shutting down after {} commands",
+                    log::debug!(
+                        "UnifiedTracker: shutting down after {} commands",
                         commands_processed
                     );
                     break;
@@ -385,71 +401,46 @@ impl UnifiedTracker {
             }
         }
 
-        log::info!("UnifiedTracker command processor stopped");
+        log::info!("UnifiedTracker: command processor stopped");
     }
 
     /// Maintenance loop - periodic cleanup and logging
     async fn maintenance_loop(
-        tracker: Arc<Mutex<Box<dyn MultiObjectTracker>>>,
-        last_predictions: Arc<Mutex<Arc<Vec<TileDetection>>>>,
+        command_tx: &Sender<TrackingCommand>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         log::info!("UnifiedTracker maintenance thread started (updating predictions every 20ms)");
 
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         let mut maintenance_cycles = 0_u64;
+        let mut last_frame_timestamp = std::time::Instant::now();
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     maintenance_cycles += 1;
 
-                    // Update predictions from current tracker state every iteration
-                    let track_count = {
-                        let mut tracker = tracker.lock().unwrap();
-                        let empty_detections = ndarray::Array2::zeros((0, 5));
+                    let now = std::time::Instant::now();
 
-                        // Advance tracker predictions forward in time (predict step with no new detections)
-                        // This updates internal Kalman filter states and ages out stale tracks
-                        match tracker.update(empty_detections.view(), true, false) {
-                            Ok(tracks) => {
-                                log::debug!("UnifiedTracker: updating tracklets.. (tracks shape: {:?})", tracks.dim());
-                                let predictions = tracker_output_to_tile_detection(&tracks);
+                    let dt = now
+                        .duration_since(last_frame_timestamp)
+                        .as_secs_f32()
+                        .max(0.001) // Minimum 1ms to avoid zero dt
+                        .min(0.2); // Maximum 200ms to avoid huge jumps
 
-                                // Debug: Log track movement details
-                                for prediction in predictions.iter() {
-                                    if let Some(track_id) = prediction.track_id {
-                                        log::debug!(
-                                            "Track {} prediction: pos=({:.1}, {:.1}) size=({:.1}x{:.1}) conf={:.2}",
-                                            track_id, prediction.x, prediction.y, prediction.w, prediction.h, prediction.confidence
-                                        );
-                                    }
-                                }
+                    // Advance tracker predictions forward in time (predict step with no new detections)
+                    // This updates ByteTrack/Kalman filter states and ages out stale tracks
+                    let _ = command_tx.send(TrackingCommand::Predict { dt }).is_ok();
 
-                                // Update cached predictions with latest tracker state
-                                {
-                                    let mut cached_predictions = last_predictions.lock().unwrap();
-                                    *cached_predictions = Arc::new(predictions);
-                                }
-
-                                tracker.num_tracklets() // Return track count
-                            }
-                            Err(e) => {
-                                log::error!("UnifiedTracker maintenance prediction failed: {:?}", e);
-                                0
-                            }
-                        }
-                    };                    // Periodic status log
                     if maintenance_cycles % 100 == 0 {
                         log::debug!(
-                            "UnifiedTracker: maintenance: {} cycles, {} active tracks",
-                            maintenance_cycles,
-                            track_count
+                            "UnifiedTracker: maintenance: {} cycles",
+                            maintenance_cycles
                         );
                     }
+                    last_frame_timestamp = std::time::Instant::now();
                 }
                 _ = &mut shutdown_rx => {
-                    log::debug!("UnifiedTracker: maintenance received shutdown signal");
                     break;
                 }
             }
@@ -457,6 +448,7 @@ impl UnifiedTracker {
 
         log::info!("UnifiedTracker: maintenance thread stopped");
     }
+
     /// Update track metadata for tracked detections
     fn update_track_metadata(
         detections: &[TileDetection],

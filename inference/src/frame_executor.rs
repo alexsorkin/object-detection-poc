@@ -197,7 +197,7 @@ impl FrameExecutor {
                         }
                     }
                     FrameCommand::Shutdown => {
-                        log::info!(
+                        log::debug!(
                             "FrameExecutor: shutting down: {} processed, {} dropped",
                             frames_processed,
                             frames_dropped

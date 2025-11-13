@@ -749,6 +749,8 @@ impl PostprocessStage {
         // Calculate total pipeline time
         let pipeline_total_time_ms = pipeline_start_time.elapsed().as_secs_f32() * 1000.0;
 
+        let detections_count = filtered_detections.len();
+
         let output = PipelineOutput {
             detections: filtered_detections,
             original_width: input.original_width,
@@ -761,6 +763,13 @@ impl PostprocessStage {
             pipeline_total_time_ms,
         };
 
+        log::info!(
+            "{} detections, {} duplicates removed, {} nested removed, time: {:.2} ms",
+            detections_count,
+            duplicates_removed,
+            nested_removed,
+            pipeline_total_time_ms,
+        );
         // Execute callback with final pipeline output
         callback(&output);
 
