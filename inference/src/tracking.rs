@@ -249,15 +249,40 @@ impl UnifiedTracker {
 
         loop {
             match command_rx.recv() {
-                Ok(TrackingCommand::Update { detections, dt: _ }) => {
+                Ok(TrackingCommand::Update { detections, dt }) => {
+                    log::debug!(
+                        "UnifiedTracker: executing update command with {} detections, dt={:.3}s",
+                        detections.len(),
+                        dt
+                    );
+
                     // Convert TileDetection to tracker format
                     let detection_array = tile_detection_to_tracker_format(&detections);
+                    log::debug!(
+                        "UnifiedTracker: converted to detection array shape: {:?}",
+                        detection_array.dim()
+                    );
 
                     let mut tracker = tracker.lock().unwrap();
                     match tracker.update(detection_array.view(), true, false) {
                         Ok(tracks) => {
+                            log::debug!(
+                                "UnifiedTracker: update produced {} tracks",
+                                tracks.nrows()
+                            );
+
                             // Convert back to TileDetection format
                             let mut tracked_detections = tracker_output_to_tile_detection(&tracks);
+
+                            // Debug: Log track positions before metadata update
+                            for detection in &tracked_detections {
+                                if let Some(track_id) = detection.track_id {
+                                    log::debug!(
+                                        "Track {} update: pos=({:.1}, {:.1}) size=({:.1}x{:.1}) before metadata",
+                                        track_id, detection.x, detection.y, detection.w, detection.h
+                                    );
+                                }
+                            }
 
                             // Update metadata for tracked detections
                             Self::update_track_metadata(
@@ -287,14 +312,30 @@ impl UnifiedTracker {
                         }
                     }
                 }
-                Ok(TrackingCommand::Predict { dt: _ }) => {
+                Ok(TrackingCommand::Predict { dt }) => {
+                    log::debug!(
+                        "UnifiedTracker: executing predict command with dt={:.3}s",
+                        dt
+                    );
+
                     // Get predictions from current tracker state
                     let mut tracker = tracker.lock().unwrap();
                     let empty_detections = ndarray::Array2::zeros((0, 5));
 
                     match tracker.update(empty_detections.view(), true, false) {
                         Ok(tracks) => {
+                            log::debug!("UnifiedTracker: predict got {} tracks", tracks.nrows());
                             let mut predictions = tracker_output_to_tile_detection(&tracks);
+
+                            // Debug: Log prediction results before metadata application
+                            for prediction in &predictions {
+                                if let Some(track_id) = prediction.track_id {
+                                    log::debug!(
+                                        "Track {} predict: pos=({:.1}, {:.1}) size=({:.1}x{:.1}) before metadata",
+                                        track_id, prediction.x, prediction.y, prediction.w, prediction.h
+                                    );
+                                }
+                            }
 
                             // Apply metadata to predictions
                             for prediction in &mut predictions {
@@ -303,6 +344,16 @@ impl UnifiedTracker {
                                         prediction.class_id = metadata.class_id;
                                         prediction.class_name = (*metadata.class_name).clone();
                                         prediction.confidence = metadata.last_confidence;
+
+                                        log::debug!(
+                                            "Track {} predict: applied metadata class_id={} confidence={:.2}",
+                                            track_id, metadata.class_id, metadata.last_confidence
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "Track {} predict: no metadata found",
+                                            track_id
+                                        );
                                     }
                                 }
                             }
@@ -343,9 +394,9 @@ impl UnifiedTracker {
         last_predictions: Arc<Mutex<Arc<Vec<TileDetection>>>>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
-        log::info!("UnifiedTracker maintenance thread started (updating predictions every 10ms)");
+        log::info!("UnifiedTracker maintenance thread started (updating predictions every 20ms)");
 
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
         let mut maintenance_cycles = 0_u64;
 
         loop {
@@ -362,7 +413,18 @@ impl UnifiedTracker {
                         // This updates internal Kalman filter states and ages out stale tracks
                         match tracker.update(empty_detections.view(), true, false) {
                             Ok(tracks) => {
+                                log::debug!("UnifiedTracker: updating tracklets.. (tracks shape: {:?})", tracks.dim());
                                 let predictions = tracker_output_to_tile_detection(&tracks);
+
+                                // Debug: Log track movement details
+                                for prediction in predictions.iter() {
+                                    if let Some(track_id) = prediction.track_id {
+                                        log::debug!(
+                                            "Track {} prediction: pos=({:.1}, {:.1}) size=({:.1}x{:.1}) conf={:.2}",
+                                            track_id, prediction.x, prediction.y, prediction.w, prediction.h, prediction.confidence
+                                        );
+                                    }
+                                }
 
                                 // Update cached predictions with latest tracker state
                                 {

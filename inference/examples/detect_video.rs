@@ -244,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         confidence_threshold,
         nms_threshold: 0.45,
         input_size: (640, 640),
-        use_gpu: true,
+        use_gpu: false, // Use CPU instead of GPU/Metal
         ..Default::default()
     };
 
@@ -349,9 +349,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !headless {
         highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
     }
-
-    // Display update interval: update window every frame for smooth playback
-    let display_interval = 1; // Update display every frame
 
     let mut frame_id = 0_u64;
     let mut paused = false;
@@ -561,13 +558,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-allocate Mat for reuse (optimization)
     let mut display_mat = Mat::default();
 
-    // === OPTIMIZATION: Pre-compute color palette for all 80 COCO classes ===
-    let color_palette = Arc::new(
-        (0..80)
-            .map(|class_id| generate_class_color(class_id))
-            .collect::<Vec<Rgb<u8>>>(),
-    );
-
     loop {
         if let Ok(_) = output_done_rx.try_recv() {
             log::debug!("Main Loop: End of video (no frames captured)");
@@ -701,11 +691,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut annotated = frame_arc.as_ref().clone(); // Clone only once when we need to annotate
 
         // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
-        // Uses pre-computed scale_x, scale_y and color_palette
         let annotation_data: Vec<_> = latest_predictions
             .par_iter()
             .map(|det| {
-                let color = color_palette[det.class_id as usize]; // Lookup, not compute
+                let color = generate_class_color(det.class_id);
                 let scaled_x = (det.x * scale_x) as i32;
                 let scaled_y = (det.y * scale_y) as i32;
                 let scaled_w = (det.w * scale_x) as u32;
@@ -748,8 +737,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         draw_rect_batch(&mut annotated, &rects);
         draw_text_batch(&mut annotated, &labels);
 
-        // Draw stats overlay (only when displaying to reduce overhead)
-        if frame_id % display_interval == 0 {
+        // Draw stats overlay
+        {
             let stats_text = format!(
                 "Frame: {} | Tracks: {} | RT-DETR Runs: {}",
                 frame_id,
@@ -792,8 +781,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
         )?;
 
-        // Display (every Nth frame to reduce overhead)
-        if !headless && frame_id % display_interval == 0 {
+        if !headless {
             highgui::imshow("Detection", &display_mat)?;
         }
 
