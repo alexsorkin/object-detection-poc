@@ -377,8 +377,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TWO separate queues:
     // 1. detector_rx: Can drop frames (non-blocking), used for detection - carries timestamp
     // 2. output_rx: Must process ALL frames (blocking), used for output
-    let (detector_tx, detector_rx) = sync_channel::<(RgbImage, Instant)>(3); // Detector queue with timestamp
-    let (output_tx, output_rx) = sync_channel::<(RgbImage, Instant)>(3); // Output queue - must process all
+    let (detector_tx, detector_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(3); // Detector queue with Arc to avoid cloning
+    let (output_tx, output_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(3); // Output queue with Arc to avoid cloning
     let (output_done_tx, output_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let (stats_done_tx, stats_done_rx) = sync_channel::<()>(1); // Signal for end of video
     let (detector_done_tx, detector_done_rx) = sync_channel::<()>(1); // Signal for end of video
@@ -405,12 +405,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match capture_frame(&mut cap) {
                 Ok(frame) => {
                     let capture_time = Instant::now();
+                    let frame_arc = Arc::new(frame); // Wrap in Arc for zero-copy sharing
 
                     // Send to output queue (NON-BLOCKING - drop if queue full)
-                    let _ = output_tx.try_send((frame.clone(), capture_time));
+                    let _ = output_tx.try_send((Arc::clone(&frame_arc), capture_time));
 
                     // Send to detector queue (NON-BLOCKING - drop if queue full)
-                    let _ = detector_tx.try_send((frame.clone(), capture_time));
+                    let _ = detector_tx.try_send((frame_arc, capture_time));
 
                     log::debug!("Dispatching frame {} for processing", cp_frame_id);
                 }
@@ -455,7 +456,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Drain DETECTOR queue to get only the LATEST frame
             // This naturally skips frames - if detection is slow, many frames accumulate and we only take the newest
-            let mut latest_detector_frame: Option<(RgbImage, Instant)> = None;
+            let mut latest_detector_frame: Option<(Arc<RgbImage>, Instant)> = None;
             let mut frames_drained = 0;
 
             while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
@@ -480,7 +481,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((detector_frame, _capture_time)) = latest_detector_frame {
                 // Convert image to raw RGB data
                 let (width, height) = detector_frame.dimensions();
-                let raw_data: Vec<u8> = detector_frame.into_raw();
+                let raw_data: Vec<u8> = detector_frame.as_ref().clone().into_raw(); // Clone only when converting to raw data
 
                 let frame = Frame {
                     data: Arc::from(raw_data.into_boxed_slice()), // Zero-copy Arc data
@@ -583,7 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This allows the loop to check for exit conditions periodically
         // instead of blocking forever waiting for frames
         let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(2)) {
-            Ok((frame, _timestamp)) => Some(frame),
+            Ok((frame_arc, _timestamp)) => Some(frame_arc),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // No frame yet, continue loop to check exit conditions
                 continue;
@@ -603,10 +604,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let rgb_image = if let Some(frame) = new_captured_frame {
+        let rgb_image = if let Some(frame_arc) = new_captured_frame {
             log::debug!("Consuming frame: {} for output", out_frame_id);
             out_frame_id += 1;
-            frame
+            frame_arc.as_ref().clone() // Clone the image data only when needed for annotation
         } else {
             log::warn!("No more frames available, ending video processing");
             break;
