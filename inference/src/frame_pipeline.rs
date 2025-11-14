@@ -7,7 +7,7 @@
 use crate::frame_executor::FrameExecutor;
 use crate::tracking_utils::{calculate_iou, BoundingBox};
 use crate::types::{ImageData, ImageFormat};
-use image::{Rgb, RgbImage};
+use image::{RgbImage};
 use opencv::{
     core::{Mat, Size, Vector, CV_8UC3},
     imgproc,
@@ -200,80 +200,6 @@ impl PreprocessStage {
             .ok_or("Failed to create RgbImage from CLAHE result")?)
     }
 
-    /// Apply HSV-based shadow removal (brightness enhancement) - DEPRECATED: Use CLAHE instead
-    #[allow(dead_code)]
-    fn remove_shadows_hsv(&self, img: &RgbImage) -> RgbImage {
-        let (width, height) = img.dimensions();
-        let mut result = RgbImage::new(width, height);
-
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = img.get_pixel(x, y);
-                let [r, g, b] = pixel.0;
-
-                // RGB to HSV conversion
-                let r_f = r as f32 / 255.0;
-                let g_f = g as f32 / 255.0;
-                let b_f = b as f32 / 255.0;
-
-                let max = r_f.max(g_f).max(b_f);
-                let min = r_f.min(g_f).min(b_f);
-                let delta = max - min;
-
-                // Calculate H (hue)
-                let h = if delta < 0.00001 {
-                    0.0
-                } else if (max - r_f).abs() < 0.00001 {
-                    60.0 * (((g_f - b_f) / delta) % 6.0)
-                } else if (max - g_f).abs() < 0.00001 {
-                    60.0 * (((b_f - r_f) / delta) + 2.0)
-                } else {
-                    60.0 * (((r_f - g_f) / delta) + 4.0)
-                };
-
-                // Calculate S (saturation)
-                let s = if max < 0.00001 { 0.0 } else { delta / max };
-
-                // V (value/brightness)
-                let v = max;
-
-                // Enhance V channel for dark pixels (shadows)
-                let v_enhanced = if v < 0.5 {
-                    (v + 0.3).min(1.0)
-                } else {
-                    (v + 0.1).min(1.0)
-                };
-
-                // HSV back to RGB
-                let c = v_enhanced * s;
-                let x_val = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-                let m = v_enhanced - c;
-
-                let (r_out, g_out, b_out) = if h < 60.0 {
-                    (c, x_val, 0.0)
-                } else if h < 120.0 {
-                    (x_val, c, 0.0)
-                } else if h < 180.0 {
-                    (0.0, c, x_val)
-                } else if h < 240.0 {
-                    (0.0, x_val, c)
-                } else if h < 300.0 {
-                    (x_val, 0.0, c)
-                } else {
-                    (c, 0.0, x_val)
-                };
-
-                let r_final = ((r_out + m) * 255.0).clamp(0.0, 255.0) as u8;
-                let g_final = ((g_out + m) * 255.0).clamp(0.0, 255.0) as u8;
-                let b_final = ((b_out + m) * 255.0).clamp(0.0, 255.0) as u8;
-
-                result.put_pixel(x, y, Rgb([r_final, g_final, b_final]));
-            }
-        }
-
-        result
-    }
-
     /// Calculate tile positions to cover the entire image
     fn get_tile_positions(&self, img_width: u32, img_height: u32) -> Vec<(u32, u32)> {
         let mut positions = Vec::new();
@@ -372,7 +298,7 @@ impl PreprocessStage {
 
         // Resize image to fit tile_size on longer dimension while preserving aspect ratio
         // This ensures the entire image fits in a single tile
-        let resized_img = self.resize_to_fit(&img);
+        let resized_img = img.clone(); //self.resize_to_fit(&img);
         let resized_width = resized_img.width();
         let resized_height = resized_img.height();
 

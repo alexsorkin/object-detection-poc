@@ -43,44 +43,14 @@ use military_target_detector::tracking::{TrackingConfig, TrackingMethod};
 use military_target_detector::tracking_types::{ByteTrackConfig, KalmanConfig};
 use military_target_detector::types::{DetectorConfig, RTDETRModel};
 use military_target_detector::video_pipeline::{Frame, VideoPipeline, VideoPipelineConfig};
-use opencv::{
-    core::Mat,
-    highgui, imgproc,
-    prelude::*,
-    videoio::{self, VideoCapture, VideoWriter},
-};
+use military_target_detector::video_utils::{CaptureInput, VideoResizer};
+use opencv::{core::Mat, highgui, imgproc, prelude::*, videoio::VideoWriter};
 use std::env;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Helper function to capture and convert a frame from video
-fn capture_frame(cap: &mut VideoCapture) -> Result<RgbImage, Box<dyn std::error::Error>> {
-    let mut mat_frame = Mat::default();
-    if !cap.read(&mut mat_frame)? || mat_frame.empty() {
-        return Err("End of video".into());
-    }
-
-    // Convert BGR to RGB
-    let mut rgb_mat = Mat::default();
-    imgproc::cvt_color(
-        &mat_frame,
-        &mut rgb_mat,
-        imgproc::COLOR_BGR2RGB,
-        0,
-        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-
-    // Convert to RgbImage
-    let width = rgb_mat.cols() as u32;
-    let height = rgb_mat.rows() as u32;
-    let data = rgb_mat.data_bytes()?.to_vec();
-    let rgb_image = RgbImage::from_vec(width, height, data).ok_or("Failed to create RgbImage")?;
-
-    Ok(rgb_image)
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
@@ -204,28 +174,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "test_data/airport.mp4".to_string()
     });
 
-    // Open video source
     eprint!("📹 Opening video source: {}... ", video_source);
     io::stderr().flush()?;
-    let mut cap = if let Ok(cam_id) = video_source.parse::<i32>() {
-        VideoCapture::new(cam_id, videoio::CAP_ANY)?
-    } else {
-        VideoCapture::from_file(&video_source, videoio::CAP_ANY)?
-    };
 
-    if !cap.is_opened()? {
-        eprintln!("❌ Failed to open video source");
-        io::stderr().flush()?;
-        return Ok(());
-    }
-
-    let fps = cap.get(videoio::CAP_PROP_FPS).unwrap_or(24.0);
-
-    // Try to set FPS for camera sources (doesn't work for video files)
-    // For video files, we'll pace with sleep() in the main loop
-    if video_source.parse::<i32>().is_ok() {
-        cap.set(videoio::CAP_PROP_FPS, fps)?;
-    }
+    let fps = 30.0; // Default FPS, will be updated by actual video
 
     let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
@@ -362,19 +314,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (writer_tx, writer_rx) = sync_channel::<(Mat, u32, u32)>(100);
     let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(10);
 
-    let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
+    // Create channels for VideoResizer output
+    let (cupture_frame_tx, cupture_frame_rx) = crossbeam::channel::unbounded::<CaptureInput>();
 
+    // Start VideoResizer thread
+    let video_source_clone = video_source.clone();
     let capture_handle = thread::spawn(move || {
-        let mut cp_frame_id = 0_u64;
+        let resizer = VideoResizer::new();
+
+        let result = if let Ok(cam_id) = video_source_clone.parse::<i32>() {
+            log::info!("Starting camera capture from device {}", cam_id);
+            resizer.resize_camera(cam_id, cupture_frame_tx)
+        } else {
+            log::info!("Starting file/stream capture from {}", video_source_clone);
+            resizer.resize_stream(&video_source_clone, cupture_frame_tx)
+        };
+
+        if let Err(e) = result {
+            log::error!("Video capture error: {}", e);
+        }
+
+        log::debug!("Capture thread: Ending");
+    });
+
+    // Create frame conversion thread - converts Mat to RgbImage and sends to detector/output queues
+    let shutdown_rx_converter = shutdown_rx_capture;
+    let converter_handle = thread::spawn(move || {
+        let mut frame_id = 0_u64;
+        let mut input_fps = 20.0_f64;
+
         loop {
-            // Check for shutdown signal (non-blocking)
-            if let Ok(_) = shutdown_rx_capture.try_recv() {
-                log::debug!("Capture thread received shutdown signal");
+            // Check for shutdown signal
+            if let Ok(_) = shutdown_rx_converter.try_recv() {
+                log::debug!("Converter thread received shutdown signal");
                 break;
             }
-
             let frame_start = Instant::now();
-            cp_frame_id += 1;
+            let capture_frame_duration = Duration::from_secs_f64(1.0 / input_fps as f64);
 
             // Pace to target FPS - sleep for remaining time in this frame period
             let elapsed = frame_start.elapsed();
@@ -382,30 +358,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::thread::sleep(capture_frame_duration - elapsed);
             }
 
-            match capture_frame(&mut cap) {
-                Ok(frame) => {
-                    let capture_time = Instant::now();
-                    let frame_arc = Arc::new(frame); // Wrap in Arc for zero-copy sharing
+            match cupture_frame_rx.try_recv() {
+                Ok(capture) => {
+                    input_fps = capture.fps;
 
-                    // Send to output queue (NON-BLOCKING - drop if queue full)
+                    frame_id += 1;
+                    let capture_time = Instant::now();
+                    let frame_arc = Arc::new(capture.resized_image);
+
+                    // Send to output queue (NON-BLOCKING)
                     let _ = output_tx.try_send((Arc::clone(&frame_arc), capture_time));
 
-                    // Send to detector queue (NON-BLOCKING - drop if queue full)
+                    // Send to detector queue (NON-BLOCKING)
                     let _ = detector_tx.try_send((frame_arc, capture_time));
 
-                    log::debug!("Dispatching frame {} for processing", cp_frame_id);
+                    log::debug!("Dispatching frame {} for processing", frame_id);
+
+                    if capture.has_frames == false {
+                        log::info!("No more frames in stream, exiting");
+                        let _ = shutdown_tx_display.send(());
+                        break;
+                    }
                 }
                 Err(_) => {
-                    // End of video - send termination signal
-                    log::debug!("Capture thread: End of video");
-                    let _ = shutdown_tx_display.send(()); // Signal main loop thread to shutdown
-                    break;
+                    // No frame available
+                    continue;
                 }
             }
         }
 
-        // Ensure channels are closed on shutdown
-        log::debug!("Capture thread: Closing channels");
+        log::debug!("Converter thread: Closing channels");
     });
 
     let video_pipeline_for_detector = Arc::clone(&video_pipeline);
@@ -421,8 +403,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 video_pipeline_for_detector.shutdown();
                 break;
             }
-
-            let frame_start = Instant::now();
 
             // Drain DETECTOR queue to get only the LATEST frame
             // This naturally skips frames - if detection is slow, many frames accumulate and we only take the newest
@@ -468,11 +448,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Pace to target FPS - sleep for remaining time in this frame period
-            let elapsed = frame_start.elapsed();
-            if elapsed < capture_frame_duration {
-                std::thread::sleep(capture_frame_duration - elapsed);
-            }
+            // Pace to ~30 FPS for detection thread
+            std::thread::sleep(Duration::from_millis(33));
         }
     });
 
@@ -867,7 +844,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send shutdown signals to all threads when main loop ends
     log::info!("Main loop ended, shutting down all threads");
-    let _ = shutdown_tx_capture.send(()).is_ok() && capture_handle.join().is_ok();
+    let _ = shutdown_tx_capture.send(()).is_ok() && converter_handle.join().is_ok();
+    let _ = capture_handle.join().is_ok();
     let _ = shutdown_tx_detector.send(()).is_ok() && detector_handle.join().is_ok();
     let _ = shutdown_tx_stats.send(()).is_ok() && stats_handle.join().is_ok();
     let _ = shutdown_tx_writer.send(()).is_ok() && writer_handle.join().is_ok();

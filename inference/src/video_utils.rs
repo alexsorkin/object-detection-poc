@@ -2,13 +2,51 @@
 
 use crate::error::DetectionError;
 use crossbeam::channel::Sender;
+use image::RgbImage;
 use opencv::{
     core::{Mat, Size},
-    imgproc::{self, INTER_LINEAR},
+    imgproc::{self, INTER_CUBIC},
     prelude::*,
     videoio::{self, VideoCapture, CAP_ANY},
 };
 use std::path::Path;
+
+/// Captured input containing both original and resized images with metadata
+#[derive(Clone)]
+pub struct CaptureInput {
+    /// The original image (full resolution)
+    pub original_image: RgbImage,
+    /// The resized image (max 640px on largest axis)
+    pub resized_image: RgbImage,
+    /// Frames per second of the source
+    pub fps: f64,
+    /// Original width before resizing
+    pub original_width: i32,
+    /// Original height before resizing
+    pub original_height: i32,
+    /// Whether more frames are available (false when stream ends)
+    pub has_frames: bool,
+}
+
+impl CaptureInput {
+    /// Create a new CaptureInput
+    pub fn new(
+        original_image: RgbImage,
+        resized_image: RgbImage,
+        fps: f64,
+        original_width: i32,
+        original_height: i32,
+    ) -> Self {
+        Self {
+            original_image,
+            resized_image,
+            fps,
+            original_width,
+            original_height,
+            has_frames: true,
+        }
+    }
+}
 
 /// Video resizer that captures frames from a source and outputs resized frames
 pub struct VideoResizer {
@@ -31,16 +69,14 @@ impl VideoResizer {
     ///
     /// # Arguments
     /// * `source_path` - Path to video file or camera device (e.g., "/dev/video0", "rtsp://...", "video.mp4")
-    /// * `resized_tx` - Channel sender for resized frames
-    /// * `original_tx` - Channel sender for original (unresized) frames
+    /// * `frame_tx` - Channel sender for input frames (containing both original and resized images)
     ///
     /// # Returns
     /// Result indicating success or error
     pub fn resize_stream(
         &self,
         source_path: impl AsRef<Path>,
-        resized_tx: Sender<Mat>,
-        original_tx: Sender<Mat>,
+        frame_tx: Sender<CaptureInput>,
     ) -> Result<(), DetectionError> {
         let path = source_path.as_ref();
         let path_str = path
@@ -53,23 +89,21 @@ impl VideoResizer {
         let capture = VideoCapture::from_file(path_str, CAP_ANY)
             .map_err(|e| DetectionError::Other(format!("Failed to open video source: {}", e)))?;
 
-        self.process_capture(capture, resized_tx, original_tx)
+        self.process_capture(capture, frame_tx)
     }
 
     /// Resize a video stream from a camera by index
     ///
     /// # Arguments
     /// * `camera_index` - Camera device index (0 for default camera, 1 for second camera, etc.)
-    /// * `resized_tx` - Channel sender for resized frames
-    /// * `original_tx` - Channel sender for original (unresized) frames
+    /// * `frame_tx` - Channel sender for input frames (containing both original and resized images)
     ///
     /// # Returns
     /// Result indicating success or error
     pub fn resize_camera(
         &self,
         camera_index: i32,
-        resized_tx: Sender<Mat>,
-        original_tx: Sender<Mat>,
+        frame_tx: Sender<CaptureInput>,
     ) -> Result<(), DetectionError> {
         log::info!("Opening camera device: {}", camera_index);
 
@@ -77,15 +111,14 @@ impl VideoResizer {
         let capture = VideoCapture::new(camera_index, CAP_ANY)
             .map_err(|e| DetectionError::Other(format!("Failed to open camera: {}", e)))?;
 
-        self.process_capture(capture, resized_tx, original_tx)
+        self.process_capture(capture, frame_tx)
     }
 
     /// Process frames from a VideoCapture source
     fn process_capture(
         &self,
         mut capture: VideoCapture,
-        resized_tx: Sender<Mat>,
-        original_tx: Sender<Mat>,
+        frame_tx: Sender<CaptureInput>,
     ) -> Result<(), DetectionError> {
         if !capture.is_opened().unwrap_or(false) {
             return Err(DetectionError::Other(
@@ -94,11 +127,25 @@ impl VideoResizer {
         }
 
         // Get video properties
-        let width = capture.get(videoio::CAP_PROP_FRAME_WIDTH).unwrap_or(0.0) as i32;
-        let height = capture.get(videoio::CAP_PROP_FRAME_HEIGHT).unwrap_or(0.0) as i32;
-        let fps = capture.get(videoio::CAP_PROP_FPS).unwrap_or(30.0);
+        let original_width = capture.get(videoio::CAP_PROP_FRAME_WIDTH).unwrap_or(0.0) as i32;
+        let original_height = capture.get(videoio::CAP_PROP_FRAME_HEIGHT).unwrap_or(0.0) as i32;
+        let mut fps = capture.get(videoio::CAP_PROP_FPS).unwrap_or(0.0);
 
-        log::info!("Video properties: {}x{} @ {:.2} FPS", width, height, fps);
+        // Handle invalid FPS (common with cameras)
+        if fps <= 0.0 {
+            log::warn!(
+                "Video source returned invalid FPS ({}), defaulting to 30.0",
+                fps
+            );
+            fps = 30.0;
+        }
+
+        log::info!(
+            "Video properties: {}x{} @ {:.2} FPS",
+            original_width,
+            original_height,
+            fps
+        );
 
         let mut frame = Mat::default();
         let mut frame_count = 0_u64;
@@ -111,27 +158,41 @@ impl VideoResizer {
 
             if !read_success || frame.empty() {
                 log::info!("End of video stream after {} frames", frame_count);
+
+                // Send final frame with has_frames=false to signal end of stream
+                let empty_image = RgbImage::new(1, 1);
+                let end_frame = CaptureInput {
+                    original_image: empty_image.clone(),
+                    resized_image: empty_image,
+                    fps,
+                    original_width,
+                    original_height,
+                    has_frames: false,
+                };
+                let _ = frame_tx.send(end_frame);
                 break;
             }
 
             frame_count += 1;
 
-            // Send original frame to original channel
-            let original_frame = frame.try_clone().map_err(|e| {
-                DetectionError::Other(format!("Failed to clone original frame: {}", e))
-            })?;
+            // Convert original frame to RgbImage
+            let original_image = self.mat_to_rgb_image(&frame)?;
 
-            if original_tx.send(original_frame).is_err() {
-                log::warn!("Original frame channel closed, stopping video capture");
-                break;
-            }
+            // Resize frame if needed and convert to RgbImage
+            let resized_image = self.resize_frame(&frame)?;
 
-            // Resize frame if needed
-            let resized_frame = self.resize_frame(&frame)?;
+            // Create CaptureInput with both original and resized images
+            let capture_input = CaptureInput::new(
+                original_image,
+                resized_image,
+                fps,
+                original_width,
+                original_height,
+            );
 
-            // Send resized frame to resized channel
-            if resized_tx.send(resized_frame).is_err() {
-                log::warn!("Resized frame channel closed, stopping video capture");
+            // Send to channel
+            if frame_tx.send(capture_input).is_err() {
+                log::warn!("Frame channel closed, stopping video capture");
                 break;
             }
 
@@ -144,11 +205,36 @@ impl VideoResizer {
         Ok(())
     }
 
+    /// Convert OpenCV Mat (BGR) to RgbImage
+    fn mat_to_rgb_image(&self, mat: &Mat) -> Result<RgbImage, DetectionError> {
+        // Convert BGR to RGB
+        let mut rgb_mat = Mat::default();
+        imgproc::cvt_color(
+            mat,
+            &mut rgb_mat,
+            imgproc::COLOR_BGR2RGB,
+            0,
+            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )
+        .map_err(|e| DetectionError::Other(format!("Failed to convert BGR to RGB: {}", e)))?;
+
+        // Convert to RgbImage
+        let width = rgb_mat.cols() as u32;
+        let height = rgb_mat.rows() as u32;
+        let data = rgb_mat
+            .data_bytes()
+            .map_err(|e| DetectionError::Other(format!("Failed to get image data: {}", e)))?
+            .to_vec();
+
+        RgbImage::from_vec(width, height, data)
+            .ok_or_else(|| DetectionError::Other("Failed to create RgbImage".to_string()))
+    }
+
     /// Resize a single frame according to the max axis size
     ///
     /// Frames with largest axis <= max_axis_size are returned as-is
     /// Frames with largest axis > max_axis_size are resized proportionally
-    fn resize_frame(&self, frame: &Mat) -> Result<Mat, DetectionError> {
+    fn resize_frame(&self, frame: &Mat) -> Result<RgbImage, DetectionError> {
         let height = frame.rows();
         let width = frame.cols();
 
@@ -156,10 +242,8 @@ impl VideoResizer {
         let max_dimension = width.max(height);
 
         if max_dimension <= self.max_axis_size {
-            // Frame is small enough, return as-is (clone to avoid ownership issues)
-            return frame
-                .try_clone()
-                .map_err(|e| DetectionError::Other(format!("Failed to clone frame: {}", e)));
+            // Frame is small enough, convert to RGB and return as-is
+            return self.mat_to_rgb_image(frame);
         }
 
         // Calculate new dimensions preserving aspect ratio
@@ -176,7 +260,7 @@ impl VideoResizer {
             scale
         );
 
-        // Resize frame
+        // Resize frame using high-quality bicubic interpolation
         let mut resized = Mat::default();
         imgproc::resize(
             frame,
@@ -184,11 +268,12 @@ impl VideoResizer {
             Size::new(new_width, new_height),
             0.0,
             0.0,
-            INTER_LINEAR,
+            INTER_CUBIC, // Bicubic interpolation for better quality
         )
         .map_err(|e| DetectionError::Other(format!("Failed to resize frame: {}", e)))?;
 
-        Ok(resized)
+        // Convert resized frame to RgbImage
+        self.mat_to_rgb_image(&resized)
     }
 
     /// Get the current max axis size setting
