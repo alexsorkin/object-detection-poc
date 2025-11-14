@@ -40,6 +40,7 @@ pub mod error;
 pub mod ffi; // Unity/C# integration
 pub mod image_utils; // Image manipulation utilities
 pub mod types;
+pub mod video_utils; // Video capture and resizing utilities
 
 // Export the detectors
 pub use detector_rtdetr::RTDETRDetector;
