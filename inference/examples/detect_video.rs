@@ -83,14 +83,9 @@ fn capture_frame(cap: &mut VideoCapture) -> Result<RgbImage, Box<dyn std::error:
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
 
-    // Print immediately before anything else
-    eprintln!("🚀 Starting detect_video example...");
-    io::stderr().flush()?;
-
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     eprintln!("📝 Parsing arguments...");
-    io::stderr().flush()?;
 
     let args: Vec<String> = env::args().collect();
     eprintln!("   Args: {:?}", args);
@@ -101,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
     let mut headless = false; // Default: show display window
     let mut model_variant = RTDETRModel::R18VD_FP32; // Default: r18_fp32
-    let mut tracking_method = TrackingMethod::Kalman; // Default: Kalman
+    let mut tracking_method = TrackingMethod::ByteTrack; // Default: Kalman
     let mut video_source: Option<String> = None;
 
     // Parse all arguments in any order
@@ -190,9 +185,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "test_data/airport.mp4".to_string()
     });
 
-    eprintln!("🎯 Real-Time Video Detection with Multi-Tracker Support\n");
-    io::stderr().flush()?;
-
     // Open video source
     eprint!("📹 Opening video source: {}... ", video_source);
     io::stderr().flush()?;
@@ -216,19 +208,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cap.set(videoio::CAP_PROP_FPS, fps)?;
     }
 
-    let total_frames = cap.get(videoio::CAP_PROP_FRAME_COUNT).unwrap_or(0.0) as i32;
-
-    eprintln!("✓");
-    eprintln!("  • FPS: {:.1}", fps);
-    if total_frames > 0 {
-        eprintln!("  • Total frames: {}", total_frames);
-        eprintln!("  • Duration: {:.1}s", total_frames as f64 / fps);
-    }
-    io::stderr().flush()?;
-
-    // Create batch executor (replaces detector pool)
-    eprintln!("\n📦 Creating batch executor...");
-    io::stderr().flush()?;
     let detector_type = DetectorType::RTDETR;
     let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
@@ -319,8 +298,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
     eprintln!("  • Classes: {:?}", allowed_classes);
     eprintln!("  • Tracker: {}", tracking_method);
-    eprintln!("  • Output FPS: {:.1} (matching input)", fps);
-    eprintln!("  • Max latency for extrapolation: 500ms");
     eprintln!(
         "  • Display mode: {}",
         if headless {
