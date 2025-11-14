@@ -293,7 +293,7 @@ impl UnifiedTracker {
                             // Debug: Log track positions before metadata update
                             for detection in &tracked_detections {
                                 if let Some(track_id) = detection.track_id {
-                                    log::debug!(
+                                    log::trace!(
                                         "Track {} update: pos=({:.1}, {:.1}) size=({:.1}x{:.1}) before metadata",
                                         track_id, detection.x, detection.y, detection.w, detection.h
                                     );
@@ -341,7 +341,7 @@ impl UnifiedTracker {
                     match tracker.update(empty_detections.view(), true, false) {
                         Ok(tracks) => {
                             log::debug!("UnifiedTracker: predict got {} tracks", tracks.nrows());
-                            let mut predictions = tracker_output_to_tile_detection(&tracks);
+                            let predictions = tracker_output_to_tile_detection(&tracks);
 
                             // Debug: Log prediction results before metadata application
                             for prediction in &predictions {
@@ -353,8 +353,10 @@ impl UnifiedTracker {
                                 }
                             }
 
-                            // Apply metadata to predictions
-                            for prediction in &mut predictions {
+                            // Apply metadata to predictions and filter out tracks without metadata
+                            let mut valid_predictions = Vec::with_capacity(predictions.len());
+
+                            for mut prediction in predictions {
                                 if let Some(track_id) = prediction.track_id {
                                     if let Some(metadata) = track_metadata.get(&track_id) {
                                         prediction.class_id = metadata.class_id;
@@ -362,26 +364,33 @@ impl UnifiedTracker {
                                         prediction.confidence = metadata.last_confidence;
 
                                         log::trace!(
-                                            "Track {} predict: applied metadata class_id={} confidence={:.2}",
-                                            track_id, metadata.class_id, metadata.last_confidence
+                                            "Track {} predict: class_id={} '{}' confidence={:.2}",
+                                            track_id,
+                                            metadata.class_id,
+                                            metadata.class_name,
+                                            metadata.last_confidence
                                         );
+
+                                        valid_predictions.push(prediction);
                                     } else {
+                                        // Track exists but has no metadata yet (newly created or never matched)
+                                        // Skip this track - it hasn't been validated by actual detections
                                         log::trace!(
-                                            "Track {} predict: no metadata found",
+                                            "Track {} predict: skipping - no metadata found",
                                             track_id
                                         );
                                     }
                                 }
                             }
 
-                            // Store predictions
+                            // Store only valid predictions
                             {
                                 let mut cached_predictions = last_predictions.lock().unwrap();
-                                *cached_predictions = Arc::new(predictions);
+                                *cached_predictions = Arc::new(valid_predictions);
                             }
                         }
                         Err(e) => {
-                            log::error!("UnifiedTracker prediction failed: {:?}", e);
+                            log::error!("UnifiedTracker: prediction failed: {:?}", e);
                         }
                     }
 
@@ -489,6 +498,13 @@ impl UnifiedTracker {
         // Use Hungarian algorithm for optimal assignment
         let assignment_result = HungarianSolver::solve_iou(iou_matrix.view(), 0.3);
 
+        log::trace!(
+            "update_track_metadata: {} detections, {} tracks, {} assignments",
+            num_detections,
+            num_tracks,
+            assignment_result.assignments.len()
+        );
+
         // Apply metadata for valid assignments
         for (det_idx, track_idx) in assignment_result.assignments {
             if let (Some(detection), Some(tracked_det)) = (
@@ -508,6 +524,14 @@ impl UnifiedTracker {
                     tracked_det.class_id = metadata.class_id;
                     tracked_det.class_name = (*metadata.class_name).clone();
                     tracked_det.confidence = metadata.last_confidence;
+
+                    log::trace!(
+                        "Track {} assigned to detection: class_id={} '{}' conf={:.2}",
+                        track_id,
+                        metadata.class_id,
+                        metadata.class_name,
+                        metadata.last_confidence
+                    );
                 }
             }
         }
