@@ -4,6 +4,7 @@
 use crate::bbox::Bbox;
 use crate::box_tracker::{KalmanBoxTracker, KalmanBoxTrackerParams};
 use crate::hungarian::HungarianSolver;
+use crate::spatial::SpatialTracker;
 use ndarray::prelude::*;
 use num::cast;
 use rayon::prelude::*;
@@ -27,6 +28,9 @@ pub struct SortMultiTracker {
     temp_track_data: Vec<Vec<f32>>,
     temp_assignments: Vec<(u32, Bbox<f32>, u32)>,
     temp_unmatched: Vec<(f32, Bbox<f32>, u32)>,
+    // Spatial indexing for dense scenarios
+    spatial_tracker: SpatialTracker,
+    spatial_threshold: u32,
 }
 
 impl SortMultiTracker {
@@ -51,6 +55,8 @@ impl SortMultiTracker {
             temp_track_data: Vec::new(),
             temp_assignments: Vec::new(),
             temp_unmatched: Vec::new(),
+            spatial_tracker: SpatialTracker::new(100.0),
+            spatial_threshold: 100,
         }
     }
 
@@ -166,6 +172,20 @@ impl SortMultiTracker {
         self.temp_assignments.clear();
         self.temp_unmatched.clear();
 
+        // Use spatial indexing for dense scenarios
+        let num_tracklets = tracklet_boxes.nrows() as u32;
+        if num_tracklets >= self.spatial_threshold {
+            self.update_tracklets_spatial(detection_boxes, tracklet_boxes)
+        } else {
+            self.update_tracklets_standard(detection_boxes, tracklet_boxes)
+        }
+    }
+
+    fn update_tracklets_standard(
+        &mut self,
+        detection_boxes: ArrayView2<f32>,
+        tracklet_boxes: ArrayView2<f32>,
+    ) -> anyhow::Result<ScoreBoxes> {
         // Use optimized IOU calculation if available
         let det_track_ious = crate::bbox::ious_optimized(detection_boxes, tracklet_boxes);
         let assignment_result =
@@ -194,6 +214,116 @@ impl SortMultiTracker {
                         .push((track_id, det_box, det_idx as u32));
                 }
             } else {
+                self.temp_unmatched.push((score, det_box, det_idx as u32));
+            }
+        }
+
+        // Process unassigned detections
+        for det_idx in assignment_result.unassigned_detections {
+            if det_idx >= detection_boxes.nrows() {
+                continue;
+            }
+
+            let det_row = detection_boxes.row(det_idx);
+            if det_row.len() < 5 {
+                continue;
+            }
+
+            let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
+            let score = det_row[4];
+            self.temp_unmatched.push((score, det_box, det_idx as u32));
+        }
+
+        // Update tracklets
+        for (track_id, bbox, det_idx) in &self.temp_assignments {
+            if let Some(tracklet) = self.tracklets.get_mut(track_id) {
+                tracklet.det_idx = *det_idx;
+                if tracklet.update(bbox.clone()).is_err() {
+                    // Failed to update Kalman filter, remove tracklet
+                    self.tracklets.remove(track_id);
+                }
+            }
+        }
+
+        // Return cloned unmatched detections (avoiding move)
+        Ok(self.temp_unmatched.clone())
+    }
+
+    fn update_tracklets_spatial(
+        &mut self,
+        detection_boxes: ArrayView2<f32>,
+        tracklet_boxes: ArrayView2<f32>,
+    ) -> anyhow::Result<ScoreBoxes> {
+        // Convert arrays to spatial format
+        let mut detections = Vec::new();
+        for i in 0..detection_boxes.nrows() {
+            let row = detection_boxes.row(i);
+            if row.len() >= 5 {
+                detections.push([row[0], row[1], row[2], row[3]]);
+            }
+        }
+
+        let mut tracks = Vec::new();
+        for i in 0..tracklet_boxes.nrows() {
+            let row = tracklet_boxes.row(i);
+            if row.len() >= 5 {
+                tracks.push([row[0], row[1], row[2], row[3]]);
+            }
+        }
+
+        // Update spatial tracker with current frame data
+        self.spatial_tracker.update(&detections, &tracks);
+
+        // Generate candidate pairs using spatial indexing
+        let candidate_pairs = self.spatial_tracker.get_candidate_pairs();
+
+        // Calculate IOUs only for candidate pairs - create sparse matrix
+        let mut iou_matrix = Array2::zeros((detection_boxes.nrows(), tracklet_boxes.nrows()));
+        for (det_idx, track_idx) in candidate_pairs {
+            if det_idx >= detection_boxes.nrows() || track_idx >= tracklet_boxes.nrows() {
+                continue;
+            }
+
+            let det_row = detection_boxes.row(det_idx);
+            let track_row = tracklet_boxes.row(track_idx);
+
+            if det_row.len() < 5 || track_row.len() < 5 {
+                continue;
+            }
+
+            let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
+            let track_box = Bbox::new(track_row[0], track_row[1], track_row[2], track_row[3]);
+
+            let iou = crate::bbox::calculate_iou(&det_box, &track_box);
+            iou_matrix[[det_idx, track_idx]] = iou;
+        }
+
+        // Use Hungarian algorithm with sparse matrix
+        let assignment_result = HungarianSolver::solve_iou(iou_matrix.view(), self.iou_threshold);
+
+        // Process assignments
+        for (det_idx, track_idx) in assignment_result.assignments {
+            if det_idx >= detection_boxes.nrows() || track_idx >= tracklet_boxes.nrows() {
+                continue;
+            }
+
+            let det_row = detection_boxes.row(det_idx);
+            if det_row.len() < 5 {
+                continue;
+            }
+
+            let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
+            let iou = iou_matrix[(det_idx, track_idx)];
+
+            if iou > self.iou_threshold {
+                let track_row = tracklet_boxes.row(track_idx);
+                if track_row.len() >= 5 {
+                    let track_id = track_row[4] as u32;
+                    self.temp_assignments
+                        .push((track_id, det_box, det_idx as u32));
+                }
+            } else {
+                let score = det_row[4];
                 self.temp_unmatched.push((score, det_box, det_idx as u32));
             }
         }
@@ -276,6 +406,21 @@ impl SortMultiTracker {
     /// Get current number of trackers
     pub fn num_trackers(&self) -> usize {
         self.tracklets.len()
+    }
+
+    /// Set the threshold for switching to spatial indexing
+    pub fn set_spatial_threshold(&mut self, threshold: u32) {
+        self.spatial_threshold = threshold;
+    }
+
+    /// Get spatial indexing statistics
+    pub fn get_spatial_stats(&self) -> (usize, usize, f64) {
+        let stats = self.spatial_tracker.efficiency_stats();
+        (
+            stats.candidate_pairs,
+            stats.total_possible_pairs,
+            stats.reduction_ratio as f64,
+        )
     }
 }
 

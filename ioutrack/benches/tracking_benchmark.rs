@@ -343,6 +343,68 @@ fn bench_spatial_indexing(c: &mut Criterion) {
                 })
             },
         );
+
+        // Test integrated spatial indexing in SORT tracker
+        let mut detections_5d = Vec::new();
+        for bbox in &scattered_dets {
+            detections_5d.extend_from_slice(bbox);
+            detections_5d.push(0.8); // confidence
+        }
+        let detections_array = Array2::from_shape_vec((n_objects, 5), detections_5d).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("sort_spatial_integrated", n_objects),
+            &detections_array,
+            |b, detection| {
+                b.iter_batched(
+                    || {
+                        let mut tracker = SortMultiTracker::new(
+                            5,
+                            3,
+                            0.3,
+                            0.5,
+                            [1.0, 1.0, 10.0, 10.0],
+                            [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001],
+                        );
+                        tracker.set_spatial_threshold(25); // Force spatial indexing for 50+ objects
+                        tracker
+                    },
+                    |mut tracker| {
+                        let _result = tracker
+                            .update(black_box(detection.view()), false, false)
+                            .unwrap();
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sort_standard_integrated", n_objects),
+            &detections_array,
+            |b, detection| {
+                b.iter_batched(
+                    || {
+                        let mut tracker = SortMultiTracker::new(
+                            5,
+                            3,
+                            0.3,
+                            0.5,
+                            [1.0, 1.0, 10.0, 10.0],
+                            [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001],
+                        );
+                        tracker.set_spatial_threshold(u32::MAX); // Disable spatial indexing
+                        tracker
+                    },
+                    |mut tracker| {
+                        let _result = tracker
+                            .update(black_box(detection.view()), false, false)
+                            .unwrap();
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
     }
     group.finish();
 }

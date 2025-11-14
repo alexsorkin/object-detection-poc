@@ -274,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracking_config = match tracking_method {
         TrackingMethod::Kalman => {
             TrackingConfig::Kalman(KalmanConfig {
-                max_age: 20,        // frames to keep track alive without detections (30*20ms = 600ms)
+                max_age: 30,        // frames to keep track alive without detections (30*20ms = 600ms)
                 min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // REDUCED from 0.3 to be more permissive for association
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
@@ -284,14 +284,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         TrackingMethod::ByteTrack => {
             TrackingConfig::ByteTrack(ByteTrackConfig {
-                max_age: 20,                               // frames to keep track alive (30*20ms = 600ms)
+                max_age: 30,                               // frames to keep track alive (30*20ms = 600ms)
                 min_hits: 1,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // IoU threshold for association (standard value)
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
-                high_score_threshold: 0.5,    // high confidence threshold
-                low_score_threshold: 0.1,     // low confidence threshold
                 measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise
                 process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001], // process noise
+                high_score_threshold: 0.5,    // high confidence threshold
+                low_score_threshold: 0.1,     // low confidence threshold
             })
         }
     };

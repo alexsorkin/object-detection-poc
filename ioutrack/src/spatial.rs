@@ -104,6 +104,7 @@ pub struct SpatialGridStats {
 
 /// Spatial index for efficient IOU computation in dense scenes
 /// Reduces the number of IOU calculations needed
+#[derive(Debug, Clone)]
 pub struct SpatialTracker {
     detection_grid: SpatialGrid,
     track_grid: SpatialGrid,
