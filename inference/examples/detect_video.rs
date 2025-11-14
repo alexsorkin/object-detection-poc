@@ -369,7 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (detector_tx, detector_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(3); // Detector queue with Arc to avoid cloning
     let (output_tx, output_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(3); // Output queue with Arc to avoid cloning
     let (writer_tx, writer_rx) = sync_channel::<(Mat, u32, u32)>(100);
-    let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(3);
+    let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(10);
 
     let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
 
@@ -803,24 +803,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         log::debug!("Main Loop: Starting iteration, checking for frames...");
 
-        if !headless {
-            while let Ok((mat, width, height)) = display_rx.try_recv() {
-                if !display_initialized.get() {
-                    let max_height = 640;
-                    let (window_width, window_height) = if height > max_height {
-                        // Scale down to 640p preserving aspect ratio
-                        let scale = max_height as f32 / height as f32;
-                        ((width as f32 * scale) as i32, max_height as i32)
-                    } else {
-                        // Use native resolution
-                        (width as i32, height as i32)
-                    };
+        while let Ok((mat, width, height)) = display_rx.recv_timeout(Duration::from_millis(2)) {
+            if !display_initialized.get() {
+                let max_height = 640;
+                let (window_width, window_height) = if height > max_height {
+                    // Scale down to 640p preserving aspect ratio
+                    let scale = max_height as f32 / height as f32;
+                    ((width as f32 * scale) as i32, max_height as i32)
+                } else {
+                    // Use native resolution
+                    (width as i32, height as i32)
+                };
+                if !headless {
                     let _ =
                         highgui::resize_window("Detection", window_width, window_height).is_ok();
-                    display_initialized.set(true);
                 }
-                latest_mat = mat.clone();
+                display_initialized.set(true);
             }
+            latest_mat = mat.clone();
+        }
+
+        if !headless {
             let _ = highgui::imshow("Detection", &latest_mat).is_ok();
 
             // Handle keyboard input with minimal delay (1ms for UI responsiveness)

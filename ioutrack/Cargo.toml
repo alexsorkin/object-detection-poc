@@ -22,3 +22,11 @@ rayon = "1.8" # Parallel processing
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"
+
+[[bench]]
+name = "tracking_benchmark"
+harness = false
+
+[[bench]]
+name = "hungarian_bench"
+harness = false
