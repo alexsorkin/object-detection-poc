@@ -892,6 +892,8 @@ pub enum RTDETRModel {
     R50VD_FP16,
     /// RT-DETR v2 with ResNet-50 backbone (FP32)
     R50VD_FP32,
+    /// RT-DETR v2 with ResNet-50 backbone (INT8)
+    R50VD_INT8,
 }
 
 impl RTDETRModel {
@@ -904,18 +906,20 @@ impl RTDETRModel {
             Self::R34VD_FP32 => "rtdetr_v2_r34vd_fp32.onnx",
             Self::R50VD_FP16 => "rtdetr_v2_r50vd_fp16.onnx",
             Self::R50VD_FP32 => "rtdetr_v2_r50vd_fp32.onnx",
+            Self::R50VD_INT8 => "rtdetr_v2_r50vd_int8.onnx",
         }
     }
 
     /// Get the model name as a string
     pub fn name(&self) -> &'static str {
         match self {
-            Self::R18VD_FP16 => "RT-DETR v2 R18 (FP16)",
-            Self::R18VD_FP32 => "RT-DETR v2 R18 (FP32)",
-            Self::R34VD_FP16 => "RT-DETR v2 R34 (FP16)",
-            Self::R34VD_FP32 => "RT-DETR v2 R34 (FP32)",
-            Self::R50VD_FP16 => "RT-DETR v2 R50 (FP16)",
-            Self::R50VD_FP32 => "RT-DETR v2 R50 (FP32)",
+            Self::R18VD_FP16 => "RT-DETR R18 (FP16)",
+            Self::R18VD_FP32 => "RT-DETR R18 (FP32)",
+            Self::R34VD_FP16 => "RT-DETR R34 (FP16)",
+            Self::R34VD_FP32 => "RT-DETR R34 (FP32)",
+            Self::R50VD_FP16 => "RT-DETR R50 (FP16)",
+            Self::R50VD_FP32 => "RT-DETR R50 (FP32)",
+            Self::R50VD_INT8 => "RT-DETR R50 (INT8)",
         }
     }
 
@@ -928,6 +932,7 @@ impl RTDETRModel {
             "r34vd_fp32" | "r34_fp32" | "r34-fp32" | "r34vd" | "r34" => Some(Self::R34VD_FP32),
             "r50vd_fp16" | "r50_fp16" | "r50-fp16" => Some(Self::R50VD_FP16),
             "r50vd_fp32" | "r50_fp32" | "r50-fp32" | "r50vd" | "r50" => Some(Self::R50VD_FP32),
+            "r50vd_int8" | "r50_int8" | "r50-int8" => Some(Self::R50VD_INT8),
             _ => None,
         }
     }
@@ -941,6 +946,7 @@ impl RTDETRModel {
             Self::R34VD_FP32,
             Self::R50VD_FP16,
             Self::R50VD_FP32,
+            Self::R50VD_INT8,
         ]
     }
 }

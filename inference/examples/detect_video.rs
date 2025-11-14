@@ -18,7 +18,7 @@
 ///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
 ///   --detector <type>       Detector type: rtdetr, yolov8 (default: rtdetr)
 ///   --model <variant>       RT-DETR model variant (default: r18_fp32)
-///                           Available: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32
+///                           Available: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32, r50_int8
 ///   --tracker <method>      Tracking method: kalman, bytetrack (default: kalman)
 ///   --headless              Run without display window (default: show window)
 ///
@@ -145,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         None => {
                             eprintln!(
-                                "Invalid model variant '{}'. Valid options: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32",
+                                "Invalid model variant '{}'. Valid options: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32, r50_int8",
                                 args[i]
                             );
                             return Ok(());
@@ -239,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         confidence_threshold,
         nms_threshold: 0.45,
         input_size: (640, 640),
-        use_gpu: false, // Use CPU instead of GPU/Metal
+        use_gpu: true, // Use CPU or GPU (CUDA/Metal/Vulkan)
         ..Default::default()
     };
 
