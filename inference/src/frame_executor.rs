@@ -132,7 +132,7 @@ impl FrameExecutor {
         command_rx: Receiver<FrameCommand>,
         max_queue_depth: usize,
     ) {
-        log::info!("FrameExecutor: executor loop started");
+        log::debug!("FrameExecutor: executor loop started");
         let mut frames_processed = 0_u64;
         let mut frames_dropped = 0_u64;
 

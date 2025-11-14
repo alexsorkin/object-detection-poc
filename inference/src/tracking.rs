@@ -259,7 +259,7 @@ impl UnifiedTracker {
         last_predictions: Arc<Mutex<Arc<Vec<TileDetection>>>>,
         command_rx: Receiver<TrackingCommand>,
     ) {
-        log::info!("UnifiedTracker command processor started");
+        log::debug!("UnifiedTracker: command processor started");
         let mut commands_processed = 0_u64;
         let mut track_metadata: HashMap<u32, TrackMetadata> = HashMap::with_capacity(64);
 
@@ -409,7 +409,7 @@ impl UnifiedTracker {
         command_tx: &Sender<TrackingCommand>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
-        log::info!("UnifiedTracker maintenance thread started (updating predictions every 20ms)");
+        log::debug!("UnifiedTracker: maintenance thread started");
 
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         let mut maintenance_cycles = 0_u64;

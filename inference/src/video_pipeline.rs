@@ -45,7 +45,6 @@ enum WorkerCommand {
 /// Internal tracker commands
 enum TrackerCommand {
     ProcessOutput(u64, Instant, ProcessedDetections),
-    AdvanceTracks,
     Shutdown,
 }
 
@@ -128,11 +127,8 @@ impl VideoPipeline {
         result_tx: Sender<FrameResult>,
         tracker: Arc<UnifiedTracker>,
     ) {
-        log::info!(
-            "Unified tracker loop started with {} tracker",
-            tracker.method()
-        );
-        let mut frames_extrapolated = 0_u64;
+        log::debug!("Tracker loop started with {} tracker", tracker.method());
+        let mut _frames_extrapolated = 0_u64;
         let mut last_frame_timestamp = Instant::now();
 
         // Pre-allocated buffers for better runtime performance
@@ -202,61 +198,7 @@ impl VideoPipeline {
 
                             last_frame_timestamp = timestamp;
                         }
-                        TrackerCommand::AdvanceTracks => {
-                            let now = Instant::now();
 
-                            let dt = now
-                                .duration_since(last_frame_timestamp)
-                                .as_secs_f32()
-                                .max(0.001) // Minimum 1ms to avoid zero dt
-                                .min(0.2); // Maximum 200ms to avoid huge jumps
-
-                            // Send predict command to async tracker
-                            if let Err(e) = tracker.send_predict(dt) {
-                                log::error!("Failed to send predict to tracker: {}", e);
-                            }
-
-                            // Get current cached predictions from tracker
-                            let tracked_predictions = tracker.get_predictions();
-
-                            log::debug!(
-                                "Advanced tracks: {} predictions, dt={:.3}s",
-                                tracked_predictions.len(),
-                                dt
-                            );
-
-                            // CREATE A RESULT WITH THE KALMAN/BYTETRACK PREDICTIONS!
-                            let result = FrameResult {
-                                frame_id: frames_extrapolated, // Use extrapolation count as frame ID
-                                timestamp: Instant::now(),
-                                detections: (*tracked_predictions).clone(), // Clone only when creating FrameResult
-                                is_extrapolated: true,                      // Mark as extrapolated
-                                processing_time_ms: 0.0, // No detection processing
-                                latency_ms: 0.0,         // Instant extrapolation
-                                duplicates_removed: 0,
-                                nested_removed: 0,
-                            };
-
-                            // SEND THE PREDICTED TRACKS TO THE RESULT CHANNEL
-                            let num_predictions = result.detections.len();
-                            if let Err(e) = result_tx.try_send(result) {
-                                log::warn!("Failed to send extrapolated result: {}", e);
-                            } else {
-                                log::debug!(
-                                    "Sent {} predicted tracks as extrapolated result",
-                                    num_predictions
-                                );
-                            }
-
-                            //log::warn!("Advancing trackers for dropped frame (pipeline busy)");
-
-                            frames_extrapolated += 1;
-
-                            // Log statistics every 50 dropped frames
-                            if frames_extrapolated % 50 == 0 {
-                                log::debug!("Dropped frames handled: {}", frames_extrapolated);
-                            }
-                        }
                         TrackerCommand::Shutdown => {
                             log::debug!("Tracker loop received shutdown command");
                             break;
@@ -269,11 +211,6 @@ impl VideoPipeline {
                 }
             }
         }
-
-        log::info!(
-            "UnifiedTracker: tracker loop stopped (total extrapolated: {})",
-            frames_extrapolated
-        );
     }
 
     /// Worker thread: handles commands and triggers detection
@@ -330,7 +267,7 @@ impl VideoPipeline {
                                             frame_id, timestamp, processed,
                                         ))
                                     {
-                                        log::warn!("Failed to send detection output: {}", e);
+                                        log::debug!("Failed to send detection output: {}", e);
                                     }
                                 },
                             );
@@ -381,15 +318,6 @@ impl VideoPipeline {
         self.tracker.get_predictions()
     }
 
-    /// Advance tracker predictions for dropped frames (async, non-blocking)
-    /// This advances the tracker's motion models without processing a frame
-    pub fn advance_tracks(&self) -> bool {
-        // Send a command to advance tracker predictions to the unified tracker loop
-        self.tracker_tx
-            .try_send(TrackerCommand::AdvanceTracks)
-            .is_ok()
-    }
-
     /// Shutdown the video pipeline gracefully
     /// This will stop all worker threads and close all channels
     pub fn shutdown(&self) {
@@ -405,7 +333,7 @@ impl VideoPipeline {
 
 impl Drop for VideoPipeline {
     fn drop(&mut self) {
-        log::warn!("VideoPipeline dropping - shutting down threads");
+        log::debug!("VideoPipeline dropping - shutting down threads");
 
         // Send shutdown signals using poison pill pattern
         let _ = self.command_tx.send(WorkerCommand::Shutdown);

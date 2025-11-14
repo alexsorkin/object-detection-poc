@@ -50,12 +50,25 @@ where
 
     predictions
         .par_iter()
-        .map(|det| {
+        .filter_map(|det| {
             let color = generate_class_color(det.get_class_id());
             let scaled_x = (det.get_x() * scale_x) as i32;
             let scaled_y = (det.get_y() * scale_y) as i32;
-            let scaled_w = (det.get_w() * scale_x) as u32;
-            let scaled_h = (det.get_h() * scale_y) as u32;
+            let scaled_w = det.get_w() * scale_x;
+            let scaled_h = det.get_h() * scale_y;
+
+            // Validate dimensions before casting to u32
+            if scaled_w <= 0.0 || scaled_h <= 0.0 {
+                log::warn!(
+                    "Invalid bbox dimensions - width: {}, height: {}, skipping",
+                    scaled_w,
+                    scaled_h
+                );
+                return None;
+            }
+
+            let scaled_w = scaled_w.max(1.0) as u32;
+            let scaled_h = scaled_h.max(1.0) as u32;
 
             let label = if let Some(track_id) = det.get_track_id() {
                 format!(
@@ -74,9 +87,9 @@ where
 
             let show_label = scaled_h > 20 && scaled_w > 30;
 
-            (
+            Some((
                 scaled_x, scaled_y, scaled_w, scaled_h, color, label, show_label,
-            )
+            ))
         })
         .collect()
 }
@@ -508,7 +521,16 @@ pub fn draw_rect_batch(img: &mut RgbImage, rects: &[(i32, i32, u32, u32, Rgb<u8>
     // Collect all pixels for all rectangles in parallel
     let pixel_updates: Vec<Vec<(u32, u32, Rgb<u8>)>> = rects
         .par_iter()
-        .map(|(x, y, width, height, color, thickness)| {
+        .filter_map(|(x, y, width, height, color, thickness)| {
+            // Validate dimensions before creating Rect
+            if *width == 0 || *height == 0 {
+                eprintln!(
+                    "Warning: Cannot draw rect with zero dimensions - width: {}, height: {}",
+                    width, height
+                );
+                return None;
+            }
+
             let mut pixels = Vec::new();
             let rect = Rect::at(*x, *y).of_size(*width, *height);
 
@@ -558,7 +580,7 @@ pub fn draw_rect_batch(img: &mut RgbImage, rects: &[(i32, i32, u32, u32, Rgb<u8>
                 }
             }
 
-            pixels
+            Some(pixels)
         })
         .collect();
 

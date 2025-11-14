@@ -404,7 +404,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Check for shutdown signal (non-blocking)
             if let Ok(_) = shutdown_rx_detector.try_recv() {
                 log::debug!("Detector thread received shutdown signal");
-                // Shutdown the video pipeline
                 video_pipeline_for_detector.shutdown();
                 break;
             }
@@ -419,9 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
                 // If we already have a frame, the previous one becomes a dropped frame
                 if latest_detector_frame.is_some() {
-                    // Advance tracker for the dropped frame (async, non-blocking)
-                    //video_pipeline_for_detector.advance_tracks();
-                    log::warn!("Advanced tracker for dropped frame (rt fps missed)");
+                    log::warn!("Extrapolating tracks for dropped frame");
                 }
 
                 latest_detector_frame = Some(frame_with_timestamp);
@@ -607,10 +604,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (scale_x, scale_y) =
                 calculate_scale_factors(origin_frame_width, origin_frame_height, 640.0);
 
-            // Get latest tracker predictions directly from video pipeline cache (synchronous)
-            // This bypasses the channel and gets predictions immediately from tracker cache
-            let latest_predictions = video_pipeline.get_predictions();
-            let num_tracks = latest_predictions
+            // Validate predictions before annotation to catch issues early
+            let valid_predictions: Vec<_> = video_pipeline
+                .get_predictions()
+                .iter()
+                .filter(|d| {
+                    // Check for valid bounding box dimensions
+                    if d.w <= 0.0 || d.h <= 0.0 {
+                        log::warn!(
+                            "Invalid prediction bbox - width: {}, height: {}, skipping",
+                            d.w,
+                            d.h
+                        );
+                        return false;
+                    }
+
+                    // Check for very small dimensions that might cause issues
+                    if d.w < 1.0 || d.h < 1.0 {
+                        log::warn!(
+                            "Too small prediction bbox - width: {}, height: {}, skipping",
+                            d.w,
+                            d.h
+                        );
+                        return false;
+                    }
+
+                    true
+                })
+                .cloned()
+                .collect();
+
+            let num_tracks = valid_predictions
                 .iter()
                 .filter(|d| d.track_id.is_some())
                 .count();
@@ -620,7 +644,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // PARALLEL: Pre-compute all annotation data (boxes, labels, colors)
             let annotation_data: Vec<_> =
-                prepare_annotation_data(&latest_predictions, scale_x, scale_y);
+                prepare_annotation_data(&valid_predictions, scale_x, scale_y);
 
             // PARALLEL BATCH: Prepare rectangle and label data for batch drawing
             let rects: Vec<_> = annotation_data
