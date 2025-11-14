@@ -736,9 +736,6 @@ pub struct DetectorConfig {
     /// Confidence threshold for detections (0-1)
     pub confidence_threshold: f32,
 
-    /// Non-maximum suppression threshold (0-1)
-    pub nms_threshold: f32,
-
     /// Maximum number of detections per frame
     pub max_detections: usize,
 
@@ -761,7 +758,6 @@ impl Default for DetectorConfig {
             model_path: "models/military_targets.onnx".to_string(),
             input_size: (640, 640),
             confidence_threshold: 0.5,
-            nms_threshold: 0.45,
             max_detections: 100,
             use_gpu: true,
             gpu_device_id: 0,

@@ -56,7 +56,6 @@ pub extern "C" fn mtd_create_detector(
     input_width: c_int,
     input_height: c_int,
     confidence_threshold: c_float,
-    nms_threshold: c_float,
     max_detections: c_int,
     use_gpu: c_int,
 ) -> c_int {
@@ -84,7 +83,6 @@ pub extern "C" fn mtd_create_detector(
         model_path: model_path_str.clone(),
         input_size: (input_width as u32, input_height as u32),
         confidence_threshold,
-        nms_threshold,
         max_detections: max_detections as usize,
         use_gpu: use_gpu != 0,
         gpu_device_id: 0,
@@ -138,7 +136,6 @@ pub extern "C" fn mtd_create_detector_legacy(
     input_width: c_int,
     input_height: c_int,
     confidence_threshold: c_float,
-    nms_threshold: c_float,
     max_detections: c_int,
     use_gpu: c_int,
 ) -> c_int {
@@ -148,7 +145,6 @@ pub extern "C" fn mtd_create_detector_legacy(
         input_width,
         input_height,
         confidence_threshold,
-        nms_threshold,
         max_detections,
         use_gpu,
     )
@@ -400,7 +396,6 @@ pub extern "C" fn mtd_get_class_color(class_id: c_int, rgb: *mut u8) {
 pub extern "C" fn mtd_update_config(
     _detector_id: c_int,
     _confidence_threshold: c_float,
-    _nms_threshold: c_float,
     _max_detections: c_int,
 ) -> c_int {
     // Not supported in current implementation

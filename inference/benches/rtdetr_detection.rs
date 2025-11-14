@@ -37,7 +37,6 @@ fn bench_rtdetr_detection(c: &mut Criterion) {
     let detector_config = DetectorConfig {
         model_path,
         confidence_threshold: 0.5,
-        nms_threshold: 0.45,
         input_size: (640, 640),
         use_gpu: false, // Use CPU for consistent benchmarking
         ..Default::default()
@@ -96,7 +95,6 @@ fn bench_rtdetr_batch_detection(c: &mut Criterion) {
     let detector_config = DetectorConfig {
         model_path,
         confidence_threshold: 0.5,
-        nms_threshold: 0.45,
         input_size: (640, 640),
         use_gpu: false,
         ..Default::default()
@@ -167,7 +165,6 @@ fn bench_confidence_thresholds(c: &mut Criterion) {
         let detector_config = DetectorConfig {
             model_path: model_path.clone(),
             confidence_threshold: threshold,
-            nms_threshold: 0.45,
             input_size: (640, 640),
             use_gpu: false,
             ..Default::default()

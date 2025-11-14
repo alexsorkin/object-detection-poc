@@ -237,26 +237,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let detector_config = DetectorConfig {
         model_path: format!("{}/{}", model_dir, model_variant.filename()),
         confidence_threshold,
-        nms_threshold: 0.45,
         input_size: (640, 640),
         use_gpu: true, // Use CPU or GPU (CUDA/Metal/Vulkan)
         ..Default::default()
     };
 
     let executor_config = ExecutorConfig {
-        max_queue_depth: 1, // Drop frames if more than 2 pending (backpressure control)
+        max_queue_depth: 1, // Drop frames if more than 1 pending (backpressure control)
     };
-    let max_queue_depth = executor_config.max_queue_depth; // Save before move
 
     let frame_executor = Arc::new(FrameExecutor::new(
         detector_type,
-        detector_config,
-        executor_config,
+        detector_config.clone(),
+        executor_config.clone(),
     )?);
 
     // Create detection pipeline
     let pipeline_config = PipelineConfig {
-        overlap: 32,
+        tile_overlap: 32,
         allowed_classes: allowed_classes.clone(),
         iou_threshold: 0.5,
     };
@@ -310,11 +308,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx_output, shutdown_rx_output) = sync_channel::<()>(1);
     let (shutdown_tx_display, shutdown_rx_display) = sync_channel::<()>(1);
 
-    eprintln!("  ✓ Pipeline ready (with {} tracker)", tracking_method);
+    eprintln!("  ✓ Pipeline ready");
     eprintln!("\n💡 Configuration:");
     eprintln!("  • Detector: {} (frame executor)", model_variant.name());
     eprintln!("  • Batch size: {}", batch_size);
-    eprintln!("  • Queue depth: {} (backpressure)", max_queue_depth);
+    eprintln!(
+        "  • Queue depth: {} (backpressure)",
+        executor_config.max_queue_depth
+    );
     eprintln!("  • Confidence: {:.0}%", confidence_threshold * 100.0);
     eprintln!("  • Classes: {:?}", allowed_classes);
     eprintln!("  • Tracker: {}", tracking_method);
@@ -351,13 +352,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_extrapolated = Arc::new(AtomicU32::new(0));
     let stats_latency_sum = Arc::new(AtomicU32::new(0)); // Store as integer (sum of ms)
     let stats_start = Instant::now();
-
-    eprintln!(
-        "📝 Detection strategy: Frame executor self-regulates backpressure (queue depth: {})",
-        max_queue_depth
-    );
-    eprintln!("📝 Starting async capture thread at {:.1} FPS\n", fps);
-    io::stderr().flush()?;
 
     // Create async capture thread - captures frames at video's native FPS
     // TWO separate queues:

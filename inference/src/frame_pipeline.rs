@@ -102,12 +102,12 @@ impl Default for PipelineOutput {
 #[derive(Clone)]
 pub struct PreprocessStage {
     tile_size: u32,
-    overlap: u32,
+    tile_overlap: u32,
 }
 
 impl PreprocessStage {
-    pub fn new(tile_size: u32, overlap: u32) -> Self {
-        Self { tile_size, overlap }
+    pub fn new(tile_size: u32, tile_overlap: u32) -> Self {
+        Self { tile_size, tile_overlap }
     }
 
     /// Resize image so the longer dimension fits tile_size while preserving aspect ratio
@@ -283,7 +283,7 @@ impl PreprocessStage {
             return positions;
         }
 
-        let stride = self.tile_size.saturating_sub(self.overlap);
+        let stride = self.tile_size.saturating_sub(self.tile_overlap);
         
         // Calculate number of tiles needed to cover the entire image
         let tiles_x = if img_width <= self.tile_size {
@@ -391,9 +391,9 @@ impl PreprocessStage {
         let tiles = task::spawn_blocking({
             let deshadowed_img = deshadowed_img.clone();
             let tile_size = self.tile_size;
-            let overlap = self.overlap;
+            let tile_overlap = self.tile_overlap;
             move || {
-                let preprocess_stage = PreprocessStage::new(tile_size, overlap);
+                let preprocess_stage = PreprocessStage::new(tile_size, tile_overlap);
                 preprocess_stage.extract_tiles(&deshadowed_img)
             }
         }).await.unwrap();
@@ -778,7 +778,7 @@ impl PostprocessStage {
 
 /// Detection pipeline configuration
 pub struct PipelineConfig {
-    pub overlap: u32,
+    pub tile_overlap: u32,
     pub allowed_classes: Vec<u32>,
     pub iou_threshold: f32,
 }
@@ -786,7 +786,7 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            overlap: 64,
+            tile_overlap: 64,
             allowed_classes: vec![2, 3, 4, 7], // car, motorcycle, airplane, truck
             iou_threshold: 0.5,
         }
@@ -808,7 +808,7 @@ impl DetectionPipeline {
         // Get tile size from detector's input size
         let (tile_size, _) = frame_executor.input_size();
 
-        let preprocess = PreprocessStage::new(tile_size, config.overlap);
+        let preprocess = PreprocessStage::new(tile_size, config.tile_overlap);
         let execution = ExecutionStage::new(frame_executor, tile_size, config.allowed_classes);
         let postprocess = PostprocessStage::new(config.iou_threshold);
 
