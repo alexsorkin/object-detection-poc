@@ -24,7 +24,6 @@ coverage.xml
 # Rust
 target/
 **/*.rs.bk
-Cargo.lock
 
 # Models and data
 *.onnx
