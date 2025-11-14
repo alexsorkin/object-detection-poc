@@ -32,8 +32,6 @@ pub struct Tile {
 #[derive(Clone)]
 pub struct PreprocessOutput {
     pub tiles: Vec<Tile>,  // Tiles extracted from deshadowed image (used for detection)
-    pub original_width: u32,
-    pub original_height: u32,
     pub resized_width: u32,
     pub resized_height: u32,
     pub resized_image: RgbImage,  // Original resized image (for annotation/visualization)
@@ -61,8 +59,6 @@ pub struct TileDetection {
 #[derive(Clone)]
 pub struct ExecutionOutput {
     pub detections: Vec<TileDetection>,
-    pub original_width: u32,
-    pub original_height: u32,
     pub resized_width: u32,
     pub resized_height: u32,
     pub resized_image: RgbImage,
@@ -72,8 +68,6 @@ pub struct ExecutionOutput {
 #[derive(Clone)]
 pub struct PipelineOutput {
     pub detections: Vec<TileDetection>,
-    pub original_width: u32,
-    pub original_height: u32,
     pub resized_width: u32,
     pub resized_height: u32,
     pub resized_image: RgbImage,
@@ -86,8 +80,6 @@ impl Default for PipelineOutput {
     fn default() -> Self {
         Self {
             detections: Vec::new(),
-            original_width: 0,
-            original_height: 0,
             resized_width: 0,
             resized_height: 0,
             resized_image: RgbImage::new(1, 1), // Minimal 1x1 dummy image
@@ -112,7 +104,7 @@ impl PreprocessStage {
 
     /// Resize image so the longer dimension fits tile_size while preserving aspect ratio
     /// This ensures the entire image fits within a single tile (no tiling needed)
-    fn resize_to_fit(&self, img: &RgbImage) -> RgbImage {
+    fn _resize_to_fit(&self, img: &RgbImage) -> RgbImage {
         let (width, height) = img.dimensions();
         
         // If both dimensions are already <= tile_size, no need to resize
@@ -293,9 +285,6 @@ impl PreprocessStage {
 
     /// Run pre-processing stage
     pub async fn process(&self, img: RgbImage) -> PreprocessOutput {
-        let original_width = img.width();
-        let original_height = img.height();
-
         // Resize image to fit tile_size on longer dimension while preserving aspect ratio
         // This ensures the entire image fits in a single tile
         let resized_img = img.clone(); //self.resize_to_fit(&img);
@@ -326,8 +315,6 @@ impl PreprocessStage {
         
         PreprocessOutput {
             tiles,
-            original_width,
-            original_height,
             resized_width,
             resized_height,
             resized_image: resized_img,  // Keep original resized for annotation
@@ -493,8 +480,6 @@ impl ExecutionStage {
         
         ExecutionOutput {
             detections: all_detections,
-            original_width: input.original_width,
-            original_height: input.original_height,
             resized_width: input.resized_width,
             resized_height: input.resized_height,
             resized_image: input.resized_image,
@@ -679,8 +664,6 @@ impl PostprocessStage {
 
         let output = PipelineOutput {
             detections: filtered_detections,
-            original_width: input.original_width,
-            original_height: input.original_height,
             resized_width: input.resized_width,
             resized_height: input.resized_height,
             resized_image: input.resized_image,

@@ -349,6 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::debug!("Converter thread received shutdown signal");
                 break;
             }
+
             let frame_start = Instant::now();
             let capture_frame_duration = Duration::from_secs_f64(1.0 / input_fps as f64);
 
@@ -364,13 +365,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     frame_id += 1;
                     let capture_time = Instant::now();
-                    let frame_arc = Arc::new(capture.resized_image);
 
                     // Send to output queue (NON-BLOCKING)
-                    let _ = output_tx.try_send((Arc::clone(&frame_arc), capture_time));
+                    let _ = output_tx.try_send((Arc::new(capture.original_image), capture_time));
 
                     // Send to detector queue (NON-BLOCKING)
-                    let _ = detector_tx.try_send((frame_arc, capture_time));
+                    let _ = detector_tx.try_send((Arc::new(capture.resized_image), capture_time));
 
                     log::debug!("Dispatching frame {} for processing", frame_id);
 
