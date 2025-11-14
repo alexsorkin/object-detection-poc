@@ -44,6 +44,23 @@ impl HungarianSolver {
             };
         }
 
+        // Check sparsity and use optimized algorithm for sparse matrices
+        let valid_count = cost_matrix.iter().filter(|&&x| x < threshold).count();
+        let total_entries = num_detections * num_tracks;
+
+        // Use greedy assignment for very sparse matrices (< 25% valid entries)
+        if valid_count < total_entries / 4 {
+            return Self::solve_greedy(cost_matrix, threshold);
+        }
+
+        Self::solve_hungarian(cost_matrix, threshold)
+    }
+
+    /// Full Hungarian algorithm implementation
+    fn solve_hungarian(cost_matrix: ArrayView2<f32>, threshold: f32) -> AssignmentResult {
+        let num_detections = cost_matrix.nrows();
+        let num_tracks = cost_matrix.ncols();
+
         // Convert to integer cost matrix for pathfinding crate with parallel processing
         let max_cost = 1_000_000i32; // Large value for invalid assignments
         let threshold_int = (threshold * 1000.0) as i32;
@@ -108,6 +125,61 @@ impl HungarianSolver {
             .into_par_iter()
             .filter(|&i| !assigned_tracks[i])
             .collect();
+
+        AssignmentResult {
+            assignments,
+            unassigned_detections,
+            unassigned_tracks,
+            total_cost,
+        }
+    }
+
+    /// Greedy assignment algorithm for sparse cost matrices
+    /// Much faster than Hungarian when most assignments are invalid
+    fn solve_greedy(cost_matrix: ArrayView2<f32>, threshold: f32) -> AssignmentResult {
+        let num_detections = cost_matrix.nrows();
+        let num_tracks = cost_matrix.ncols();
+
+        // Collect all valid assignments with their costs
+        let mut candidates: Vec<(f32, usize, usize)> = Vec::new();
+
+        for i in 0..num_detections {
+            for j in 0..num_tracks {
+                let cost = cost_matrix[[i, j]];
+                if cost < threshold {
+                    candidates.push((cost, i, j));
+                }
+            }
+        }
+
+        // Sort by cost (ascending - best assignments first)
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Greedily assign
+        let mut assignments = Vec::new();
+        let mut used_detections = vec![false; num_detections];
+        let mut used_tracks = vec![false; num_tracks];
+
+        for (_cost, det_idx, track_idx) in candidates {
+            if !used_detections[det_idx] && !used_tracks[track_idx] {
+                assignments.push((det_idx, track_idx));
+                used_detections[det_idx] = true;
+                used_tracks[track_idx] = true;
+            }
+        }
+
+        // Collect unassigned indices
+        let unassigned_detections: Vec<usize> = (0..num_detections)
+            .filter(|&i| !used_detections[i])
+            .collect();
+
+        let unassigned_tracks: Vec<usize> = (0..num_tracks).filter(|&i| !used_tracks[i]).collect();
+
+        // Calculate total cost
+        let total_cost = assignments
+            .iter()
+            .map(|(det_idx, track_idx)| (cost_matrix[[*det_idx, *track_idx]] * 1000.0) as i32)
+            .sum();
 
         AssignmentResult {
             assignments,

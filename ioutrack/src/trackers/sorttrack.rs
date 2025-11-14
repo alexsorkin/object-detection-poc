@@ -1,7 +1,7 @@
 //! SORT (Simple Online Real-time Tracking) implementation
 //! Based on the original Python SORT algorithm adapted for pure Rust
 
-use crate::bbox::{ious, Bbox};
+use crate::bbox::Bbox;
 use crate::box_tracker::{KalmanBoxTracker, KalmanBoxTrackerParams};
 use crate::hungarian::HungarianSolver;
 use ndarray::prelude::*;
@@ -9,65 +9,7 @@ use num::cast;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
-type TrackidBoxes = Vec<(u32, Bbox<f32>, u32)>;
 type ScoreBoxes = Vec<(f32, Bbox<f32>, u32)>;
-
-/// Assign detection boxes to track boxes using Hungarian algorithm
-fn assign_detections_to_tracks(
-    detections: ArrayView2<f32>,
-    tracks: ArrayView2<f32>,
-    iou_threshold: f32,
-) -> anyhow::Result<(TrackidBoxes, ScoreBoxes)> {
-    let det_track_ious = ious(detections, tracks);
-    let assignment_result = HungarianSolver::solve_iou(det_track_ious.view(), iou_threshold);
-
-    let mut match_updates = Vec::new();
-    let mut unmatched_dets = Vec::new();
-
-    // Process assigned detections
-    for (det_idx, track_idx) in assignment_result.assignments {
-        if det_idx >= detections.nrows() || track_idx >= tracks.nrows() {
-            continue;
-        }
-
-        let det_row = detections.row(det_idx);
-        if det_row.len() < 5 {
-            continue;
-        }
-
-        let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
-        let score = det_row[4];
-        let iou = det_track_ious[(det_idx, track_idx)];
-
-        if iou > iou_threshold {
-            let track_row = tracks.row(track_idx);
-            if track_row.len() >= 5 {
-                let track_id = track_row[4] as u32;
-                match_updates.push((track_id, det_box, det_idx as u32));
-            }
-        } else {
-            unmatched_dets.push((score, det_box, det_idx as u32));
-        }
-    }
-
-    // Process unassigned detections
-    for det_idx in assignment_result.unassigned_detections {
-        if det_idx >= detections.nrows() {
-            continue;
-        }
-
-        let det_row = detections.row(det_idx);
-        if det_row.len() < 5 {
-            continue;
-        }
-
-        let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
-        let score = det_row[4];
-        unmatched_dets.push((score, det_box, det_idx as u32));
-    }
-
-    Ok((match_updates, unmatched_dets))
-}
 
 /// SORT (Simple Online Real-time Tracking) tracker
 #[derive(Debug, Clone)]
@@ -81,6 +23,10 @@ pub struct SortMultiTracker {
     process_noise: [f32; 7],
     pub tracklets: BTreeMap<u32, KalmanBoxTracker>,
     pub n_steps: u32,
+    // Memory pools for reused allocations
+    temp_track_data: Vec<Vec<f32>>,
+    temp_assignments: Vec<(u32, Bbox<f32>, u32)>,
+    temp_unmatched: Vec<(f32, Bbox<f32>, u32)>,
 }
 
 impl SortMultiTracker {
@@ -102,11 +48,17 @@ impl SortMultiTracker {
             process_noise,
             tracklets: BTreeMap::new(),
             n_steps: 0,
+            temp_track_data: Vec::new(),
+            temp_assignments: Vec::new(),
+            temp_unmatched: Vec::new(),
         }
     }
 
     /// Predict new positions for all tracklets and cleanup invalid ones
     pub fn predict_and_cleanup(&mut self) -> Array2<f32> {
+        // Clear and reuse temporary storage
+        self.temp_track_data.clear();
+
         // Parallel prediction and validation
         let track_data: Vec<(u32, Vec<f32>)> = self
             .tracklets
@@ -131,8 +83,9 @@ impl SortMultiTracker {
             track_data.iter().map(|(id, _)| *id).collect();
         self.tracklets.retain(|id, _| valid_ids.contains(id));
 
-        // Flatten data for array creation
-        let mut data = Vec::with_capacity(track_data.len() * 5);
+        // Flatten data for array creation using pre-allocated capacity
+        let total_elements = track_data.len() * 5;
+        let mut data = Vec::with_capacity(total_elements);
         for (_, track_data) in track_data {
             data.extend(track_data);
         }
@@ -203,25 +156,77 @@ impl SortMultiTracker {
         }
     }
 
-    /// Update tracklets with detections
+    /// Update tracklets with detections using pooled memory
     pub fn update_tracklets(
         &mut self,
         detection_boxes: ArrayView2<f32>,
         tracklet_boxes: ArrayView2<f32>,
     ) -> anyhow::Result<ScoreBoxes> {
-        let (matched_boxes, unmatched_detections) =
-            assign_detections_to_tracks(detection_boxes, tracklet_boxes, self.iou_threshold)?;
+        // Clear reused vectors
+        self.temp_assignments.clear();
+        self.temp_unmatched.clear();
 
-        for (track_id, bbox, det_idx) in matched_boxes {
-            if let Some(tracklet) = self.tracklets.get_mut(&track_id) {
-                tracklet.det_idx = det_idx;
-                if tracklet.update(bbox).is_err() {
+        // Use optimized IOU calculation if available
+        let det_track_ious = crate::bbox::ious_optimized(detection_boxes, tracklet_boxes);
+        let assignment_result =
+            HungarianSolver::solve_iou(det_track_ious.view(), self.iou_threshold);
+
+        // Process assignments using pooled memory
+        for (det_idx, track_idx) in assignment_result.assignments {
+            if det_idx >= detection_boxes.nrows() || track_idx >= tracklet_boxes.nrows() {
+                continue;
+            }
+
+            let det_row = detection_boxes.row(det_idx);
+            if det_row.len() < 5 {
+                continue;
+            }
+
+            let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
+            let score = det_row[4];
+            let iou = det_track_ious[(det_idx, track_idx)];
+
+            if iou > self.iou_threshold {
+                let track_row = tracklet_boxes.row(track_idx);
+                if track_row.len() >= 5 {
+                    let track_id = track_row[4] as u32;
+                    self.temp_assignments
+                        .push((track_id, det_box, det_idx as u32));
+                }
+            } else {
+                self.temp_unmatched.push((score, det_box, det_idx as u32));
+            }
+        }
+
+        // Process unassigned detections
+        for det_idx in assignment_result.unassigned_detections {
+            if det_idx >= detection_boxes.nrows() {
+                continue;
+            }
+
+            let det_row = detection_boxes.row(det_idx);
+            if det_row.len() < 5 {
+                continue;
+            }
+
+            let det_box = Bbox::new(det_row[0], det_row[1], det_row[2], det_row[3]);
+            let score = det_row[4];
+            self.temp_unmatched.push((score, det_box, det_idx as u32));
+        }
+
+        // Update tracklets
+        for (track_id, bbox, det_idx) in &self.temp_assignments {
+            if let Some(tracklet) = self.tracklets.get_mut(track_id) {
+                tracklet.det_idx = *det_idx;
+                if tracklet.update(bbox.clone()).is_err() {
                     // Failed to update Kalman filter, remove tracklet
-                    self.tracklets.remove(&track_id);
+                    self.tracklets.remove(track_id);
                 }
             }
         }
-        Ok(unmatched_detections)
+
+        // Return cloned unmatched detections (avoiding move)
+        Ok(self.temp_unmatched.clone())
     }
 
     /// Remove tracklets that haven't been updated for too long

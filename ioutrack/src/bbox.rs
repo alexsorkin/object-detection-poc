@@ -147,6 +147,76 @@ pub fn ious(detections: ArrayView2<f32>, tracks: ArrayView2<f32>) -> Array2<f32>
     Array2::from_shape_vec((n_dets, n_tracks), iou_data).unwrap()
 }
 
+/// Optimized IoU calculation with chunking for better cache locality
+/// This version processes data in chunks to improve memory access patterns
+pub fn ious_optimized(detections: ArrayView2<f32>, tracks: ArrayView2<f32>) -> Array2<f32> {
+    let n_dets = detections.nrows();
+    let n_tracks = tracks.nrows();
+
+    if n_dets == 0 || n_tracks == 0 {
+        return Array2::zeros((n_dets, n_tracks));
+    }
+
+    // Process in chunks for better cache locality
+    const CHUNK_SIZE: usize = 64;
+
+    // Parallel processing of detection chunks
+    let iou_data: Vec<f32> = (0..n_dets)
+        .into_par_iter()
+        .flat_map(|i| {
+            let det_row = detections.row(i);
+            if det_row.len() < 4 {
+                return vec![0.0; n_tracks];
+            }
+
+            let det_xmin = det_row[0];
+            let det_ymin = det_row[1];
+            let det_xmax = det_row[2];
+            let det_ymax = det_row[3];
+            let det_area = (det_xmax - det_xmin) * (det_ymax - det_ymin);
+
+            // Process tracks in chunks for better cache locality
+            let mut row_ious = vec![0.0; n_tracks];
+
+            for chunk_start in (0..n_tracks).step_by(CHUNK_SIZE) {
+                let chunk_end = (chunk_start + CHUNK_SIZE).min(n_tracks);
+
+                for j in chunk_start..chunk_end {
+                    let track_row = tracks.row(j);
+                    if track_row.len() < 4 {
+                        continue;
+                    }
+
+                    let track_xmin = track_row[0];
+                    let track_ymin = track_row[1];
+                    let track_xmax = track_row[2];
+                    let track_ymax = track_row[3];
+
+                    // Vectorized intersection calculation
+                    let x1 = det_xmin.max(track_xmin);
+                    let y1 = det_ymin.max(track_ymin);
+                    let x2 = det_xmax.min(track_xmax);
+                    let y2 = det_ymax.min(track_ymax);
+
+                    if x2 > x1 && y2 > y1 {
+                        let intersection = (x2 - x1) * (y2 - y1);
+                        let track_area = (track_xmax - track_xmin) * (track_ymax - track_ymin);
+                        let union = det_area + track_area - intersection;
+
+                        if union > 0.0 {
+                            row_ious[j] = intersection / union;
+                        }
+                    }
+                }
+            }
+
+            row_ious
+        })
+        .collect();
+
+    Array2::from_shape_vec((n_dets, n_tracks), iou_data).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -225,6 +225,128 @@ fn bench_single_frame_update(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_iou_optimizations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("iou_optimizations");
+
+    for &size in &[50, 100, 200, 500] {
+        let detections =
+            Array2::from_shape_vec((size, 4), (0..size * 4).map(|i| i as f32).collect()).unwrap();
+        let tracks =
+            Array2::from_shape_vec((size, 4), (0..size * 4).map(|i| (i as f32) + 0.5).collect())
+                .unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("original", size),
+            &(&detections, &tracks),
+            |b, (dets, trks)| {
+                b.iter(|| ioutrack::bbox::ious(black_box(dets.view()), black_box(trks.view())))
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("optimized", size),
+            &(&detections, &tracks),
+            |b, (dets, trks)| {
+                b.iter(|| {
+                    ioutrack::bbox::ious_optimized(black_box(dets.view()), black_box(trks.view()))
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_sparse_assignment(c: &mut Criterion) {
+    use rand::Rng;
+    let mut group = c.benchmark_group("assignment_algorithms");
+
+    for &sparsity in &[10, 25, 50, 75] {
+        // percentage of valid assignments
+        let size = 100;
+        let threshold = 0.5;
+        let mut cost_matrix_data = vec![1.0f32; size * size]; // Initialize with high cost
+
+        // Create sparse matrix
+        let valid_count = (size * size * sparsity) / 100;
+        let mut rng = rand::thread_rng();
+        for _ in 0..valid_count {
+            let i = rng.gen_range(0..size);
+            let j = rng.gen_range(0..size);
+            let idx = i * size + j;
+            cost_matrix_data[idx] = rng.gen_range(0.0..threshold);
+        }
+
+        let cost_matrix = Array2::from_shape_vec((size, size), cost_matrix_data).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("hungarian", sparsity),
+            &cost_matrix,
+            |b, matrix| {
+                b.iter(|| {
+                    ioutrack::hungarian::HungarianSolver::solve(black_box(matrix.view()), threshold)
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_spatial_indexing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("spatial_indexing");
+
+    for &n_objects in &[50, 100, 200, 500] {
+        // Create scattered objects (low density)
+        let scattered_dets: Vec<[f32; 4]> = (0..n_objects)
+            .map(|i| {
+                let x = (i as f32) * 100.0;
+                let y = (i as f32) * 100.0;
+                [x, y, x + 50.0, y + 50.0]
+            })
+            .collect();
+
+        let scattered_tracks: Vec<[f32; 4]> = (0..n_objects)
+            .map(|i| {
+                let x = (i as f32) * 100.0 + 25.0;
+                let y = (i as f32) * 100.0 + 25.0;
+                [x, y, x + 50.0, y + 50.0]
+            })
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("spatial_query", n_objects),
+            &(&scattered_dets, &scattered_tracks),
+            |b, (dets, tracks)| {
+                b.iter_batched(
+                    || ioutrack::spatial::SpatialTracker::new(100.0),
+                    |mut tracker| {
+                        tracker.update(black_box(dets), black_box(tracks));
+                        let _pairs = tracker.get_candidate_pairs();
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+
+        // Compare with brute force approach
+        group.bench_with_input(
+            BenchmarkId::new("brute_force_pairs", n_objects),
+            &(&scattered_dets, &scattered_tracks),
+            |b, (dets, tracks)| {
+                b.iter(|| {
+                    let mut pairs = Vec::new();
+                    for i in 0..dets.len() {
+                        for j in 0..tracks.len() {
+                            pairs.push((i, j));
+                        }
+                    }
+                    black_box(pairs)
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sort_update,
@@ -232,6 +354,9 @@ criterion_group!(
     bench_sort_various_sizes,
     bench_single_frame_update,
     bench_iou_calculation,
-    bench_detection_splitting
+    bench_detection_splitting,
+    bench_iou_optimizations,
+    bench_sparse_assignment,
+    bench_spatial_indexing
 );
 criterion_main!(benches);

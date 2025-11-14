@@ -23,6 +23,7 @@ pub mod bbox;
 pub mod box_tracker;
 pub mod hungarian; // Hungarian algorithm for optimal assignment
 pub mod kalman;
+pub mod spatial; // Spatial indexing for efficient neighbor search
 pub mod trackers;
 
 pub use box_tracker::KalmanBoxTracker;
