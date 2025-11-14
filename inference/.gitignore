@@ -18,6 +18,7 @@ detection_results/
 # Benchmark results
 benches/results/
 *.criterion/
+benchmark_reports
 
 # IDE
 .vscode/

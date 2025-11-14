@@ -3,8 +3,8 @@
 //! This module provides C-compatible functions that can be called from Unity C# scripts
 //! or other languages that support C interop.
 
+use crate::detector_trait::{Detector, DetectorType};
 use crate::types::{DetectorConfig, ImageData, ImageFormat, TargetClass};
-use crate::YoloV8Detector;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -14,7 +14,7 @@ use std::slice;
 use std::sync::Mutex;
 
 // Global detector instance storage - each detector needs Mutex for mutable access
-static mut DETECTORS: Option<Mutex<HashMap<u32, Mutex<YoloV8Detector>>>> = None;
+static mut DETECTORS: Option<Mutex<HashMap<u32, Mutex<Box<dyn Detector>>>>> = None;
 static mut NEXT_DETECTOR_ID: u32 = 1;
 
 /// Initialize the detection library
@@ -51,6 +51,7 @@ pub extern "C" fn mtd_free_string(ptr: *mut c_char) {
 /// Create new detector instance
 #[no_mangle]
 pub extern "C" fn mtd_create_detector(
+    detector_type: c_int, // 0=YOLOV8, 1=RTDETR
     model_path: *const c_char,
     input_width: c_int,
     input_height: c_int,
@@ -70,6 +71,13 @@ pub extern "C" fn mtd_create_detector(
         }
     };
 
+    // Determine detector type
+    let detector_type_enum = match detector_type {
+        0 => DetectorType::YOLOV8,
+        1 => DetectorType::RTDETR,
+        _ => return -1,
+    };
+
     // For FFI backward compatibility, use the same model path for both variants
     // The detector will use whichever one exists based on use_gpu setting
     let config = DetectorConfig {
@@ -84,8 +92,8 @@ pub extern "C" fn mtd_create_detector(
         optimize_for_speed: true,
     };
 
-    // Create detector with new API (no device parameter)
-    match YoloV8Detector::new(config) {
+    // Create detector with trait-based API
+    match detector_type_enum.create(config) {
         Ok(detector) => {
             let detector_id = unsafe {
                 let id = NEXT_DETECTOR_ID;
@@ -121,6 +129,29 @@ pub extern "C" fn mtd_destroy_detector(detector_id: c_int) -> c_int {
         }
     }
     -1 // Error
+}
+
+/// Create new detector instance (backward compatibility - defaults to RT-DETR)
+#[no_mangle]
+pub extern "C" fn mtd_create_detector_legacy(
+    model_path: *const c_char,
+    input_width: c_int,
+    input_height: c_int,
+    confidence_threshold: c_float,
+    nms_threshold: c_float,
+    max_detections: c_int,
+    use_gpu: c_int,
+) -> c_int {
+    mtd_create_detector(
+        1, // Default to RT-DETR
+        model_path,
+        input_width,
+        input_height,
+        confidence_threshold,
+        nms_threshold,
+        max_detections,
+        use_gpu,
+    )
 }
 
 /// Detection result structure for C interop

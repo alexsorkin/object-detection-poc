@@ -19,25 +19,6 @@ pub trait Detector: Send {
     fn input_size(&self) -> (u32, u32);
 }
 
-/// Wrap YOLOv8 detector to implement the Detector trait
-impl Detector for crate::detector_yolov8::YoloV8Detector {
-    fn detect(&mut self, image: &ImageData) -> Result<Vec<Detection>, String> {
-        self.detect(image).map_err(|e| e.to_string())
-    }
-
-    fn detect_batch(&mut self, images: &[ImageData]) -> Result<Vec<Vec<Detection>>, String> {
-        self.detect_batch(images).map_err(|e| e.to_string())
-    }
-
-    fn name(&self) -> &str {
-        "YOLOv8"
-    }
-
-    fn input_size(&self) -> (u32, u32) {
-        (640, 640)
-    }
-}
-
 /// Wrap RT-DETR detector to implement the Detector trait
 impl Detector for crate::detector_rtdetr::RTDETRDetector {
     fn detect(&mut self, image: &ImageData) -> Result<Vec<Detection>, String> {
@@ -71,10 +52,7 @@ impl DetectorType {
         config: crate::types::DetectorConfig,
     ) -> Result<Box<dyn Detector>, Box<dyn std::error::Error>> {
         match self {
-            DetectorType::YOLOV8 => {
-                let detector = crate::detector_yolov8::YoloV8Detector::new(config)?;
-                Ok(Box::new(detector))
-            }
+            DetectorType::YOLOV8 => Err("YOLOv8 detector is not currently implemented".into()),
             DetectorType::RTDETR => {
                 let detector = crate::detector_rtdetr::RTDETRDetector::new(config)?;
                 Ok(Box::new(detector))

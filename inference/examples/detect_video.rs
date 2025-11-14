@@ -16,6 +16,7 @@
 /// Options (can be in any order):
 ///   --confidence <0-100>    Detection confidence threshold (default: 50)
 ///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
+///   --detector <type>       Detector type: rtdetr, yolov8 (default: rtdetr)
 ///   --model <variant>       RT-DETR model variant (default: r18_fp32)
 ///                           Available: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32
 ///   --tracker <method>      Tracking method: kalman, bytetrack (default: kalman)
@@ -26,7 +27,8 @@
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- test_data/airport.mp4 --confidence 60 --headless
 ///   cargo run --release --features metal --example detect_video -- --headless --classes 0,2,5,7 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --model r50_fp32 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- --detector rtdetr --model r50_fp32 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- --detector yolov8 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --model r18_fp16 --tracker bytetrack test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --tracker kalman test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam
@@ -97,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut headless = false; // Default: show display window
     let mut model_variant = RTDETRModel::R18VD_FP32; // Default: r18_fp32
     let mut tracking_method = TrackingMethod::ByteTrack; // Default: Kalman
+    let mut detector_type = DetectorType::RTDETR; // Default: RT-DETR
     let mut video_source: Option<String> = None;
 
     // Parse all arguments in any order
@@ -170,6 +173,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            "--detector" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].to_lowercase().as_str() {
+                        "rtdetr" | "rt-detr" => {
+                            detector_type = DetectorType::RTDETR;
+                        }
+                        _ => {
+                            log::warn!(
+                                "⚠️  Unknown detector type: '{}'. Using RT-DETR. Supported: rtdetr",
+                                args[i]
+                            );
+                        }
+                    }
+                }
+            }
             arg => {
                 // If it doesn't start with --, treat it as the video source
                 if !arg.starts_with("--") {
@@ -208,11 +227,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cap.set(videoio::CAP_PROP_FPS, fps)?;
     }
 
-    let detector_type = DetectorType::RTDETR;
     let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
 
     // Read model directory from environment variable or use default
     let model_dir = env::var("DEFENITY_MODEL_DIR").unwrap_or_else(|_| "../models".to_string());
+
+    eprintln!("🤖 Using detector: {:?}", detector_type);
 
     let detector_config = DetectorConfig {
         model_path: format!("{}/{}", model_dir, model_variant.filename()),

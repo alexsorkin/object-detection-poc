@@ -25,7 +25,6 @@
 // Detector implementation
 pub mod detector_rtdetr;
 pub mod detector_trait;
-pub mod detector_yolov8;
 pub mod frame_executor;
 pub mod frame_pipeline;
 
@@ -45,7 +44,6 @@ pub mod types;
 // Export the detectors
 pub use detector_rtdetr::RTDETRDetector;
 pub use detector_trait::{Detector, DetectorType};
-pub use detector_yolov8::YoloV8Detector;
 
 pub use error::{DetectionError, Result};
 pub use types::{
