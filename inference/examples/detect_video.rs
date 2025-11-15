@@ -296,7 +296,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         highgui::named_window("Detection", highgui::WINDOW_NORMAL)?;
     }
 
-    let mut frame_id = 0_u64;
     let mut paused = false;
 
     // Create clones of Arc for threads - these will all share the same atomic
@@ -351,18 +350,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             while let Ok(capture) = cupture_frame_rx.try_recv() {
                 let capture_time = Instant::now();
-                // Send to output queue (NON-BLOCKING)
-                let _ = output_tx.try_send((Arc::new(capture.original_image), capture_time));
-                // Send to detector queue (NON-BLOCKING)
-                let _ = detector_tx.try_send((Arc::new(capture.resized_image), capture_time));
 
-                log::info!(
+                log::debug!(
                     "Dispatching frame {}, FPS: {:.2}",
                     cap_frame_id,
                     capture.fps
                 );
 
-                if capture.has_frames == false {
+                // OPTIMIZATION: Images are already Arc-wrapped from CaptureInput, use cheap Arc::clone
+                let _ = output_tx.try_send((Arc::clone(&capture.original_image), capture_time));
+                // Send to detector queue (NON-BLOCKING)
+                let _ = detector_tx.try_send((Arc::clone(&capture.resized_image), capture_time));
+
+                if !capture.has_frames {
                     log::info!("No frames has left in stream, exiting..");
                     let _ = shutdown_tx_display.send(());
                 }
@@ -480,8 +480,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut out_frame_id = 0_u64;
-
     let writer_handle = thread::spawn(move || {
         let mut file_writer: Option<VideoWriter> = None;
 
@@ -529,8 +527,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let output_handle = thread::spawn(move || {
+        let mut out_frame_id = 0_u64;
         let mut elapsed = stats_start.elapsed().as_secs_f32();
-        let mut avg_fps = frame_id as f32 / elapsed;
+        let mut avg_fps = 10.0 as f32 / elapsed;
         let mut processed = stats_processed.load(Ordering::Relaxed);
         let mut extrapolated = stats_extrapolated.load(Ordering::Relaxed);
         let mut total = processed + extrapolated;
@@ -643,7 +642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let stats_text = format!(
                     "Frame: {} # Tracks: {} # RT-DETR Runs: {}",
-                    frame_id,
+                    out_frame_id,
                     num_tracks,
                     stats_processed.load(Ordering::Relaxed)
                 );
@@ -694,13 +693,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()))
                 .is_ok();
 
-            frame_id += 1;
-
             // Print progress every N frames (based on FPS)
             let progress_interval = (fps as u64).max(24);
-            if frame_id % progress_interval == 0 {
+            if out_frame_id % progress_interval == 0 {
                 elapsed = stats_start.elapsed().as_secs_f32();
-                avg_fps = frame_id as f32 / elapsed;
+                avg_fps = out_frame_id as f32 / elapsed;
                 processed = stats_processed.load(Ordering::Relaxed);
                 extrapolated = stats_extrapolated.load(Ordering::Relaxed);
                 total = processed + extrapolated;
@@ -714,7 +711,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Checkpoint: {:.1} FPS | Tracks: {} | Display frames: {}",
                     avg_fps,
                     num_tracks,
-                    frame_id,
+                    out_frame_id,
                 );
 
                 if total == 0 {
@@ -742,7 +739,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!(
             "Finished with: frame_id={}, total_time={}, processed={}, extrapolated={}",
-            frame_id, elapsed, processed, extrapolated
+            out_frame_id, elapsed, processed, extrapolated
         );
         eprintln!(
             "==============================================================================="
@@ -752,7 +749,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("===================================================");
         eprintln!("FINAL STATISTICS:");
         eprintln!("===================================================");
-        eprintln!("Total frames displayed: {}", frame_id);
+        eprintln!("Total frames displayed: {}", out_frame_id);
         eprintln!("Duration: {:.1}s", elapsed);
         eprintln!("Average FPS: {:.1}", avg_fps);
         eprintln!("");

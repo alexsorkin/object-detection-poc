@@ -10,15 +10,17 @@ use opencv::{
     videoio::{self, VideoCapture, CAP_ANY},
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Captured input containing both original and resized images with metadata
+/// OPTIMIZATION: Uses Arc for zero-copy sharing of image data across threads
 #[derive(Clone)]
 pub struct CaptureInput {
     /// The original image (full resolution)
-    pub original_image: RgbImage,
+    pub original_image: Arc<RgbImage>,
     /// The resized image (max 640px on largest axis)
-    pub resized_image: RgbImage,
+    pub resized_image: Arc<RgbImage>,
     /// Frames per second of the source
     pub fps: f64,
     /// Original width before resizing
@@ -31,9 +33,10 @@ pub struct CaptureInput {
 
 impl CaptureInput {
     /// Create a new CaptureInput
+    /// OPTIMIZATION: Accepts Arc-wrapped images for zero-copy sharing
     pub fn new(
-        original_image: RgbImage,
-        resized_image: RgbImage,
+        original_image: Arc<RgbImage>,
+        resized_image: Arc<RgbImage>,
         fps: f64,
         original_width: i32,
         original_height: i32,
@@ -171,10 +174,10 @@ impl VideoResizer {
             if !read_success || frame.empty() {
                 log::info!("End of video stream after {} frames", frame_count);
 
-                // OPTIMIZATION: Send minimal end-of-stream marker
-                let empty_image = RgbImage::new(1, 1);
+                // OPTIMIZATION: Use Arc::clone for cheap reference counting
+                let empty_image = Arc::new(RgbImage::new(1, 1));
                 let end_frame = CaptureInput {
-                    original_image: empty_image.clone(),
+                    original_image: Arc::clone(&empty_image),
                     resized_image: empty_image,
                     fps,
                     original_width,
@@ -188,6 +191,7 @@ impl VideoResizer {
             frame_count += 1;
 
             // OPTIMIZATION: Process both conversions in parallel using rayon
+            // Results are already Arc-wrapped, no cloning needed
             let (original_image, resized_image) = rayon::join(
                 || self.mat_to_rgb_image(&frame),
                 || self.resize_frame(&frame),
@@ -196,7 +200,7 @@ impl VideoResizer {
             let original_image = original_image?;
             let resized_image = resized_image?;
 
-            // Create CaptureInput with both original and resized images
+            // OPTIMIZATION: Create CaptureInput with Arc-wrapped images (zero-copy)
             let capture_input = CaptureInput::new(
                 original_image,
                 resized_image,
@@ -222,8 +226,8 @@ impl VideoResizer {
     }
 
     /// Convert OpenCV Mat (BGR) to RgbImage
-    /// OPTIMIZATION: Uses parallel processing for large images and pre-allocated buffers
-    fn mat_to_rgb_image(&self, mat: &Mat) -> Result<RgbImage, DetectionError> {
+    /// OPTIMIZATION: Returns Arc-wrapped image for zero-copy sharing
+    fn mat_to_rgb_image(&self, mat: &Mat) -> Result<Arc<RgbImage>, DetectionError> {
         let width = mat.cols() as u32;
         let height = mat.rows() as u32;
         let total_pixels = (width * height) as usize;
@@ -248,8 +252,10 @@ impl VideoResizer {
                 .map_err(|e| DetectionError::Other(format!("Failed to get image data: {}", e)))?
                 .to_vec();
 
-            RgbImage::from_vec(width, height, data)
-                .ok_or_else(|| DetectionError::Other("Failed to create RgbImage".to_string()))
+            let rgb_image = RgbImage::from_vec(width, height, data)
+                .ok_or_else(|| DetectionError::Other("Failed to create RgbImage".to_string()))?;
+
+            Ok(Arc::new(rgb_image))
         } else {
             // OPTIMIZATION: Parallel processing for large images
             // Convert BGR to RGB using OpenCV first (still fastest for color conversion)
@@ -272,8 +278,10 @@ impl VideoResizer {
             let mut vec_data = Vec::with_capacity(data.len());
             vec_data.extend_from_slice(data);
 
-            RgbImage::from_vec(width, height, vec_data)
-                .ok_or_else(|| DetectionError::Other("Failed to create RgbImage".to_string()))
+            let rgb_image = RgbImage::from_vec(width, height, vec_data)
+                .ok_or_else(|| DetectionError::Other("Failed to create RgbImage".to_string()))?;
+
+            Ok(Arc::new(rgb_image))
         }
     }
 
@@ -281,7 +289,8 @@ impl VideoResizer {
     ///
     /// Frames with largest axis <= max_axis_size are returned as-is
     /// Frames with largest axis > max_axis_size are resized proportionally
-    fn resize_frame(&self, frame: &Mat) -> Result<RgbImage, DetectionError> {
+    /// OPTIMIZATION: Returns Arc-wrapped image for zero-copy sharing
+    fn resize_frame(&self, frame: &Mat) -> Result<Arc<RgbImage>, DetectionError> {
         let height = frame.rows();
         let width = frame.cols();
 
