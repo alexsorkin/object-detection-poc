@@ -6,7 +6,7 @@ use crate::tracking_utils::{
 use crossbeam::channel::{self, Receiver, Sender};
 use ioutrack::{ByteMultiTracker, HungarianSolver, KalmanMultiTracker, MultiObjectTracker};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -79,7 +79,7 @@ pub struct UnifiedTracker {
     /// Command channel for async operations
     command_tx: Sender<TrackingCommand>,
     /// Cached predictions for fast synchronous access
-    last_predictions: Arc<Mutex<Arc<Vec<TileDetection>>>>,
+    last_predictions: Arc<RwLock<Arc<Vec<TileDetection>>>>,
     /// Background worker thread handle
     _worker_handle: Option<thread::JoinHandle<()>>,
     /// Tokio runtime for maintenance tasks
@@ -94,7 +94,7 @@ pub struct UnifiedTracker {
 #[derive(Clone, Debug)]
 struct TrackMetadata {
     class_id: u32,
-    class_name: Arc<String>,
+    class_name: Arc<str>,
     last_confidence: f32,
 }
 
@@ -104,7 +104,7 @@ impl std::fmt::Debug for UnifiedTracker {
             .field("method", &self.method)
             .field(
                 "predictions_cached",
-                &self.last_predictions.lock().unwrap().len(),
+                &self.last_predictions.read().unwrap().len(),
             )
             .field("maintenance_period_ms", &self.maintenance_period_ms)
             .finish_non_exhaustive()
@@ -115,7 +115,7 @@ impl UnifiedTracker {
     /// Create new tracker from config with async processing
     pub fn new(config: TrackingConfig) -> Self {
         let (command_tx, command_rx) = channel::unbounded::<TrackingCommand>();
-        let last_predictions = Arc::new(Mutex::new(Arc::new(Vec::new())));
+        let last_predictions = Arc::new(RwLock::new(Arc::new(Vec::new())));
 
         // Extract maintenance period from config
         let maintenance_period_ms = match &config {
@@ -225,7 +225,7 @@ impl UnifiedTracker {
 
     /// Get cached predictions (synchronous, fast)
     pub fn get_predictions(&self) -> Arc<Vec<TileDetection>> {
-        Arc::clone(&*self.last_predictions.lock().unwrap())
+        Arc::clone(&*self.last_predictions.read().unwrap())
     }
 
     /// Synchronous update with immediate results
@@ -237,6 +237,23 @@ impl UnifiedTracker {
     ) -> Result<Arc<Vec<TileDetection>>, String> {
         // Send the update command
         self.send_update(detections, dt)?;
+
+        // Give the async processor a moment to process the update
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Return the updated predictions
+        Ok(self.get_predictions())
+    }
+
+    /// Synchronous update with Arc (zero-copy)
+    /// Sends update command and waits briefly for processing, then returns current predictions
+    pub fn update_sync_arc(
+        &self,
+        detections: Arc<Vec<TileDetection>>,
+        dt: f32,
+    ) -> Result<Arc<Vec<TileDetection>>, String> {
+        // Send the update command (zero-copy)
+        self.send_update_arc(detections, dt)?;
 
         // Give the async processor a moment to process the update
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -265,20 +282,23 @@ impl UnifiedTracker {
 
     /// Get number of active tracks (estimated from cached predictions)
     pub fn num_tracks(&self) -> usize {
-        self.last_predictions.lock().unwrap().len()
+        self.last_predictions.read().unwrap().len()
     }
 
     /// Command processor thread - handles tracker updates in background
     fn command_processor(
         tracker: Arc<Mutex<Box<dyn MultiObjectTracker>>>,
-        last_predictions: Arc<Mutex<Arc<Vec<TileDetection>>>>,
+        last_predictions: Arc<RwLock<Arc<Vec<TileDetection>>>>,
         command_rx: Receiver<TrackingCommand>,
     ) {
         log::debug!("UnifiedTracker: command processor started");
         let mut commands_processed = 0_u64;
         let mut track_metadata: HashMap<u32, TrackMetadata> = HashMap::with_capacity(64);
+        let mut valid_predictions = Vec::with_capacity(64); // Pre-allocate buffer
 
         loop {
+            let mut predictions_to_cache: Option<Arc<Vec<TileDetection>>> = None;
+
             match command_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(TrackingCommand::Update { detections, dt }) => {
                     log::debug!(
@@ -304,6 +324,9 @@ impl UnifiedTracker {
 
                             // Convert back to TileDetection format
                             let mut tracked_detections = tracker_output_to_tile_detection(&tracks);
+                            let num_tracklets = tracker.num_tracklets();
+                            // Release tracker lock BEFORE metadata update to reduce contention
+                            drop(tracker);
 
                             // Debug: Log track positions before metadata update
                             for detection in &tracked_detections {
@@ -324,17 +347,14 @@ impl UnifiedTracker {
 
                             commands_processed += 1;
 
-                            // Store predictions for fast access
-                            {
-                                let mut predictions = last_predictions.lock().unwrap();
-                                *predictions = Arc::new(tracked_detections);
-                            }
+                            // Prepare predictions for batched write
+                            predictions_to_cache = Some(Arc::new(tracked_detections));
 
                             if commands_processed % 100 == 0 {
                                 log::debug!(
                                     "UnifiedTracker processed {} updates, {} active tracks",
                                     commands_processed,
-                                    tracker.num_tracklets()
+                                    num_tracklets
                                 );
                             }
                         }
@@ -357,6 +377,8 @@ impl UnifiedTracker {
                         Ok(tracks) => {
                             log::debug!("UnifiedTracker: predict got {} tracks", tracks.nrows());
                             let predictions = tracker_output_to_tile_detection(&tracks);
+                            // Release tracker lock BEFORE metadata application
+                            drop(tracker);
 
                             // Debug: Log prediction results before metadata application
                             for prediction in &predictions {
@@ -369,13 +391,14 @@ impl UnifiedTracker {
                             }
 
                             // Apply metadata to predictions and filter out tracks without metadata
-                            let mut valid_predictions = Vec::with_capacity(predictions.len());
+                            valid_predictions.clear(); // Reuse allocation
 
                             for mut prediction in predictions {
                                 if let Some(track_id) = prediction.track_id {
                                     if let Some(metadata) = track_metadata.get(&track_id) {
                                         prediction.class_id = metadata.class_id;
-                                        prediction.class_name = (*metadata.class_name).clone();
+                                        prediction.class_name =
+                                            metadata.class_name.as_ref().to_string();
                                         prediction.confidence = metadata.last_confidence;
 
                                         log::trace!(
@@ -398,11 +421,9 @@ impl UnifiedTracker {
                                 }
                             }
 
-                            // Store only valid predictions
-                            {
-                                let mut cached_predictions = last_predictions.lock().unwrap();
-                                *cached_predictions = Arc::new(valid_predictions);
-                            }
+                            // Prepare predictions for batched write (move, don't clone)
+                            predictions_to_cache =
+                                Some(Arc::new(std::mem::take(&mut valid_predictions)));
                         }
                         Err(e) => {
                             log::error!("UnifiedTracker: prediction failed: {:?}", e);
@@ -427,6 +448,12 @@ impl UnifiedTracker {
                     log::warn!("UnifiedTracker command channel disconnected");
                     break;
                 }
+            }
+
+            // Batched write: update predictions cache once per iteration
+            if let Some(predictions) = predictions_to_cache {
+                let mut cached = last_predictions.write().unwrap();
+                *cached = predictions;
             }
         }
 
@@ -484,7 +511,7 @@ impl UnifiedTracker {
 
     /// Update track metadata for tracked detections using Hungarian algorithm
     fn update_track_metadata(
-        detections: &[TileDetection],
+        detections: &Arc<Vec<TileDetection>>,
         tracked_detections: &mut [TileDetection],
         track_metadata: &mut HashMap<u32, TrackMetadata>,
     ) {
@@ -538,7 +565,7 @@ impl UnifiedTracker {
                 if let Some(track_id) = tracked_det.track_id {
                     let metadata = TrackMetadata {
                         class_id: detection.class_id,
-                        class_name: Arc::new(detection.class_name.clone()),
+                        class_name: Arc::from(detection.class_name.as_str()),
                         last_confidence: detection.confidence,
                     };
 
@@ -546,7 +573,7 @@ impl UnifiedTracker {
 
                     // Apply metadata to tracked detection
                     tracked_det.class_id = metadata.class_id;
-                    tracked_det.class_name = (*metadata.class_name).clone();
+                    tracked_det.class_name = metadata.class_name.to_string();
                     tracked_det.confidence = metadata.last_confidence;
 
                     log::trace!(

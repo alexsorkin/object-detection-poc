@@ -158,7 +158,7 @@ impl VideoPipeline {
                             );
 
                             let tracked_detections: Arc<Vec<TileDetection>> = match tracker
-                                .update_sync(processed_detections.detections.to_vec(), dt)
+                                .update_sync_arc(Arc::clone(&processed_detections.detections), dt)
                             {
                                 Ok(predictions) => predictions,
                                 Err(e) => {
