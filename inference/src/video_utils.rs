@@ -1,6 +1,7 @@
 //! Video utilities for frame capture and resizing
 
 use crate::error::DetectionError;
+use crate::image_utils;
 use crossbeam::channel::Sender;
 use image::RgbImage;
 use opencv::{
@@ -286,20 +287,25 @@ impl VideoResizer {
     }
 
     /// Resize a single frame according to the max axis size
+    /// Applies CLAHE shadow removal before resizing for better quality
     ///
-    /// Frames with largest axis <= max_axis_size are returned as-is
-    /// Frames with largest axis > max_axis_size are resized proportionally
+    /// Frames with largest axis <= max_axis_size are returned as-is (with shadow removal)
+    /// Frames with largest axis > max_axis_size are resized proportionally (after shadow removal)
     /// OPTIMIZATION: Returns Arc-wrapped image for zero-copy sharing
     fn resize_frame(&self, frame: &Mat) -> Result<Arc<RgbImage>, DetectionError> {
         let height = frame.rows();
         let width = frame.cols();
 
+        // Apply shadow removal using CLAHE before any processing
+        let enhanced_frame = image_utils::remove_shadows_clahe(frame)
+            .map_err(|e| DetectionError::Other(format!("Shadow removal failed: {}", e)))?;
+
         // Determine if resizing is needed
         let max_dimension = width.max(height);
 
         if max_dimension <= self.max_axis_size {
-            // Frame is small enough, convert to RGB and return as-is
-            return self.mat_to_rgb_image(frame);
+            // Frame is small enough, convert to RGB and return as-is (already enhanced)
+            return self.mat_to_rgb_image(&enhanced_frame);
         }
 
         // Calculate new dimensions preserving aspect ratio
@@ -316,10 +322,10 @@ impl VideoResizer {
             scale
         );
 
-        // Resize frame using high-quality bicubic interpolation
+        // Resize enhanced frame using high-quality bicubic interpolation
         let mut resized = Mat::default();
         imgproc::resize(
-            frame,
+            &enhanced_frame,
             &mut resized,
             Size::new(new_width, new_height),
             0.0,

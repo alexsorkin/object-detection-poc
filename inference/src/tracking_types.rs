@@ -18,6 +18,8 @@ pub struct KalmanConfig {
     pub measurement_noise: [f32; 4],
     /// Process noise covariance diagonal  
     pub process_noise: [f32; 7],
+    /// Maintenance period in milliseconds (how often to run predict step)
+    pub maintenance_period_ms: u64,
 }
 
 impl Default for KalmanConfig {
@@ -29,6 +31,7 @@ impl Default for KalmanConfig {
             init_tracker_min_score: 0.3, // Match RT-DETR confidence levels (~30-40%)
             measurement_noise: [1.0, 1.0, 10.0, 10.0],
             process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001],
+            maintenance_period_ms: 20, // 20ms = 50Hz prediction rate
         }
     }
 }
@@ -52,6 +55,8 @@ pub struct ByteTrackConfig {
     pub measurement_noise: [f32; 4],
     /// Process noise covariance diagonal  
     pub process_noise: [f32; 7],
+    /// Maintenance period in milliseconds (how often to run predict step)
+    pub maintenance_period_ms: u64,
 }
 
 impl Default for ByteTrackConfig {
@@ -65,6 +70,7 @@ impl Default for ByteTrackConfig {
             low_score_threshold: 0.1,
             measurement_noise: [1.0, 1.0, 10.0, 10.0],
             process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001],
+            maintenance_period_ms: 20, // 20ms = 50Hz prediction rate
         }
     }
 }

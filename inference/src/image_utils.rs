@@ -1,8 +1,62 @@
 /// Image utilities for drawing and labeling detections
 use image::{Rgb, RgbImage};
+use opencv::{
+    core::{Mat, Size, Vector},
+    imgproc,
+    prelude::*,
+};
 
 // Import for TileDetection trait implementation
 use crate::frame_pipeline::TileDetection;
+
+/// Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for shadow removal
+/// Uses OpenCV's CLAHE on the L channel of LAB color space
+/// Works directly on OpenCV Mat in BGR format (OpenCV's native format)
+///
+/// # Arguments
+/// * `bgr_mat` - The input BGR Mat (OpenCV's native format from video capture)
+///
+/// # Returns
+/// Result containing the enhanced BGR Mat or an error
+pub fn remove_shadows_clahe(bgr_mat: &Mat) -> Result<Mat, Box<dyn std::error::Error>> {
+    // Convert BGR to LAB color space
+    let mut lab_mat = Mat::default();
+    imgproc::cvt_color(
+        bgr_mat,
+        &mut lab_mat,
+        imgproc::COLOR_BGR2Lab,
+        0,
+        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+
+    // Split LAB channels
+    let mut lab_channels = Vector::<Mat>::new();
+    opencv::core::split(&lab_mat, &mut lab_channels)?;
+
+    // Apply CLAHE to L channel (lightness)
+    let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
+    let mut l_equalized = Mat::default();
+    clahe.apply(&lab_channels.get(0)?, &mut l_equalized)?;
+
+    // Replace L channel with equalized version
+    lab_channels.set(0, l_equalized)?;
+
+    // Merge channels back
+    let mut lab_enhanced = Mat::default();
+    opencv::core::merge(&lab_channels, &mut lab_enhanced)?;
+
+    // Convert back to BGR
+    let mut bgr_enhanced = Mat::default();
+    imgproc::cvt_color(
+        &lab_enhanced,
+        &mut bgr_enhanced,
+        imgproc::COLOR_Lab2BGR,
+        0,
+        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+
+    Ok(bgr_enhanced)
+}
 
 /// Calculate scale factors for resizing image to target size while preserving aspect ratio
 ///

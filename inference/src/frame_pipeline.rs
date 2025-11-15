@@ -7,12 +7,7 @@
 use crate::frame_executor::FrameExecutor;
 use crate::tracking_utils::{calculate_iou, BoundingBox};
 use crate::types::{ImageData, ImageFormat};
-use image::{RgbImage};
-use opencv::{
-    core::{Mat, Size, Vector, CV_8UC3},
-    imgproc,
-    prelude::*,
-};
+use image::RgbImage;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -100,96 +95,6 @@ pub struct PreprocessStage {
 impl PreprocessStage {
     pub fn new(tile_size: u32, tile_overlap: u32) -> Self {
         Self { tile_size, tile_overlap }
-    }
-
-    /// Resize image so the longer dimension fits tile_size while preserving aspect ratio
-    /// This ensures the entire image fits within a single tile (no tiling needed)
-    fn _resize_to_fit(&self, img: &RgbImage) -> RgbImage {
-        let (width, height) = img.dimensions();
-        
-        // If both dimensions are already <= tile_size, no need to resize
-        if width <= self.tile_size && height <= self.tile_size {
-            return img.clone();
-        }
-
-        // Calculate scale factor based on the LONGER dimension
-        let scale = if width > height {
-            self.tile_size as f32 / width as f32
-        } else {
-            self.tile_size as f32 / height as f32
-        };
-
-        let new_width = (width as f32 * scale) as u32;
-        let new_height = (height as f32 * scale) as u32;
-
-        // OPTIMIZATION: Use Triangle filter (3-5x faster than Lanczos3)
-        // Triangle provides good quality for real-time processing
-        image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Triangle,
-        )
-    }
-
-    /// Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for shadow removal
-    /// Uses OpenCV's CLAHE on the L channel of LAB color space
-    fn remove_shadows_clahe(&self, img: &RgbImage) -> Result<RgbImage, Box<dyn std::error::Error>> {
-        let width = img.width();
-        let height = img.height();
-        
-        // Convert RgbImage to OpenCV Mat (RGB format)
-        let data = img.as_raw();
-        let rgb_mat = unsafe {
-            Mat::new_rows_cols_with_data_unsafe(
-                height as i32,
-                width as i32,
-                CV_8UC3,
-                data.as_ptr() as *mut _,
-                opencv::core::Mat_AUTO_STEP,
-            )?
-        };
-        
-        // Convert RGB to LAB color space
-        let mut lab_mat = Mat::default();
-        imgproc::cvt_color(
-            &rgb_mat,
-            &mut lab_mat,
-            imgproc::COLOR_RGB2Lab,
-            0,
-            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-        )?;
-        
-        // Split LAB channels
-        let mut lab_channels = Vector::<Mat>::new();
-        opencv::core::split(&lab_mat, &mut lab_channels)?;
-        
-        // Apply CLAHE to L channel (lightness)
-        let mut clahe = imgproc::create_clahe(2.0, Size::new(8, 8))?;
-        let mut l_equalized = Mat::default();
-        clahe.apply(&lab_channels.get(0)?, &mut l_equalized)?;
-        
-        // Replace L channel with equalized version
-        lab_channels.set(0, l_equalized)?;
-        
-        // Merge channels back
-        let mut lab_enhanced = Mat::default();
-        opencv::core::merge(&lab_channels, &mut lab_enhanced)?;
-        
-        // Convert back to RGB
-        let mut rgb_enhanced = Mat::default();
-        imgproc::cvt_color(
-            &lab_enhanced,
-            &mut rgb_enhanced,
-            imgproc::COLOR_Lab2RGB,
-            0,
-            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-        )?;
-        
-        // Convert Mat back to RgbImage
-        let data_bytes = rgb_enhanced.data_bytes()?.to_vec();
-        Ok(RgbImage::from_vec(width, height, data_bytes)
-            .ok_or("Failed to create RgbImage from CLAHE result")?)
     }
 
     /// Calculate tile positions to cover the entire image
@@ -284,41 +189,26 @@ impl PreprocessStage {
     }
 
     /// Run pre-processing stage
-    pub async fn process(&self, img: RgbImage) -> PreprocessOutput {
-        // Resize image to fit tile_size on longer dimension while preserving aspect ratio
-        // This ensures the entire image fits in a single tile
-        let resized_img = img.clone(); //self.resize_to_fit(&img);
-        let resized_width = resized_img.width();
-        let resized_height = resized_img.height();
-
-        // Apply CLAHE-based shadow removal to entire resized image once (more efficient than per-tile)
-        // CLAHE improves object detection quality and must always be applied
-        let deshadowed_img = match self.remove_shadows_clahe(&resized_img) {
-            Ok(enhanced) => enhanced,
-            Err(e) => {
-                eprintln!("⚠️  CLAHE failed, using original image: {}", e);
-                resized_img.clone()
-            }
-        };
+    pub async fn process(&self, img: RgbImage) -> Result<PreprocessOutput, String> {
 
         // Extract tiles from shadow-removed image (tiles will be used for detection)
         // Run tile extraction in a blocking task to avoid blocking the async executor
         let tiles = task::spawn_blocking({
-            let deshadowed_img = deshadowed_img.clone();
+            let input_img = img.clone();
             let tile_size = self.tile_size;
             let tile_overlap = self.tile_overlap;
             move || {
                 let preprocess_stage = PreprocessStage::new(tile_size, tile_overlap);
-                preprocess_stage.extract_tiles(&deshadowed_img)
+                preprocess_stage.extract_tiles(&input_img)
             }
         }).await.unwrap();
         
-        PreprocessOutput {
+        Ok(PreprocessOutput {
             tiles,
-            resized_width,
-            resized_height,
-            resized_image: resized_img,  // Keep original resized for annotation
-        }
+            resized_width: img.width(),
+            resized_height: img.height(),
+            resized_image: img,  // Keep original resized for annotation
+        })
     }
 }
 
@@ -344,7 +234,7 @@ impl ExecutionStage {
     }
 
     /// Run detection on tiles
-    pub async fn process(&self, input: PreprocessOutput) -> ExecutionOutput {
+    pub async fn process(&self, input: PreprocessOutput) -> Result<ExecutionOutput, String> {
         // OPTIMIZATION: Pre-allocate detection vector (typical: 5-15 detections per tile)
         let mut all_detections = Vec::with_capacity(input.tiles.len() * 10);
 
@@ -478,12 +368,12 @@ impl ExecutionStage {
             all_detections.extend(tile_dets);
         }
         
-        ExecutionOutput {
+        Ok(ExecutionOutput {
             detections: all_detections,
             resized_width: input.resized_width,
             resized_height: input.resized_height,
             resized_image: input.resized_image,
-        }
+        })
     }
 }
 
@@ -542,7 +432,7 @@ impl PostprocessStage {
     /// Filter out detections that are fully contained within other detections
     /// Only removes nested detections if they are of the same class as the parent
     /// OPTIMIZATION: Parallel filtering - each detection checked concurrently
-    fn filter_nested_detections(&self, detections: Vec<TileDetection>) -> Vec<TileDetection> {
+    fn filter_nested_detections(&self, detections: Vec<TileDetection>) -> Result<Vec<TileDetection>, String> {
         const NESTED_PADDING: f32 = 10.0; // Add 10px padding to nested detection boundaries
 
         // PARALLEL: Check each detection concurrently for containment
@@ -565,15 +455,15 @@ impl PostprocessStage {
             })
             .collect();
 
-        filtered
+        Ok(filtered)
     }
 
     /// Apply NMS to remove duplicates
     /// OPTIMIZATION: Parallel NMS by class - each class processed independently
     /// OPTIMIZATION: Parallel IoU calculation - suppression checks run concurrently
-    fn apply_nms(&self, detections: Vec<TileDetection>) -> Vec<TileDetection> {
+    fn apply_nms(&self, detections: Vec<TileDetection>) -> Result<Vec<TileDetection>, String> {
         if detections.is_empty() {
-            return detections;
+            return Ok(detections);
         }
 
         // PARALLEL: Group detections by class using concurrent collection
@@ -624,11 +514,11 @@ impl PostprocessStage {
             })
             .collect();
 
-        results
+        Ok(results)
     }
 
     /// Run post-processing stage
-    pub async fn process<F>(&self, input: ExecutionOutput, callback: F, pipeline_start_time: Instant) -> PipelineOutput
+    pub async fn process<F>(&self, input: ExecutionOutput, callback: F, pipeline_start_time: Instant) -> Result<PipelineOutput,String>
     where
         F: FnOnce(&PipelineOutput),
     {
@@ -642,7 +532,7 @@ impl PostprocessStage {
                 let postprocess_stage = PostprocessStage::new(iou_threshold);
                 postprocess_stage.apply_nms(detections)
             }
-        }).await.unwrap();
+        }).await.unwrap().unwrap();
         let duplicates_removed = before_nms - after_nms.len();
 
         // Step 2: Filter nested detections (fully contained boxes)
@@ -654,7 +544,7 @@ impl PostprocessStage {
                 let postprocess_stage = PostprocessStage::new(iou_threshold);
                 postprocess_stage.filter_nested_detections(after_nms)
             }
-        }).await.unwrap();
+        }).await.unwrap().unwrap();
         let nested_removed = before_nested_filter - filtered_detections.len();
 
         // Calculate total pipeline time
@@ -681,7 +571,7 @@ impl PostprocessStage {
         // Execute callback with final pipeline output
         callback(&output);
 
-        output
+        Ok(output)
     }
 }
 
@@ -728,22 +618,6 @@ impl DetectionPipeline {
         }
     }
 
-    pub async fn process_with_callback_local<F>(&self, img: RgbImage, callback: F)
-    where
-        F: FnOnce(&PipelineOutput),
-    {
-        let pipeline_start_time = Instant::now();
-        
-        // Stage 1: Preprocess (await directly)
-        let preprocess_result = self.preprocess.process(img).await;
-
-        // Stage 2: Execution
-        let execution_result = self.execution.process(preprocess_result).await;
-
-        // Stage 3: Postprocess
-        self.postprocess.process(execution_result, callback, pipeline_start_time).await;
-    }
-
     /// Synchronous version of process_with_callback for non-tokio contexts
     /// This method runs all processing synchronously and calls the callback directly
     pub fn process_with_callback<F>(&self, img: &RgbImage, callback: F)
@@ -758,28 +632,24 @@ impl DetectionPipeline {
         
         rt.block_on(async {
             // Stage 1: Preprocess
-            let preprocess_result = self.preprocess.process(img_clone).await;
-
-            // Stage 2: Execution
-            let execution_result = self.execution.process(preprocess_result).await;
-
-            // Stage 3: Postprocess
-            let _output = self.postprocess.process(execution_result, callback, pipeline_start_time).await;
+            match self.preprocess.process(img_clone).await {
+                Ok(preprocess_result) => {
+                    // Stage 2: Execution
+                    match self.execution.process(preprocess_result).await {
+                        Ok(execution_result) => {
+                            // Stage 3: Postprocess
+                            let _output = self.postprocess.process(execution_result, callback, pipeline_start_time).await;
+                        }
+                        Err(e) => {
+                            log::error!("Execution stage failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Preprocessing stage failed: {}", e);
+                }
+            }
         });
-    }
-
-    /// Async fire-and-forget wrapper for process_with_callback 
-    /// This method starts the async processing and immediately returns without waiting
-    /// The callback will be executed asynchronously when processing completes
-    pub async fn process_with_callback_async<F>(&self, img: &RgbImage, callback: F)
-    where
-        // This async wrapper accepts non-'static callbacks (no Send bound).
-        F: FnOnce(&PipelineOutput),
-    {
-        let img_clone = img.clone();
-        
-        // Run the processing directly without spawning (caller handles async context)
-        self.process_with_callback_local(img_clone, callback).await;
     }
 
 }

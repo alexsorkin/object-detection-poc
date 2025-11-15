@@ -890,6 +890,10 @@ pub enum RTDETRModel {
     R50VD_FP32,
     /// RT-DETR v2 with ResNet-50 backbone (UINT8)
     R50VD_UINT8,
+    /// RT-DETR v2 with ResNet-101 backbone (FP16)
+    R101VD_FP16,
+    /// RT-DETR v2 with ResNet-101 backbone (FP32)
+    R101VD_FP32,
 }
 
 impl RTDETRModel {
@@ -903,6 +907,8 @@ impl RTDETRModel {
             Self::R50VD_FP16 => "rtdetr_v2_r50vd_fp16.onnx",
             Self::R50VD_FP32 => "rtdetr_v2_r50vd_fp32.onnx",
             Self::R50VD_UINT8 => "rtdetr_v2_r50vd_uint8.onnx",
+            Self::R101VD_FP16 => "rtdetr_v2_r101vd_fp16.onnx",
+            Self::R101VD_FP32 => "rtdetr_v2_r101vd_fp32.onnx",
         }
     }
 
@@ -916,6 +922,8 @@ impl RTDETRModel {
             Self::R50VD_FP16 => "RT-DETR R50 (FP16)",
             Self::R50VD_FP32 => "RT-DETR R50 (FP32)",
             Self::R50VD_UINT8 => "RT-DETR R50 (UINT8)",
+            Self::R101VD_FP16 => "RT-DETR R101 (FP16)",
+            Self::R101VD_FP32 => "RT-DETR R101 (FP32)",
         }
     }
 
@@ -929,6 +937,10 @@ impl RTDETRModel {
             "r50vd_fp16" | "r50_fp16" | "r50-fp16" => Some(Self::R50VD_FP16),
             "r50vd_fp32" | "r50_fp32" | "r50-fp32" | "r50vd" | "r50" => Some(Self::R50VD_FP32),
             "r50vd_uint8" | "r50_uint8" | "r50-uint8" => Some(Self::R50VD_UINT8),
+            "r101vd_fp16" | "r101_fp16" | "r101-fp16" => Some(Self::R101VD_FP16),
+            "r101vd_fp32" | "r101_fp32" | "r101-fp32" | "r101vd" | "r101" => {
+                Some(Self::R101VD_FP32)
+            }
             _ => None,
         }
     }
@@ -943,6 +955,8 @@ impl RTDETRModel {
             Self::R50VD_FP16,
             Self::R50VD_FP32,
             Self::R50VD_UINT8,
+            Self::R101VD_FP16,
+            Self::R101VD_FP32,
         ]
     }
 }

@@ -86,6 +86,8 @@ pub struct UnifiedTracker {
     _runtime: Runtime,
     /// Shutdown signal for cleanup
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Maintenance period in milliseconds
+    maintenance_period_ms: u64,
 }
 
 /// Metadata for each track
@@ -104,6 +106,7 @@ impl std::fmt::Debug for UnifiedTracker {
                 "predictions_cached",
                 &self.last_predictions.lock().unwrap().len(),
             )
+            .field("maintenance_period_ms", &self.maintenance_period_ms)
             .finish_non_exhaustive()
     }
 }
@@ -114,11 +117,17 @@ impl UnifiedTracker {
         let (command_tx, command_rx) = channel::unbounded::<TrackingCommand>();
         let last_predictions = Arc::new(Mutex::new(Arc::new(Vec::new())));
 
+        // Extract maintenance period from config
+        let maintenance_period_ms = match &config {
+            TrackingConfig::Kalman(cfg) => cfg.maintenance_period_ms,
+            TrackingConfig::ByteTrack(cfg) => cfg.maintenance_period_ms,
+        };
+
         // Create the appropriate tracker based on config
         let (tracker, method): (Box<dyn MultiObjectTracker>, TrackingMethod) = match &config {
             TrackingConfig::Kalman(kalman_config) => {
-                log::info!("Creating KalmanMultiTracker with config: max_age={}, min_hits={}, iou_threshold={:.3}, init_tracker_min_score={:.3}", 
-                    kalman_config.max_age, kalman_config.min_hits, kalman_config.iou_threshold, kalman_config.init_tracker_min_score);
+                log::info!("Creating KalmanMultiTracker with config: max_age={}, min_hits={}, iou_threshold={:.3}, init_tracker_min_score={:.3}, maintenance_period={}ms", 
+                    kalman_config.max_age, kalman_config.min_hits, kalman_config.iou_threshold, kalman_config.init_tracker_min_score, kalman_config.maintenance_period_ms);
                 let tracker = KalmanMultiTracker::new(
                     kalman_config.max_age,
                     kalman_config.min_hits,
@@ -130,8 +139,8 @@ impl UnifiedTracker {
                 (Box::new(tracker), TrackingMethod::Kalman)
             }
             TrackingConfig::ByteTrack(bytetrack_config) => {
-                log::info!("Creating ByteMultiTracker with config: max_age={}, min_hits={}, iou_threshold={:.3}, init_tracker_min_score={:.3}", 
-                    bytetrack_config.max_age, bytetrack_config.min_hits, bytetrack_config.iou_threshold, bytetrack_config.init_tracker_min_score);
+                log::info!("Creating ByteMultiTracker with config: max_age={}, min_hits={}, iou_threshold={:.3}, init_tracker_min_score={:.3}, maintenance_period={}ms", 
+                    bytetrack_config.max_age, bytetrack_config.min_hits, bytetrack_config.iou_threshold, bytetrack_config.init_tracker_min_score, bytetrack_config.maintenance_period_ms);
                 let tracker = ByteMultiTracker::new(
                     bytetrack_config.max_age,
                     bytetrack_config.min_hits,
@@ -167,7 +176,12 @@ impl UnifiedTracker {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let command_tx_for_maintenance = command_tx.clone();
         runtime.spawn(async move {
-            Self::maintenance_loop(&command_tx_for_maintenance, shutdown_rx).await;
+            Self::maintenance_loop(
+                &command_tx_for_maintenance,
+                shutdown_rx,
+                maintenance_period_ms,
+            )
+            .await;
         });
 
         Self {
@@ -177,6 +191,7 @@ impl UnifiedTracker {
             _worker_handle: Some(worker_handle),
             _runtime: runtime,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            maintenance_period_ms,
         }
     }
 
@@ -417,10 +432,14 @@ impl UnifiedTracker {
     async fn maintenance_loop(
         command_tx: &Sender<TrackingCommand>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        maintenance_period_ms: u64,
     ) {
-        log::debug!("UnifiedTracker: maintenance thread started");
+        log::debug!(
+            "UnifiedTracker: maintenance thread started with period {}ms",
+            maintenance_period_ms
+        );
 
-        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        let mut interval = tokio::time::interval(Duration::from_millis(maintenance_period_ms));
         let mut maintenance_cycles = 0_u64;
         let mut last_frame_timestamp = std::time::Instant::now();
 

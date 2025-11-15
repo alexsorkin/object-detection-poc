@@ -49,6 +49,7 @@ use std::env;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -177,8 +178,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprint!("📹 Opening video source: {}... ", video_source);
     io::stderr().flush()?;
-
-    let fps = 30.0; // Default FPS, will be updated by actual video
+    let last_fps = Arc::new(Mutex::new(20.0_f32));
+    let fps = Arc::clone(&last_fps); // Default FPS, will be updated by actual video
 
     // Read model directory from environment variable or use default
     let model_dir = env::var("DEFENITY_MODEL_DIR").unwrap_or_else(|_| "../models".to_string());
@@ -228,6 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
                 measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise covariance
                 process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001], // standard process noise
+                maintenance_period_ms: 50,    // maintenance period in milliseconds
             })
         }
         TrackingMethod::ByteTrack => {
@@ -240,6 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 process_noise: [1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 0.0001], // process noise
                 high_score_threshold: 0.5,    // high confidence threshold
                 low_score_threshold: 0.1,     // low confidence threshold
+                maintenance_period_ms: 50,    // maintenance period in milliseconds
             })
         }
     };
@@ -336,18 +339,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create frame conversion thread - converts Mat to RgbImage and sends to detector/output queues
     let shutdown_rx_converter = shutdown_rx_capture;
+    let fps_for_converter = Arc::clone(&fps);
     let converter_handle = thread::spawn(move || {
         let mut cap_frame_id = 0_u64;
 
         loop {
-            // Check for shutdown signal
-            if let Ok(_) = shutdown_rx_converter.try_recv() {
-                log::debug!("Converter thread received shutdown signal");
-                break;
-            }
-
             while let Ok(capture) = cupture_frame_rx.try_recv() {
                 let capture_time = Instant::now();
+                *fps_for_converter.lock().unwrap() = capture.fps as f32;
 
                 log::debug!(
                     "Dispatching frame {}, FPS: {:.2}",
@@ -356,9 +355,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 // OPTIMIZATION: Images are already Arc-wrapped from CaptureInput, use cheap Arc::clone
-                let _ = output_tx.try_send((Arc::clone(&capture.original_image), capture_time));
+                let _ = output_tx
+                    .try_send((Arc::clone(&capture.original_image), capture_time))
+                    .is_ok();
                 // Send to detector queue (NON-BLOCKING)
-                let _ = detector_tx.try_send((Arc::clone(&capture.resized_image), capture_time));
+                let _ = detector_tx
+                    .try_send((Arc::clone(&capture.resized_image), capture_time))
+                    .is_ok();
 
                 if !capture.has_frames {
                     log::info!("No frames has left in stream, exiting..");
@@ -366,6 +369,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 cap_frame_id += 1;
+            }
+
+            // Check for shutdown signal
+            if shutdown_rx_converter.try_recv().is_ok() {
+                log::debug!("Converter thread received shutdown signal");
+                break;
             }
         }
 
@@ -379,13 +388,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut input_frame_id = 0_u64;
 
         loop {
-            // Check for shutdown signal (non-blocking)
-            if let Ok(_) = shutdown_rx_detector.try_recv() {
-                log::debug!("Detector thread received shutdown signal");
-                video_pipeline_for_detector.shutdown();
-                break;
-            }
-
             // Drain DETECTOR queue to get only the LATEST frame
             // This naturally skips frames - if detection is slow, many frames accumulate and we only take the newest
             let mut latest_detector_frame: Option<(Arc<RgbImage>, Instant)> = None;
@@ -433,8 +435,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Check for shutdown signal (non-blocking)
+            if shutdown_rx_detector.try_recv().is_ok() {
+                log::debug!("Detector thread received shutdown signal");
+                video_pipeline_for_detector.shutdown();
+                break;
+            }
+
             // Pace to ~30 FPS for detection thread
-            std::thread::sleep(Duration::from_millis(33));
+            std::thread::sleep(Duration::from_millis(5));
         }
     });
 
@@ -447,12 +456,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stats_handle = thread::spawn(move || {
         loop {
-            // Check for shutdown signal (non-blocking)
-            if let Ok(_) = shutdown_rx_stats.try_recv() {
-                log::debug!("Results thread received shutdown signal");
-                break;
-            }
-
             // Non-blocking check for stats
             match video_pipeline_for_stats.get_result() {
                 Some(stats) => {
@@ -476,11 +479,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Check for shutdown signal (non-blocking)
+            if shutdown_rx_stats.try_recv().is_ok() {
+                log::debug!("Results thread received shutdown signal");
+                break;
+            }
+
             // Small sleep to avoid busy loop
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(5));
         }
     });
 
+    let fps_for_writer = Arc::clone(&fps);
     let writer_handle = thread::spawn(move || {
         let mut file_writer: Option<VideoWriter> = None;
 
@@ -493,7 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file_writer = match VideoWriter::new(
                         output_path,
                         VideoWriter::fourcc('a', 'v', 'c', '1').unwrap(),
-                        fps,
+                        *fps_for_writer.lock().unwrap() as f64,
                         opencv::core::Size::new(width as i32, height as i32),
                         true,
                     ) {
@@ -507,7 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = file_writer.as_mut().unwrap().write(&mat).is_ok();
                 }
             }
-            if let Ok(_) = shutdown_rx_writer.try_recv() {
+            if shutdown_rx_writer.try_recv().is_ok() {
                 log::debug!("Writer thread received shutdown signal");
                 break;
             }
@@ -519,6 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let fps_for_output = Arc::clone(&fps);
     let output_handle = thread::spawn(move || {
         let mut out_frame_id = 0_u64;
         let mut elapsed = stats_start.elapsed().as_secs_f32();
@@ -685,9 +696,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = writer_tx
                 .try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()))
                 .is_ok();
-
             // Print progress every N frames (based on FPS)
-            let progress_interval = (fps as u64).max(24);
+            let progress_interval = (*fps_for_output.lock().unwrap() as u64).max(24);
             if out_frame_id % progress_interval == 0 {
                 elapsed = stats_start.elapsed().as_secs_f32();
                 avg_fps = out_frame_id as f32 / elapsed;
