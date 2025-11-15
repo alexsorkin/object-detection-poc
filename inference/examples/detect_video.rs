@@ -223,8 +223,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracking_config = match tracking_method {
         TrackingMethod::Kalman => {
             TrackingConfig::Kalman(KalmanConfig {
-                max_age: 30,        // frames to keep track alive without detections (30*20ms = 600ms)
-                min_hits: 1,        // REDUCED from 3 to test track position updates
+                max_age: 25,        // frames to keep track alive without detections (30*20ms = 600ms)
+                min_hits: 3,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // REDUCED from 0.3 to be more permissive for association
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
                 measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise covariance
@@ -234,8 +234,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         TrackingMethod::ByteTrack => {
             TrackingConfig::ByteTrack(ByteTrackConfig {
-                max_age: 30,                               // frames to keep track alive (30*20ms = 600ms)
-                min_hits: 1,        // REDUCED from 3 to test track position updates
+                max_age: 25,                               // frames to keep track alive (30*20ms = 600ms)
+                min_hits: 3,        // REDUCED from 3 to test track position updates
                 iou_threshold: 0.3, // IoU threshold for association (standard value)
                 init_tracker_min_score: 0.25, // minimum confidence to create new track (25% - standard value)
                 measurement_noise: [1.0, 1.0, 10.0, 10.0], // measurement noise
@@ -309,13 +309,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TWO separate queues:
     // 1. detector_rx: Can drop frames (non-blocking), used for detection - carries timestamp
     // 2. output_rx: Must process ALL frames (blocking), used for output
-    let (detector_tx, detector_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(3); // Detector queue with Arc to avoid cloning
-    let (output_tx, output_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(3); // Output queue with Arc to avoid cloning
+    let (detector_tx, detector_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(10); // Detector queue with Arc to avoid cloning
+    let (output_tx, output_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(10); // Output queue with Arc to avoid cloning
     let (writer_tx, writer_rx) = sync_channel::<(Mat, u32, u32)>(100);
-    let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(10);
+    let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(100);
 
     // Create channels for VideoResizer output
-    let (cupture_frame_tx, cupture_frame_rx) = crossbeam::channel::unbounded::<CaptureInput>();
+    let (capture_frame_tx, capture_frame_rx) = crossbeam::channel::unbounded::<CaptureInput>();
 
     // Start VideoResizer thread
     let video_source_clone = video_source.clone();
@@ -324,10 +324,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let result = if let Ok(cam_id) = video_source_clone.parse::<i32>() {
             log::info!("Starting camera capture from device {}", cam_id);
-            resizer.resize_camera(cam_id, cupture_frame_tx)
+            resizer.resize_camera(cam_id, capture_frame_tx)
         } else {
             log::info!("Starting file/stream capture from {}", video_source_clone);
-            resizer.resize_stream(&video_source_clone, cupture_frame_tx)
+            resizer.resize_stream(&video_source_clone, capture_frame_tx)
         };
 
         if let Err(e) = result {
@@ -344,37 +344,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cap_frame_id = 0_u64;
 
         loop {
-            while let Ok(capture) = cupture_frame_rx.try_recv() {
-                let capture_time = Instant::now();
-                *fps_for_converter.lock().unwrap() = capture.fps as f32;
-
-                log::debug!(
-                    "Dispatching frame {}, FPS: {:.2}",
-                    cap_frame_id,
-                    capture.fps
-                );
-
-                // OPTIMIZATION: Images are already Arc-wrapped from CaptureInput, use cheap Arc::clone
-                let _ = output_tx
-                    .try_send((Arc::clone(&capture.original_image), capture_time))
-                    .is_ok();
-                // Send to detector queue (NON-BLOCKING)
-                let _ = detector_tx
-                    .try_send((Arc::clone(&capture.resized_image), capture_time))
-                    .is_ok();
-
-                if !capture.has_frames {
-                    log::info!("No frames has left in stream, exiting..");
-                    let _ = shutdown_tx_display.send(());
-                }
-
-                cap_frame_id += 1;
-            }
-
-            // Check for shutdown signal
+            // Check for shutdown signal first
             if shutdown_rx_converter.try_recv().is_ok() {
                 log::debug!("Converter thread received shutdown signal");
                 break;
+            }
+
+            // Blocking receive - wait for next frame
+            match capture_frame_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(capture) => {
+                    let capture_time = Instant::now();
+                    *fps_for_converter.lock().unwrap() = capture.fps as f32;
+
+                    log::debug!(
+                        "Dispatching frame {}, FPS: {:.2}",
+                        cap_frame_id,
+                        capture.fps
+                    );
+
+                    // OPTIMIZATION: Images are already Arc-wrapped from CaptureInput, use cheap Arc::clone
+                    output_tx
+                        .try_send((Arc::clone(&capture.original_image), capture_time))
+                        .ok();
+                    // Send to detector queue (NON-BLOCKING)
+                    detector_tx
+                        .try_send((Arc::clone(&capture.resized_image), capture_time))
+                        .ok();
+
+                    if !capture.has_frames {
+                        log::info!("No frames has left in stream, exiting..");
+                        shutdown_tx_display.send(()).ok();
+                    }
+
+                    cap_frame_id += 1;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // No frame available, continue loop
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    log::info!("Capture channel disconnected, converter thread exiting");
+                    break;
+                }
             }
         }
 
@@ -382,41 +393,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let video_pipeline_for_detector = Arc::clone(&video_pipeline);
+    let fps_for_detector = Arc::clone(&fps);
 
     let detector_handle = thread::spawn(move || {
         let mut submitted_frame_id = 0_u64;
         let mut input_frame_id = 0_u64;
 
         loop {
-            // Drain DETECTOR queue to get only the LATEST frame
-            // This naturally skips frames - if detection is slow, many frames accumulate and we only take the newest
-            let mut latest_detector_frame: Option<(Arc<RgbImage>, Instant)> = None;
-            let mut frames_drained = 0;
+            let mut latest_detector_frame: Option<Arc<RgbImage>> = None;
+            let mut frames_drained = 0_i32;
+            let frame_start = Instant::now();
 
-            while let Ok(frame_with_timestamp) = detector_rx.try_recv() {
+            // Drain all pending frames, keep only the latest
+            while let Ok((detector_frame, _capture_time)) = detector_rx.try_recv() {
                 // If we already have a frame, the previous one becomes a dropped frame
                 if latest_detector_frame.is_some() {
-                    log::warn!("Extrapolating tracks for dropped frame");
+                    frames_drained += 1;
                 }
-
-                latest_detector_frame = Some(frame_with_timestamp);
-                frames_drained += 1;
+                latest_detector_frame = Some(detector_frame);
                 input_frame_id += 1;
             }
 
-            if frames_drained > 1 {
-                log::debug!("Drained {} frames, using latest", frames_drained);
+            if frames_drained > 0 {
+                log::warn!("Drained frames: {} (pipeline overload)", frames_drained);
             }
-            log::debug!("Consuming frame {} for detect", input_frame_id);
 
-            // Submit latest detector frame if available
-            if let Some((detector_frame, _capture_time)) = latest_detector_frame {
+            if latest_detector_frame.is_some() {
+                log::debug!("Consuming frame {} for detect", input_frame_id);
                 // OPTIMIZATION: detector_frame is Arc<RgbImage>, dereference to access methods
+                let detector_frame = latest_detector_frame.unwrap();
                 let (width, height) = detector_frame.dimensions();
 
                 // OPTIMIZATION: Only clone pixel data when converting to owned Vec for Frame
                 // This is the minimal necessary allocation for the detection pipeline
-                let raw_data: Vec<u8> = (*detector_frame).clone().into_raw();
+                let raw_data: Vec<u8> = match Arc::try_unwrap(detector_frame) {
+                    Ok(img) => img.into_raw(),
+                    Err(arc) => arc.as_ref().to_vec(),
+                };
 
                 let frame = Frame {
                     data: Arc::from(raw_data.into_boxed_slice()), // Wrap in Arc for zero-copy sharing
@@ -427,12 +440,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // submit_frame is NON-BLOCKING - if pipeline is busy, frame is dropped
                 // This provides natural backpressure without pacing
-                if video_pipeline_for_detector.submit_frame(frame) {
-                    log::debug!("Submitted frame {} for detect", submitted_frame_id);
-                    submitted_frame_id += 1;
-                } else {
-                    //video_pipeline_for_detector.advance_tracks();
-                }
+                match video_pipeline_for_detector.submit_frame(frame) {
+                    Ok(()) => {
+                        log::debug!("Submitted frame {} for detect", submitted_frame_id);
+                        submitted_frame_id += 1;
+                    }
+                    Err(_) => {
+                        log::warn!("Dropped frame {} (pipeline busy)", input_frame_id);
+                        continue;
+                    }
+                };
+            }
+
+            // Pace to target FPS - sleep for remaining time in this frame period
+            // This happens AFTER draining and submitting to avoid queue buildup
+            let capture_frame_duration =
+                Duration::from_secs_f64(1.0 / *fps_for_detector.lock().unwrap() as f64);
+            let elapsed = frame_start.elapsed();
+            if elapsed < capture_frame_duration {
+                std::thread::sleep(capture_frame_duration - elapsed);
             }
 
             // Check for shutdown signal (non-blocking)
@@ -441,9 +467,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 video_pipeline_for_detector.shutdown();
                 break;
             }
-
-            // Pace to ~30 FPS for detection thread
-            std::thread::sleep(Duration::from_millis(5));
         }
     });
 
@@ -498,7 +521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok((mat, width, height)) = writer_rx.try_recv() {
                 if let Some(writer) = &mut file_writer {
                     log::trace!("Writing frame to output video file");
-                    let _ = writer.write(&mat).is_ok();
+                    let _ = writer.write(&mat);
                 } else {
                     file_writer = match VideoWriter::new(
                         output_path,
@@ -514,7 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     log::debug!("Writing first frame to output video file");
-                    let _ = file_writer.as_mut().unwrap().write(&mat).is_ok();
+                    let _ = file_writer.as_mut().unwrap().write(&mat);
                 }
             }
             if shutdown_rx_writer.try_recv().is_ok() {
@@ -544,17 +567,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         loop {
-            // Check shutdown signal
-            if let Ok(_) = shutdown_rx_output.try_recv() {
-                log::debug!("Output thread received shutdown signal");
-                break;
-            }
-
             // Try to get frame from OUTPUT queue with timeout
             // This allows the loop to check for exit conditions periodically
             // instead of blocking forever waiting for frames
-            let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((frame_arc, _timestamp)) => Some(frame_arc),
+            let frame_arc = match output_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok((cap_arc, _timestamp)) => {
+                    log::debug!("Consuming frame: {} for output", out_frame_id);
+                    out_frame_id += 1;
+                    cap_arc
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No frame yet, continue loop to check exit conditions
                     continue;
@@ -566,14 +587,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let frame_arc = if let Some(frame_arc) = new_captured_frame {
-                log::debug!("Consuming frame: {} for output", out_frame_id);
-                out_frame_id += 1;
-                frame_arc // Keep as Arc, clone only when needed
-            } else {
-                log::warn!("No more frames available, ending video processing");
-                break;
-            };
             let origin_frame_width = frame_arc.width();
             let origin_frame_height = frame_arc.height();
 
@@ -688,14 +701,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,
                 opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             );
-            let _ = display_tx
-                .try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()))
-                .is_ok();
 
+            let _ =
+                display_tx.try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()));
             // Write ALL frames to output video (async, non-blocking)
-            let _ = writer_tx
-                .try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()))
-                .is_ok();
+            let _ =
+                writer_tx.try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()));
+
             // Print progress every N frames (based on FPS)
             let progress_interval = (*fps_for_output.lock().unwrap() as u64).max(24);
             if out_frame_id % progress_interval == 0 {
@@ -730,7 +742,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         avg_latency
                     );
                 }
-                io::stderr().flush().ok();
+                let _ = io::stderr().flush();
+            }
+
+            // Check shutdown signal
+            if shutdown_rx_output.try_recv().is_ok() {
+                log::debug!("Output thread received shutdown signal");
+                break;
             }
         }
         // Shutdown video pipeline
@@ -760,7 +778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  RT-DETR runs: {}", processed);
         eprintln!("  Average latency: {:.0}ms", avg_latency);
         eprintln!("===================================================\n");
-        let _ = io::stderr().flush().is_ok();
+        let _ = io::stderr().flush();
     });
 
     // Pre-allocate Mat for reuse (optimization)
@@ -768,38 +786,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut latest_mat = Mat::default();
 
     loop {
-        if let Ok(_) = shutdown_rx_display.try_recv() {
-            log::debug!("Main loop received shutdown signal");
-            if !headless {
-                let _ = highgui::destroy_all_windows().is_ok();
-            }
-            break;
-        }
-
         log::debug!("Main Loop: Starting iteration, checking for frames...");
 
         while let Ok((mat, width, height)) = display_rx.try_recv() {
-            if !display_initialized.get() {
-                let max_height = 640;
-                let (window_width, window_height) = if height > max_height {
-                    // Scale down to 640p preserving aspect ratio
-                    let scale = max_height as f32 / height as f32;
-                    ((width as f32 * scale) as i32, max_height as i32)
-                } else {
-                    // Use native resolution
-                    (width as i32, height as i32)
-                };
-                if !headless {
-                    let _ =
-                        highgui::resize_window("Detection", window_width, window_height).is_ok();
+            if !headless {
+                if !display_initialized.get() {
+                    let max_height = 640;
+                    let (window_width, window_height) = if height > max_height {
+                        // Scale down to 640p preserving aspect ratio
+                        let scale = max_height as f32 / height as f32;
+                        ((width as f32 * scale) as i32, max_height as i32)
+                    } else {
+                        // Use native resolution
+                        (width as i32, height as i32)
+                    };
+                    if !headless {
+                        let _ = highgui::resize_window("Detection", window_width, window_height);
+                    }
+                    display_initialized.set(true);
                 }
-                display_initialized.set(true);
+                latest_mat = mat.clone();
             }
-            latest_mat = mat.clone();
         }
 
         if !headless {
-            let _ = highgui::imshow("Detection", &latest_mat).is_ok();
+            let _ = highgui::imshow("Detection", &latest_mat);
 
             // Handle keyboard input with minimal delay (1ms for UI responsiveness)
             let key = highgui::wait_key(1)?;
@@ -822,6 +833,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // In headless mode, add a small sleep to prevent busy loop
             std::thread::sleep(Duration::from_millis(1));
+        }
+
+        if shutdown_rx_display.try_recv().is_ok() {
+            log::debug!("Main loop received shutdown signal");
+            if !headless {
+                let _ = highgui::destroy_all_windows();
+            }
+            break;
         }
     }
 

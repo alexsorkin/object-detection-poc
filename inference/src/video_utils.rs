@@ -140,10 +140,10 @@ impl VideoResizer {
         // Handle invalid FPS (common with cameras)
         if fps <= 0.0 {
             log::warn!(
-                "Video source returned invalid FPS ({}), defaulting to 30.0",
+                "Video source returned invalid FPS ({}), defaulting to 20.0",
                 fps
             );
-            fps = 30.0;
+            fps = 20.0;
         }
 
         log::info!(
@@ -160,12 +160,6 @@ impl VideoResizer {
         loop {
             let frame_start = Instant::now();
             let capture_frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
-
-            // Pace to target FPS - sleep for remaining time in this frame period
-            let elapsed = frame_start.elapsed();
-            if elapsed < capture_frame_duration {
-                std::thread::sleep(capture_frame_duration - elapsed);
-            }
 
             // Read frame
             let read_success = capture
@@ -185,7 +179,7 @@ impl VideoResizer {
                     original_height,
                     has_frames: false,
                 };
-                let _ = frame_tx.send(end_frame);
+                frame_tx.try_send(end_frame).ok();
                 break;
             }
 
@@ -211,14 +205,17 @@ impl VideoResizer {
             );
 
             // Send to channel
-            if frame_tx.send(capture_input).is_err() {
-                log::warn!("Frame channel closed, stopping video capture");
-                break;
-            }
+            frame_tx.try_send(capture_input).ok();
 
             // OPTIMIZATION: Reduce logging frequency to every 100 frames
             if frame_count % 100 == 0 {
                 log::debug!("Processed {} frames", frame_count);
+            }
+
+            // Pace to target FPS - sleep for remaining time in this frame period
+            let elapsed = frame_start.elapsed();
+            if elapsed <= capture_frame_duration {
+                std::thread::sleep(capture_frame_duration - elapsed);
             }
         }
 

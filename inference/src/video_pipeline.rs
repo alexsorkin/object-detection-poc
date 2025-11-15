@@ -299,10 +299,10 @@ impl VideoPipeline {
     }
 
     /// Submit frame for processing (non-blocking, returns false if buffer full)
-    pub fn submit_frame(&self, frame: Frame) -> bool {
+    pub fn submit_frame(&self, frame: Frame) -> Result<(), String> {
         self.command_tx
             .try_send(WorkerCommand::ProcessFrame(frame))
-            .is_ok()
+            .map_err(|e| format!("Failed to submit frame: {}", e))
     }
 
     /// Get next result (non-blocking)
@@ -382,7 +382,10 @@ mod tests {
                 height: 480,
                 sequence: i,
             };
-            assert!(video_pipeline.submit_frame(frame), "Failed to submit frame");
+            assert!(
+                video_pipeline.submit_frame(frame).is_ok(),
+                "Failed to submit frame"
+            );
         }
 
         // Get results
