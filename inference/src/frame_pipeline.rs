@@ -41,7 +41,7 @@ pub struct TileDetection {
     pub h: f32,
     pub confidence: f32,
     pub class_id: u32,
-    pub class_name: String,
+    pub class_name: Arc<str>,
     pub tile_idx: usize,
     // Optional Kalman filter velocity (pixels per second)
     pub vx: Option<f32>,
@@ -349,7 +349,7 @@ impl ExecutionStage {
                                 h: h_tile_px,
                                 confidence: det.confidence,
                                 class_id,
-                                class_name: capitalized_name,
+                                class_name: Arc::from(capitalized_name),
                                 tile_idx: *tile_idx,
                                 vx: None,  // No velocity for raw detections
                                 vy: None,

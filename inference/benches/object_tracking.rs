@@ -4,6 +4,7 @@ use military_target_detector::{
     tracking_utils::{calculate_iou, BoundingBox},
 };
 use rand::Rng;
+use std::sync::Arc;
 
 /// Generate realistic test detections for tracking benchmarks
 fn generate_test_detections(
@@ -28,7 +29,7 @@ fn generate_test_detections(
             h: height,
             confidence,
             class_id: rng.gen_range(0..8), // Common COCO classes
-            class_name: format!("class_{}", rng.gen_range(0..8)),
+            class_name: Arc::from(format!("class_{}", rng.gen_range(0..8)).as_str()),
             tile_idx: 0,
             vx: None,
             vy: None,
@@ -168,7 +169,7 @@ fn bench_coordinate_transforms(c: &mut Criterion) {
                                 h: d.h * scale_y,
                                 confidence: d.confidence,
                                 class_id: d.class_id,
-                                class_name: d.class_name.clone(),
+                                class_name: Arc::clone(&d.class_name),
                                 tile_idx: d.tile_idx,
                                 vx: d.vx.map(|v| v * scale_x),
                                 vy: d.vy.map(|v| v * scale_y),

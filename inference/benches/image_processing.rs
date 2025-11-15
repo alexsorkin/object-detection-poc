@@ -5,6 +5,7 @@ use military_target_detector::{
     image_utils::{calculate_scale_factors, draw_rect_batch, prepare_annotation_data},
 };
 use rand::Rng;
+use std::sync::Arc;
 
 /// Generate test detection data for image processing benchmarks
 fn generate_test_tile_detections(count: usize) -> Vec<TileDetection> {
@@ -17,9 +18,9 @@ fn generate_test_tile_detections(count: usize) -> Vec<TileDetection> {
             y: rng.gen_range(0.0..1000.0),
             w: rng.gen_range(20.0..200.0),
             h: rng.gen_range(20.0..200.0),
-            confidence: rng.gen_range(0.3..0.95),
+            confidence: rng.gen_range(0.5..1.0),
             class_id: rng.gen_range(0..8),
-            class_name: format!("class_{}", rng.gen_range(0..8)),
+            class_name: Arc::from(format!("class_{}", rng.gen_range(0..8)).as_str()),
             tile_idx: 0,
             vx: None,
             vy: None,

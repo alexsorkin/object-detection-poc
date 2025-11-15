@@ -4,6 +4,7 @@ use military_target_detector::{
     frame_pipeline::TileDetection, image_utils::calculate_scale_factors,
 };
 use rand::Rng;
+use std::sync::Arc;
 
 /// Create test frame data
 fn create_test_image(width: u32, height: u32) -> RgbImage {
@@ -31,9 +32,9 @@ fn generate_test_detections(count: usize) -> Vec<TileDetection> {
             y: rng.gen_range(0.0..1000.0),
             w: rng.gen_range(20.0..200.0),
             h: rng.gen_range(20.0..200.0),
-            confidence: rng.gen_range(0.3..0.95),
-            class_id: rng.gen_range(0..8),
-            class_name: format!("class_{}", i % 8),
+            confidence: rng.gen_range(0.5..1.0),
+            class_id: (i % 8) as u32,
+            class_name: Arc::from(format!("class_{}", i % 8).as_str()),
             tile_idx: 0,
             vx: Some(rng.gen_range(-5.0..5.0)),
             vy: Some(rng.gen_range(-5.0..5.0)),

@@ -4,6 +4,7 @@
 use crate::frame_pipeline::TileDetection;
 use ndarray::Array2;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// Convert TileDetection (x, y, w, h) to tracker format (x1, y1, x2, y2, confidence)
 ///
@@ -56,10 +57,10 @@ pub fn tracker_output_to_tile_detection(tracks: &ndarray::Array2<f32>) -> Vec<Ti
                     y: y1,
                     w: x2 - x1,
                     h: y2 - y1,
-                    confidence: 0.8, // Track confidence (should be derived from tracker state)
-                    class_id: 0, // TODO: Need to maintain class mapping from original detections
-                    class_name: "tracked_object".to_string(), // TODO: Map from class_id
-                    tile_idx: 0, // Default
+                    confidence: 0.0, // tracker doesn't provide confidence
+                    class_id: 0,     // TODO: Use actual class ID from metadata
+                    class_name: Arc::from("tracked_object"), // TODO: Map from class_id
+                    tile_idx: 0,     // Not applicable for tracked detections
                     vx: None,
                     vy: None,
                     track_id: Some(track_id),

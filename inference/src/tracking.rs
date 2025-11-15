@@ -397,8 +397,7 @@ impl UnifiedTracker {
                                 if let Some(track_id) = prediction.track_id {
                                     if let Some(metadata) = track_metadata.get(&track_id) {
                                         prediction.class_id = metadata.class_id;
-                                        prediction.class_name =
-                                            metadata.class_name.as_ref().to_string();
+                                        prediction.class_name = Arc::clone(&metadata.class_name);
                                         prediction.confidence = metadata.last_confidence;
 
                                         log::trace!(
@@ -565,7 +564,7 @@ impl UnifiedTracker {
                 if let Some(track_id) = tracked_det.track_id {
                     let metadata = TrackMetadata {
                         class_id: detection.class_id,
-                        class_name: Arc::from(detection.class_name.as_str()),
+                        class_name: Arc::clone(&detection.class_name),
                         last_confidence: detection.confidence,
                     };
 
@@ -573,7 +572,7 @@ impl UnifiedTracker {
 
                     // Apply metadata to tracked detection
                     tracked_det.class_id = metadata.class_id;
-                    tracked_det.class_name = metadata.class_name.to_string();
+                    tracked_det.class_name = Arc::clone(&metadata.class_name);
                     tracked_det.confidence = metadata.last_confidence;
 
                     log::trace!(
