@@ -446,7 +446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         submitted_frame_id += 1;
                     }
                     Err(_) => {
-                        log::warn!("Dropped frame {} (pipeline busy)", input_frame_id);
+                        log::warn!("Dropped frame {} (pipeline is busy)", input_frame_id);
                         continue;
                     }
                 };
