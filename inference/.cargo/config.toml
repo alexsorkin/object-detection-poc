@@ -1,7 +1,7 @@
 # Environment variables for cargo build
 # These are set for ALL cargo invocations, including build scripts
 [env]
-DYLD_LIBRARY_PATH = { value = "/usr/local/opt/llvm/lib", force = true, relative = false }
+DYLD_LIBRARY_PATH = { value = "/usr/local/opt/llvm/lib:/usr/local/opt/openvino/lib", force = true, relative = false }
 LIBCLANG_PATH = { value = "/usr/local/opt/llvm/lib", force = true, relative = false }
 LLVM_CONFIG_PATH = { value = "/usr/local/opt/llvm/bin/llvm-config", force = true, relative = false }
 OpenCV_DIR = { value = "/usr/local/opt/opencv", force = true, relative = false }

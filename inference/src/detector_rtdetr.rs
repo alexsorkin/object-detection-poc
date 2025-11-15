@@ -78,9 +78,9 @@ impl RTDETRDetector {
             }
 
             // Try CoreML (Apple Metal)
-            #[cfg(feature = "metal")]
+            #[cfg(feature = "coreml")]
             {
-                match Self::try_create_gpu_session(&model_path, &config) {
+                match Self::try_create_coreml_session(&model_path, &config) {
                     Ok(session) => {
                         log::info!("✓ RT-DETR loaded successfully with CoreML (GPU/Metal)");
                         return Ok(Self {
@@ -91,12 +91,36 @@ impl RTDETRDetector {
                     }
                     Err(e) => {
                         log::warn!("CoreML initialization failed: {}", e);
+                        log::warn!("Falling back to next GPU backend or CPU...");
+                    }
+                }
+            }
+
+            // Try OpenVINO (Intel GPU/VPU)
+            #[cfg(feature = "openvino")]
+            {
+                match Self::try_create_openvino_session(&model_path, &config) {
+                    Ok(session) => {
+                        log::info!("✓ RT-DETR loaded successfully with OpenVINO (Intel GPU)");
+                        return Ok(Self {
+                            session,
+                            config,
+                            input_size,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("OpenVINO initialization failed: {}", e);
                         log::warn!("Falling back to CPU with FP32 model...");
                     }
                 }
             }
 
-            #[cfg(not(any(feature = "metal", feature = "cuda", feature = "tensorrt")))]
+            #[cfg(not(any(
+                feature = "coreml",
+                feature = "cuda",
+                feature = "tensorrt",
+                feature = "openvino"
+            )))]
             {
                 log::warn!("No GPU backend feature enabled, falling back to CPU");
             }
@@ -193,23 +217,52 @@ impl RTDETRDetector {
     }
 
     /// Try to create a GPU-accelerated session with CoreML
-    #[cfg(feature = "metal")]
-    fn try_create_gpu_session(
+    #[cfg(feature = "coreml")]
+    fn try_create_coreml_session(
         model_path: &str,
         _config: &DetectorConfig,
     ) -> Result<Session, DetectionError> {
+        use ort::execution_providers::coreml::CoreMLComputeUnits;
         use ort::execution_providers::CoreMLExecutionProvider;
 
-        log::info!("Attempting to use CoreML (Metal) backend...");
+        log::info!("Attempting to use CoreML (Metal GPU only, no Neural Engine)...");
 
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_execution_providers([CoreMLExecutionProvider::default().build()])
+            .with_execution_providers([CoreMLExecutionProvider::default()
+                .with_compute_units(CoreMLComputeUnits::CPUAndGPU) // Use GPU only, disable Neural Engine
+                .build()])
             .map_err(|e| DetectionError::ModelLoadError(format!("CoreML provider failed: {}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| DetectionError::ModelLoadError(format!("Failed to load model: {}", e)))?;
+
+        Ok(session)
+    }
+
+    /// Try to create a GPU-accelerated session with OpenVINO
+    #[cfg(feature = "openvino")]
+    fn try_create_openvino_session(
+        model_path: &str,
+        _config: &DetectorConfig,
+    ) -> Result<Session, DetectionError> {
+        use ort::execution_providers::OpenVINOExecutionProvider;
+
+        log::info!("Attempting to use OpenVINO backend (Intel GPU/VPU)...");
+
+        let session = Session::builder()
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_execution_providers([OpenVINOExecutionProvider::default().build()])
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("OpenVINO provider failed: {}", e))
+            })?
+            .commit_from_file(model_path)
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("Failed to load model with OpenVINO: {}", e))
+            })?;
 
         Ok(session)
     }

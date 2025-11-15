@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    //tracing_subscriber::fmt::init();
 
     eprintln!("📝 Parsing arguments...");
 
@@ -115,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         None => {
                             eprintln!(
-                                "Invalid model variant '{}'. Valid options: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32, r50_int8",
+                                "Invalid model variant '{}'. Valid options: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32, r50_uint8",
                                 args[i]
                             );
                             return Ok(());
@@ -152,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         _ => {
                             log::warn!(
-                                "⚠️  Unknown detector type: '{}'. Using RT-DETR. Supported: rtdetr",
+                                "⚠️  Unknown detector type: '{}'. Supported: [rtdetr]",
                                 args[i]
                             );
                         }
@@ -179,8 +180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fps = 30.0; // Default FPS, will be updated by actual video
 
-    let batch_size = 1; // No batching possible with 400ms processing time and max_pending=2
-
     // Read model directory from environment variable or use default
     let model_dir = env::var("DEFENITY_MODEL_DIR").unwrap_or_else(|_| "../models".to_string());
 
@@ -190,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_path: format!("{}/{}", model_dir, model_variant.filename()),
         confidence_threshold,
         input_size: (640, 640),
-        use_gpu: true, // Use CPU or GPU (CUDA/Metal/Vulkan)
+        use_gpu: true, // Use CPU or GPU (CUDA/Metal/OpenVINO/Vulkan)
         ..Default::default()
     };
 
@@ -263,7 +262,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  ✓ Pipeline ready");
     eprintln!("\n💡 Configuration:");
     eprintln!("  • Detector: {} (frame executor)", model_variant.name());
-    eprintln!("  • Batch size: {}", batch_size);
     eprintln!(
         "  • Queue depth: {} (backpressure)",
         executor_config.max_queue_depth
@@ -411,12 +409,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Submit latest detector frame if available
             if let Some((detector_frame, _capture_time)) = latest_detector_frame {
-                // Convert image to raw RGB data
+                // OPTIMIZATION: detector_frame is Arc<RgbImage>, dereference to access methods
                 let (width, height) = detector_frame.dimensions();
-                let raw_data: Vec<u8> = detector_frame.as_ref().clone().into_raw(); // Clone only when converting to raw data
+
+                // OPTIMIZATION: Only clone pixel data when converting to owned Vec for Frame
+                // This is the minimal necessary allocation for the detection pipeline
+                let raw_data: Vec<u8> = (*detector_frame).clone().into_raw();
 
                 let frame = Frame {
-                    data: Arc::from(raw_data.into_boxed_slice()), // Zero-copy Arc data
+                    data: Arc::from(raw_data.into_boxed_slice()), // Wrap in Arc for zero-copy sharing
                     width,
                     height,
                     sequence: submitted_frame_id,
@@ -484,45 +485,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut file_writer: Option<VideoWriter> = None;
 
         loop {
-            if let Ok(_) = shutdown_rx_writer.try_recv() {
-                log::debug!("Writer thread received shutdown signal");
-                while let Ok((mat, _width, _height)) = writer_rx.try_recv() {
+            while let Ok((mat, width, height)) = writer_rx.try_recv() {
+                if let Some(writer) = &mut file_writer {
+                    log::trace!("Writing frame to output video file");
+                    let _ = writer.write(&mat).is_ok();
+                } else {
+                    file_writer = match VideoWriter::new(
+                        output_path,
+                        VideoWriter::fourcc('a', 'v', 'c', '1').unwrap(),
+                        fps,
+                        opencv::core::Size::new(width as i32, height as i32),
+                        true,
+                    ) {
+                        Ok(writer) => Some(writer),
+                        Err(e) => {
+                            eprintln!("❌ Failed to open video writer: {}", e);
+                            break;
+                        }
+                    };
+                    log::debug!("Writing first frame to output video file");
                     let _ = file_writer.as_mut().unwrap().write(&mat).is_ok();
                 }
-                break;
             }
-            match writer_rx.try_recv() {
-                Ok((mat, width, height)) => {
-                    if let Some(writer) = &mut file_writer {
-                        log::trace!("Writing frame to output video file");
-                        let _ = writer.write(&mat).is_ok();
-                    } else {
-                        file_writer = match VideoWriter::new(
-                            output_path,
-                            VideoWriter::fourcc('a', 'v', 'c', '1').unwrap(),
-                            fps,
-                            opencv::core::Size::new(width as i32, height as i32),
-                            true,
-                        ) {
-                            Ok(writer) => Some(writer),
-                            Err(e) => {
-                                eprintln!("❌ Failed to open video writer: {}", e);
-                                break;
-                            }
-                        };
-                        log::debug!("Writing first frame to output video file");
-                        let _ = file_writer.as_mut().unwrap().write(&mat).is_ok();
-                    }
-                }
-                Err(_) => {
-                    continue;
-                }
+            if let Ok(_) = shutdown_rx_writer.try_recv() {
+                log::debug!("Writer thread received shutdown signal");
+                break;
             }
         }
         if let Some(writer) = &mut file_writer {
-            log::info!("Releasing video writer");
+            log::debug!("Releasing video writer");
             let _ = writer.release().map_err(|e| e.to_string());
-            log::debug!("Output video saved: {}", output_path);
+            log::info!("Output video saved: {}", output_path);
         }
     });
 
