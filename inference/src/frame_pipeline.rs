@@ -194,12 +194,12 @@ impl PreprocessStage {
         // Extract tiles from shadow-removed image (tiles will be used for detection)
         // Run tile extraction in a blocking task to avoid blocking the async executor
         let tiles = task::spawn_blocking({
-            let input_img = img.clone();
+            let img = img.clone();
             let tile_size = self.tile_size;
             let tile_overlap = self.tile_overlap;
             move || {
                 let preprocess_stage = PreprocessStage::new(tile_size, tile_overlap);
-                preprocess_stage.extract_tiles(&input_img)
+                preprocess_stage.extract_tiles(&img)
             }
         }).await.unwrap();
         
@@ -217,7 +217,7 @@ impl PreprocessStage {
 pub struct ExecutionStage {
     frame_executor: Arc<FrameExecutor>,
     tile_size: u32,
-    allowed_classes: Vec<u32>,
+    allowed_classes: Arc<Vec<u32>>,
 }
 
 impl ExecutionStage {
@@ -229,7 +229,7 @@ impl ExecutionStage {
         Self {
             frame_executor,
             tile_size,
-            allowed_classes,
+            allowed_classes: Arc::new(allowed_classes),
         }
     }
 
@@ -243,9 +243,9 @@ impl ExecutionStage {
         
         // PARALLEL: Convert all tiles to ImageData concurrently
         let tile_data_vec: Vec<_> = task::spawn_blocking({
-            let tiles = input.tiles.clone();
+            let tiles_ref = input.tiles.clone();
             move || {
-                tiles
+                tiles_ref
                     .par_iter()
                     .map(|tile| {
                         // Pre-allocate with exact capacity for better performance
@@ -304,7 +304,7 @@ impl ExecutionStage {
         let processed_detections: Vec<(usize, Vec<TileDetection>)> = task::spawn_blocking({
             let tile_results = tile_results.clone();
             let tile_size = self.tile_size;
-            let allowed_classes = self.allowed_classes.clone();
+            let allowed_classes = Arc::clone(&self.allowed_classes);
             move || {
                 tile_results
                     .par_iter()
@@ -330,16 +330,19 @@ impl ExecutionStage {
                             let x_final = x_tile_px + *offset_x as f32;
                             let y_final = y_tile_px + *offset_y as f32;
 
-                            // Get class name and capitalize first letter
+                            // Get class name - capitalize inline without String allocation
                             let class_name = det.class.name();
-                            let capitalized_name = if !class_name.is_empty() {
+                            let class_name_arc: Arc<str> = if !class_name.is_empty() {
                                 let mut chars = class_name.chars();
                                 match chars.next() {
-                                    None => String::new(),
-                                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                                    None => Arc::from(""),
+                                    Some(first) => {
+                                        let capitalized = first.to_uppercase().chain(chars).collect::<String>();
+                                        Arc::from(capitalized.as_str())
+                                    }
                                 }
                             } else {
-                                class_name
+                                Arc::from(class_name)
                             };
                             
                             tile_dets.push(TileDetection {
@@ -349,7 +352,7 @@ impl ExecutionStage {
                                 h: h_tile_px,
                                 confidence: det.confidence,
                                 class_id,
-                                class_name: Arc::from(capitalized_name),
+                                class_name: class_name_arc,
                                 tile_idx: *tile_idx,
                                 vx: None,  // No velocity for raw detections
                                 vy: None,
@@ -435,8 +438,8 @@ impl PostprocessStage {
     fn filter_nested_detections(&self, detections: Vec<TileDetection>) -> Result<Vec<TileDetection>, String> {
         const NESTED_PADDING: f32 = 10.0; // Add 10px padding to nested detection boundaries
 
-        // PARALLEL: Check each detection concurrently for containment
-        let filtered: Vec<TileDetection> = detections
+        // PARALLEL: Filter contained boxes concurrently - collect indices first
+        let keep_indices: Vec<usize> = detections
             .par_iter()
             .enumerate()
             .filter_map(|(i, det)| {
@@ -448,11 +451,15 @@ impl PostprocessStage {
                 });
 
                 if !is_contained {
-                    Some(det.clone())
+                    Some(i)
                 } else {
                     None
                 }
             })
+            .collect();
+        
+        let filtered: Vec<TileDetection> = keep_indices.into_iter()
+            .map(|i| detections[i].clone())
             .collect();
 
         Ok(filtered)
@@ -484,15 +491,15 @@ impl PostprocessStage {
                 class_dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
                 // Apply NMS for this class
-                let mut keep = Vec::new();
                 let mut suppressed = vec![false; class_dets.len()];
+                let mut keep_indices = Vec::new();
 
                 for i in 0..class_dets.len() {
                     if suppressed[i] {
                         continue;
                     }
 
-                    keep.push(class_dets[i].clone());
+                    keep_indices.push(i);
 
                     // PARALLEL: Calculate IoU for all remaining detections concurrently
                     // Collect indices that should be suppressed
@@ -510,7 +517,8 @@ impl PostprocessStage {
                     }
                 }
 
-                keep
+                // Clone only the kept detections at the end
+                keep_indices.into_iter().map(|i| class_dets[i].clone()).collect::<Vec<_>>()
             })
             .collect();
 
@@ -525,26 +533,13 @@ impl PostprocessStage {
         let before_nms = input.detections.len();
 
         // Step 1: Apply NMS to remove duplicates based on IoU
-        let after_nms = task::spawn_blocking({
-            let detections = input.detections.clone();
-            let iou_threshold = self.iou_threshold;
-            move || {
-                let postprocess_stage = PostprocessStage::new(iou_threshold);
-                postprocess_stage.apply_nms(detections)
-            }
-        }).await.unwrap().unwrap();
+        let postprocess_stage = PostprocessStage::new(self.iou_threshold);
+        let after_nms = postprocess_stage.apply_nms(input.detections)?;
         let duplicates_removed = before_nms - after_nms.len();
 
         // Step 2: Filter nested detections (fully contained boxes)
         let before_nested_filter = after_nms.len();
-        let filtered_detections = task::spawn_blocking({
-            let after_nms = after_nms.clone();
-            let iou_threshold = self.iou_threshold;
-            move || {
-                let postprocess_stage = PostprocessStage::new(iou_threshold);
-                postprocess_stage.filter_nested_detections(after_nms)
-            }
-        }).await.unwrap().unwrap();
+        let filtered_detections = postprocess_stage.filter_nested_detections(after_nms)?;
         let nested_removed = before_nested_filter - filtered_detections.len();
 
         // Calculate total pipeline time

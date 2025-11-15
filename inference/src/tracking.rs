@@ -562,25 +562,30 @@ impl UnifiedTracker {
                 tracked_detections.get_mut(track_idx),
             ) {
                 if let Some(track_id) = tracked_det.track_id {
-                    let metadata = TrackMetadata {
-                        class_id: detection.class_id,
-                        class_name: Arc::clone(&detection.class_name),
-                        last_confidence: detection.confidence,
-                    };
+                    let class_id = detection.class_id;
+                    let class_name = Arc::clone(&detection.class_name);
+                    let confidence = detection.confidence;
 
-                    track_metadata.insert(track_id, metadata.clone());
+                    track_metadata.insert(
+                        track_id,
+                        TrackMetadata {
+                            class_id,
+                            class_name: Arc::clone(&class_name),
+                            last_confidence: confidence,
+                        },
+                    );
 
                     // Apply metadata to tracked detection
-                    tracked_det.class_id = metadata.class_id;
-                    tracked_det.class_name = Arc::clone(&metadata.class_name);
-                    tracked_det.confidence = metadata.last_confidence;
+                    tracked_det.class_id = class_id;
+                    tracked_det.class_name = Arc::clone(&class_name);
+                    tracked_det.confidence = confidence;
 
                     log::trace!(
                         "Track {} assigned to detection: class_id={} '{}' conf={:.2}",
                         track_id,
-                        metadata.class_id,
-                        metadata.class_name,
-                        metadata.last_confidence
+                        class_id,
+                        class_name,
+                        confidence
                     );
                 }
             }
