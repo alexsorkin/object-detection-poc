@@ -340,8 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create frame conversion thread - converts Mat to RgbImage and sends to detector/output queues
     let shutdown_rx_converter = shutdown_rx_capture;
     let converter_handle = thread::spawn(move || {
-        let mut frame_id = 0_u64;
-        let mut input_fps = 20.0_f64;
+        let mut cap_frame_id = 0_u64;
 
         loop {
             // Check for shutdown signal
@@ -350,40 +349,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            let frame_start = Instant::now();
-            let capture_frame_duration = Duration::from_secs_f64(1.0 / input_fps as f64);
+            while let Ok(capture) = cupture_frame_rx.try_recv() {
+                let capture_time = Instant::now();
+                // Send to output queue (NON-BLOCKING)
+                let _ = output_tx.try_send((Arc::new(capture.original_image), capture_time));
+                // Send to detector queue (NON-BLOCKING)
+                let _ = detector_tx.try_send((Arc::new(capture.resized_image), capture_time));
 
-            // Pace to target FPS - sleep for remaining time in this frame period
-            let elapsed = frame_start.elapsed();
-            if elapsed < capture_frame_duration {
-                std::thread::sleep(capture_frame_duration - elapsed);
-            }
+                log::info!(
+                    "Dispatching frame {}, FPS: {:.2}",
+                    cap_frame_id,
+                    capture.fps
+                );
 
-            match cupture_frame_rx.try_recv() {
-                Ok(capture) => {
-                    input_fps = capture.fps;
-
-                    frame_id += 1;
-                    let capture_time = Instant::now();
-
-                    // Send to output queue (NON-BLOCKING)
-                    let _ = output_tx.try_send((Arc::new(capture.original_image), capture_time));
-
-                    // Send to detector queue (NON-BLOCKING)
-                    let _ = detector_tx.try_send((Arc::new(capture.resized_image), capture_time));
-
-                    log::debug!("Dispatching frame {} for processing", frame_id);
-
-                    if capture.has_frames == false {
-                        log::info!("No more frames in stream, exiting");
-                        let _ = shutdown_tx_display.send(());
-                        break;
-                    }
+                if capture.has_frames == false {
+                    log::info!("No frames has left in stream, exiting..");
+                    let _ = shutdown_tx_display.send(());
                 }
-                Err(_) => {
-                    // No frame available
-                    continue;
-                }
+
+                cap_frame_id += 1;
             }
         }
 
@@ -566,7 +550,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Try to get frame from OUTPUT queue with timeout
             // This allows the loop to check for exit conditions periodically
             // instead of blocking forever waiting for frames
-            let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(2)) {
+            let new_captured_frame = match output_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok((frame_arc, _timestamp)) => Some(frame_arc),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No frame yet, continue loop to check exit conditions
@@ -727,8 +711,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 log::debug!(
-                    "Frame {}: {:.1} FPS | Tracks: {} | Display frames: {}",
-                    frame_id,
+                    "Checkpoint: {:.1} FPS | Tracks: {} | Display frames: {}",
                     avg_fps,
                     num_tracks,
                     frame_id,
@@ -795,7 +778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         log::debug!("Main Loop: Starting iteration, checking for frames...");
 
-        while let Ok((mat, width, height)) = display_rx.recv_timeout(Duration::from_millis(2)) {
+        while let Ok((mat, width, height)) = display_rx.try_recv() {
             if !display_initialized.get() {
                 let max_height = 640;
                 let (window_width, window_height) = if height > max_height {
