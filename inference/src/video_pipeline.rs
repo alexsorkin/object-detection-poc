@@ -27,7 +27,7 @@ pub struct Frame {
 pub struct FrameResult {
     pub frame_id: u64,
     pub timestamp: Instant,
-    pub detections: Vec<TileDetection>,
+    pub detections: Arc<Vec<TileDetection>>,
     pub is_extrapolated: bool,
     pub processing_time_ms: f32,
     pub latency_ms: f32,
@@ -135,7 +135,7 @@ impl VideoPipeline {
         let _empty_detections_buffer = Vec::<TileDetection>::new();
 
         loop {
-            match tracker_rx.recv() {
+            match tracker_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => {
                     match command {
                         TrackerCommand::ProcessOutput(
@@ -171,7 +171,7 @@ impl VideoPipeline {
                             let result = FrameResult {
                                 frame_id,
                                 timestamp,
-                                detections: (*tracked_detections).clone(), // Clone only when creating FrameResult
+                                detections: Arc::clone(&tracked_detections), // Zero-copy Arc increment
                                 is_extrapolated: false,
                                 processing_time_ms: processed_detections.pipeline_total_time_ms,
                                 latency_ms: 0.0, // No latency in command-based processing
@@ -205,7 +205,11 @@ impl VideoPipeline {
                         }
                     }
                 }
-                Err(_) => {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // Periodic work while idle - could generate extrapolated predictions
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     log::info!("Tracker command channel closed");
                     break;
                 }
@@ -224,7 +228,7 @@ impl VideoPipeline {
         log::info!("Video pipeline worker started");
 
         loop {
-            match command_rx.recv() {
+            match command_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => {
                     match command {
                         WorkerCommand::ProcessFrame(frame) => {
@@ -255,7 +259,7 @@ impl VideoPipeline {
                                 move |output: &PipelineOutput| {
                                     // Create lightweight structure with only needed data
                                     let processed = ProcessedDetections {
-                                        detections: Arc::new(output.detections.clone()), // One clone here
+                                        detections: Arc::clone(&output.detections), // Zero-copy Arc increment
                                         pipeline_total_time_ms: output.pipeline_total_time_ms,
                                         duplicates_removed: output.duplicates_removed,
                                         nested_removed: output.nested_removed,
@@ -288,7 +292,11 @@ impl VideoPipeline {
                         }
                     }
                 }
-                Err(_) => {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // Periodic work while idle - could add stats logging, warmup, etc.
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     log::info!("Command channel closed");
                     break;
                 }

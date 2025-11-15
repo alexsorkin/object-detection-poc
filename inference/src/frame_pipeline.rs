@@ -62,7 +62,7 @@ pub struct ExecutionOutput {
 /// Final output after post-processing
 #[derive(Clone)]
 pub struct PipelineOutput {
-    pub detections: Vec<TileDetection>,
+    pub detections: Arc<Vec<TileDetection>>,
     pub resized_width: u32,
     pub resized_height: u32,
     pub resized_image: RgbImage,
@@ -74,7 +74,7 @@ pub struct PipelineOutput {
 impl Default for PipelineOutput {
     fn default() -> Self {
         Self {
-            detections: Vec::new(),
+            detections: Arc::new(Vec::new()),
             resized_width: 0,
             resized_height: 0,
             resized_image: RgbImage::new(1, 1), // Minimal 1x1 dummy image
@@ -553,7 +553,7 @@ impl PostprocessStage {
         let detections_count = filtered_detections.len();
 
         let output = PipelineOutput {
-            detections: filtered_detections,
+            detections: Arc::new(filtered_detections),
             resized_width: input.resized_width,
             resized_height: input.resized_height,
             resized_image: input.resized_image,

@@ -279,7 +279,7 @@ impl UnifiedTracker {
         let mut track_metadata: HashMap<u32, TrackMetadata> = HashMap::with_capacity(64);
 
         loop {
-            match command_rx.recv() {
+            match command_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(TrackingCommand::Update { detections, dt }) => {
                     log::debug!(
                         "UnifiedTracker: executing update command with {} detections, dt={:.3}s",
@@ -418,7 +418,12 @@ impl UnifiedTracker {
                     );
                     break;
                 }
-                Err(_) => {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // Periodic maintenance: clean up stale track metadata
+                    // For now, just continue - proper cleanup would require tracker API changes
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     log::warn!("UnifiedTracker command channel disconnected");
                     break;
                 }
