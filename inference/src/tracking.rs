@@ -299,7 +299,7 @@ impl UnifiedTracker {
         loop {
             let mut predictions_to_cache: Option<Arc<Vec<TileDetection>>> = None;
 
-            match command_rx.recv_timeout(Duration::from_millis(50)) {
+            match command_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(TrackingCommand::Update { detections, dt }) => {
                     log::debug!(
                         "UnifiedTracker: executing update command with {} detections, dt={:.3}s",
@@ -607,6 +607,6 @@ impl Drop for UnifiedTracker {
         }
 
         // Give threads a moment to shutdown gracefully
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }

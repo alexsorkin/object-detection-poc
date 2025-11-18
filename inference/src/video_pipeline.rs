@@ -135,7 +135,7 @@ impl VideoPipeline {
         let _empty_detections_buffer = Vec::<TileDetection>::new();
 
         loop {
-            match tracker_rx.recv_timeout(Duration::from_millis(50)) {
+            match tracker_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(command) => {
                     match command {
                         TrackerCommand::ProcessOutput(
@@ -228,7 +228,7 @@ impl VideoPipeline {
         log::info!("Video pipeline worker started");
 
         loop {
-            match command_rx.recv_timeout(Duration::from_millis(50)) {
+            match command_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(command) => {
                     match command {
                         WorkerCommand::ProcessFrame(frame) => {

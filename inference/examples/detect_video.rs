@@ -309,8 +309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TWO separate queues:
     // 1. detector_rx: Can drop frames (non-blocking), used for detection - carries timestamp
     // 2. output_rx: Must process ALL frames (blocking), used for output
-    let (detector_tx, detector_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(10); // Detector queue with Arc to avoid cloning
-    let (output_tx, output_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(10); // Output queue with Arc to avoid cloning
+    let (detector_tx, detector_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(5); // Detector queue with Arc to avoid cloning
+    let (output_tx, output_rx) = sync_channel::<(Arc<RgbImage>, Instant)>(5); // Output queue with Arc to avoid cloning
     let (writer_tx, writer_rx) = sync_channel::<(Mat, u32, u32)>(100);
     let (display_tx, display_rx) = sync_channel::<(Mat, u32, u32)>(100);
 
@@ -788,28 +788,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         log::debug!("Main Loop: Starting iteration, checking for frames...");
 
-        while let Ok((mat, width, height)) = display_rx.try_recv() {
-            if !headless {
-                if !display_initialized.get() {
-                    let max_height = 640;
-                    let (window_width, window_height) = if height > max_height {
-                        // Scale down to 640p preserving aspect ratio
-                        let scale = max_height as f32 / height as f32;
-                        ((width as f32 * scale) as i32, max_height as i32)
-                    } else {
-                        // Use native resolution
-                        (width as i32, height as i32)
-                    };
-                    if !headless {
-                        let _ = highgui::resize_window("Detection", window_width, window_height);
-                    }
-                    display_initialized.set(true);
-                }
-                latest_mat = mat.clone();
-            }
-        }
-
         if !headless {
+            latest_mat = match display_rx.try_recv() {
+                Ok((mat, width, height)) => {
+                    if !display_initialized.get() {
+                        let max_height = 640;
+                        let (window_width, window_height) = if height > max_height {
+                            // Scale down to 640p preserving aspect ratio
+                            let scale = max_height as f32 / height as f32;
+                            ((width as f32 * scale) as i32, max_height as i32)
+                        } else {
+                            // Use native resolution
+                            (width as i32, height as i32)
+                        };
+                        let _ = highgui::resize_window("Detection", window_width, window_height);
+                        display_initialized.set(true);
+                    }
+                    // drain one more frame if available to reduce latency
+                    match display_rx.try_recv() {
+                        Ok((next_mat, _, _)) => next_mat,
+                        Err(_) => mat,
+                    }
+                }
+                // If no new frame, reuse last one
+                Err(_) => latest_mat,
+            };
+
             let _ = highgui::imshow("Detection", &latest_mat);
 
             // Handle keyboard input with minimal delay (1ms for UI responsiveness)
@@ -830,9 +834,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("▶️  Resumed");
                 io::stderr().flush()?;
             }
-        } else {
-            // In headless mode, add a small sleep to prevent busy loop
-            std::thread::sleep(Duration::from_millis(1));
         }
 
         if shutdown_rx_display.try_recv().is_ok() {
