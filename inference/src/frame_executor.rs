@@ -57,7 +57,6 @@ impl FrameExecutor {
 
         // Get input size
         let input_size = match detector_type {
-            DetectorType::YOLOV8 => (640, 640),
             DetectorType::RTDETR => (640, 640),
         };
 

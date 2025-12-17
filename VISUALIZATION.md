@@ -2,52 +2,57 @@
 
 ## Overview
 
-The `detect_yoloair` example now includes automatic visualization of detected objects with bounding boxes and labels.
+The RT-DETR detection pipeline includes automatic visualization of detected objects with bounding boxes and labels.
 
 ## Usage
 
-### Basic Usage (Default Output)
+### Video Detection with Real-time Visualization
 
 ```bash
 cd inference
-cargo run --release --features metal --example detect_yoloair path/to/image.jpg
+cargo run --release --features metal --example detect_video path/to/video.mp4
 ```
 
 This will:
-1. Load and process the image
+1. Load and process the video
 2. Run detection with GPU acceleration
 3. Draw bounding boxes with colored borders
-4. Save the annotated image as `output_annotated.jpg`
+4. Display results in real-time window
+5. Save annotated video as `output_video.mp4`
 
-### Custom Output Path
+### Custom Configuration
 
 ```bash
-cargo run --release --features metal --example detect_yoloair input.jpg output.jpg
+cargo run --release --features metal --example detect_video -- \
+  --confidence 60 \
+  --classes 0,2,3,4,7 \
+  --model r50_fp32 \
+  test_data/airport.mp4
 ```
 
-### Example
+### Example Output
 
 ```bash
-# Detect objects in an aerial photo
-cargo run --release --features metal --example detect_yoloair ../test_images/aerial_view.jpg results/detected.jpg
+# Detect objects in video
+cargo run --release --features metal --example detect_video test_data/airport.mp4
 
 # Output:
-# 🎯 YOLO Aerial Detector - GPU Accelerated
+# 📝 Parsing arguments...
+# 🤖 Using detector: RTDETR
+# 📹 Opening video source: test_data/airport.mp4... ✓
 # 
-# ⚙️  Backend: ONNX Runtime (CoreML/Metal on macOS)
+# 💡 Configuration:
+#   • Detector: rtdetr_v2_r50vd_fp32 (frame executor)
+#   • Confidence: 50%
+#   • Classes: [0, 2, 3, 4, 7]
+#   • Tracker: ByteTrack
 # 
-# 📷 Loading image... ✓ (1920x1080)
-# 📦 Loading model on GPU... ✓ (1.23s)
-# 🚀 Running GPU inference... ✓ (180ms)
+# 🎬 Starting video processing...
+#   Press 'q' to quit, 'p' to pause
 # 
-# 📊 Results:
-#   Detections: 3
-#   Inference: 180ms (5.6 FPS)
-# 
-# 🎯 Detected Targets:
-# 
-#   Detection #1:
-#     Class: person (ID: 0)
+# 📊 Detection Statistics:
+#   Detections: 156
+#   Inference: 45ms (22.2 FPS)
 #     Confidence: 87.3%
 #     Box: x=0.245, y=0.512, w=0.089, h=0.156
 # 
@@ -112,37 +117,34 @@ The example outputs:
 
 ## Tips
 
-### For Aerial Images
+### Confidence Thresholds
 
 ```bash
 # Use lower confidence threshold for distant objects
-# Edit the example to set: confidence_threshold: 0.10
-cargo run --release --features metal --example detect_yoloair aerial.jpg output.jpg
+cargo run --release --features metal --example detect_video -- --confidence 30 test_data/video.mp4
 ```
 
-### For High-Resolution Images
+### High-Resolution Videos
 
-The visualization automatically scales to any image size. Bounding boxes are drawn at full resolution.
+The visualization automatically scales to any video size. Bounding boxes are drawn at full resolution.
 
-### Batch Processing
+### Headless Mode
 
-Create a simple script to process multiple images:
+For processing without display:
 
 ```bash
-#!/bin/bash
-for img in images/*.jpg; do
-    output="results/$(basename $img)"
-    cargo run --release --features metal --example detect_yoloair "$img" "$output"
-done
+cargo run --release --features metal --example detect_video -- --headless test_data/video.mp4
 ```
 
 ## Supported Models
 
-The visualization works with any YOLO model format:
+The visualization works with RT-DETR models:
 
-- **COCO models** (80 classes): person, car, dog, clock, etc.
-- **Objects365 models** (365 classes): Extended object set
-- **Custom models**: Any class IDs, labeled as `class_N`
+- **RT-DETR r18**: Fast, suitable for real-time applications
+- **RT-DETR r34/r50**: More accurate, higher latency
+- **RT-DETR r101**: Maximum accuracy
+- **FP16 variants**: GPU-accelerated inference
+- **Custom trained models**: Any class IDs supported
 - **Single-class models**: Aerial detectors, specialized models
 
 ## Performance
@@ -170,53 +172,54 @@ See the commented code in the example for reference.
 
 ## Troubleshooting
 
-### Issue: Image not found
+### Issue: Video not found
 ```
 Error: No such file or directory (os error 2)
 ```
-**Solution**: Check the image path is correct. Use absolute paths if needed.
+**Solution**: Check the video path is correct. Use absolute paths if needed.
 
 ### Issue: Model not found
 ```
 Error: Failed to load model
 ```
-**Solution**: Ensure the model path in the example points to your ONNX model file.
+**Solution**: Ensure the RT-DETR model files are in the `models/` directory.
 
 ### Issue: No detections
 ```
-ℹ️  No targets detected
+No detections found
 ```
-**Solution**: Try lowering the `confidence_threshold` in the example code (default: 0.10).
+**Solution**: Try lowering the confidence threshold: `--confidence 30`
 
-### Issue: Out of memory
+### Issue: Low FPS
 ```
-Error: Failed to allocate
+Slow detection performance
 ```
-**Solution**: Use the mini model or resize large images before processing.
+**Solution**: Use FP16 models for GPU acceleration or lower resolution videos.
 
 ## Examples
 
-### Military Target Detection
+### Airport Security
 ```bash
-cargo run --release --features metal --example detect_yoloair battlefield.jpg result.jpg
+cargo run --release --features metal --example detect_video test_data/airport.mp4
 ```
 
-### Aerial Vehicle Detection
+### Traffic Monitoring
 ```bash
-cargo run --release --features metal --example detect_yoloair drone_footage.jpg detected_vehicles.jpg
+cargo run --release --features metal --example detect_video -- --classes 2,3,4,7 traffic.mp4
 ```
 
-### General Object Detection (COCO)
+### Real-time Webcam
 ```bash
-cargo run --release --features metal --example detect_yoloair street_scene.jpg annotated.jpg
+cargo run --release --features metal --example detect_video 0
 ```
 
 ## Output Format
 
-The annotated image is saved as a standard JPEG file with:
-- Original image as background
+The annotated video is saved as `output_video.mp4` with:
+- Original video frames as background
 - Colored bounding boxes overlaid
-- Label bars with class names
-- High-resolution, ready for analysis or presentation
+- Real-time tracking IDs
+- Green boxes for detections, yellow for tracker predictions
+- 30 FPS output with smooth tracking
 
-You can open the output with any image viewer or use it in reports, documentation, or further processing pipelines.
+You can open the output with any video player or use it for analysis, documentation, or further processing.

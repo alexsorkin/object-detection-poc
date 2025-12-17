@@ -16,7 +16,7 @@ names:
   3: "heavy_weapon"
 
 # Model configuration
-model: "yolov8n.pt"  # Nano model only for 8GB systems
+model: "rtdetr-l.pt"  # RT-DETR model for 8GB systems
 
 # Memory-constrained hyperparameters
 epochs: 50          # Fewer epochs to reduce training time

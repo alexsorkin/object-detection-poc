@@ -160,7 +160,7 @@ This directory should contain your trained ONNX models.
 - `model_info.json` - Model metadata
 
 ## Training Your Own Model:
-1. Prepare dataset in YOLO format
+1. Prepare dataset with annotations
 2. Run training: `python training/train.py`
 3. Export model: `python training/export.py`
 

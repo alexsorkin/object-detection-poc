@@ -51,7 +51,7 @@ pub extern "C" fn mtd_free_string(ptr: *mut c_char) {
 /// Create new detector instance
 #[no_mangle]
 pub extern "C" fn mtd_create_detector(
-    detector_type: c_int, // 0=YOLOV8, 1=RTDETR
+    detector_type: c_int, // 0=RTDETR
     model_path: *const c_char,
     input_width: c_int,
     input_height: c_int,
@@ -72,8 +72,7 @@ pub extern "C" fn mtd_create_detector(
 
     // Determine detector type
     let detector_type_enum = match detector_type {
-        0 => DetectorType::YOLOV8,
-        1 => DetectorType::RTDETR,
+        0 => DetectorType::RTDETR,
         _ => return -1,
     };
 

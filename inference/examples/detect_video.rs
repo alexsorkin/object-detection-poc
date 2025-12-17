@@ -16,7 +16,6 @@
 /// Options (can be in any order):
 ///   --confidence <0-100>    Detection confidence threshold (default: 50)
 ///   --classes <id,id,...>   Comma-separated class IDs to detect (default: 0,2,3,4,7)
-///   --detector <type>       Detector type: rtdetr, yolov8 (default: rtdetr)
 ///   --model <variant>       RT-DETR model variant (default: r18_fp32)
 ///                           Available: r18_fp16, r18_fp32, r34_fp16, r34_fp32, r50_fp16, r50_fp32, r50_int8
 ///   --tracker <method>      Tracking method: kalman, bytetrack (default: kalman)
@@ -27,8 +26,7 @@
 ///   cargo run --release --features metal --example detect_video -- --confidence 35 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- test_data/airport.mp4 --confidence 60 --headless
 ///   cargo run --release --features metal --example detect_video -- --headless --classes 0,2,5,7 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --detector rtdetr --model r50_fp32 test_data/airport.mp4
-///   cargo run --release --features metal --example detect_video -- --detector yolov8 test_data/airport.mp4
+///   cargo run --release --features metal --example detect_video -- --model r50_fp32 test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --model r18_fp16 --tracker bytetrack test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video -- --tracker kalman test_data/airport.mp4
 ///   cargo run --release --features metal --example detect_video 0  # Use webcam

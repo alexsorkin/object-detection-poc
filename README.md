@@ -1,6 +1,6 @@
 # Military Target Detection Model
 
-High-performance computer vision system for detecting military targets using YOLOv8 and Rust inference.
+High-performance computer vision system for detecting military targets using RT-DETR and Rust inference.
 
 ## 🚀 Quick Start
 
@@ -38,14 +38,14 @@ cargo run --release --features metal --example benchmark_all
 
 | Model | Size | Speed | FPS | Use Case |
 |-------|------|-------|-----|----------|
-| **Mini** (YOLOv8s) ⭐ | 43MB | 180ms | 5.6 | Real-time, recommended |
-| **Full** (YOLOv8m) | 99MB | 496ms | 2.0 | Maximum accuracy |
+| **RT-DETR r18** ⭐ | ~70MB | ~45ms | 22 | Real-time, recommended |
+| **RT-DETR r50** | ~150MB | ~90ms | 11 | Maximum accuracy |
 
 *Benchmarked on AMD Radeon Pro 5500M with CoreML/Metal*
 
 ## Architecture
 
-- **Training**: Python with PyTorch/Ultralytics (YOLOv8)
+- **Training**: Python with PyTorch/Ultralytics (RT-DETR)
 - **Inference**: Rust with ONNX Runtime + CoreML/Metal GPU
 - **Integration**: C/C# bindings for Unity applications
 - **Platform**: macOS (Metal), iOS, visionOS (Apple Vision Pro)
@@ -66,15 +66,14 @@ model/
 │   │   └── benchmark_all.rs      # Performance testing
 │   └── Cargo.toml        # Rust dependencies
 ├── scripts/               # Utility scripts
-│   ├── export_mini.py    # Export mini model
-│   ├── export_full.py    # Export full model
+│   ├── generate_battle_scenes.py
+│   ├── create_test_image.py
 │   └── setup.sh          # Environment setup
 ├── training/              # Training pipeline
-│   ├── train.py          # YOLOv8 training
+│   ├── train.py          # RT-DETR training
 │   └── export.py         # Model export
 ├── data/                  # Training datasets
-├── bindings/              # C/Unity bindings
-└── pretrained_models/     # Base YOLO models
+└── bindings/              # C/Unity bindings
 ```
 
 ## GPU Acceleration 🚀
@@ -86,10 +85,10 @@ model/
 - **Platforms supported**: macOS, iOS, visionOS (Apple Vision Pro)
 
 ### Performance Metrics
-- **Mini Model**: 180ms avg, 5.6 FPS (recommended)
-- **Full Model**: 496ms avg, 2.0 FPS (accurate)
-- **GPU**: AMD Radeon Pro 5500M (8GB) / Intel UHD 630
-- **API**: ONNX Runtime 2.0.0-rc.10 with CoreML backend
+- **RT-DETR r18**: ~45ms avg, 22 FPS (recommended)
+- **RT-DETR r50**: ~90ms avg, 11 FPS (accurate)
+- **GPU**: AMD Radeon Pro 5500M (8GB) / Apple Silicon
+- **API**: ONNX Runtime with CoreML backend
 
 ## Key Features
 
@@ -101,8 +100,8 @@ model/
 - Cross-platform support
 
 ### 📦 Optimized Models
-- Two deployment sizes (Mini/Full)
-- Pre-trained YOLOv8 models
+- Multiple RT-DETR variants (r18/r34/r50/r101)
+- Transformer-based detection (no NMS required)
 - ONNX format for portability
 - Efficient memory usage
 

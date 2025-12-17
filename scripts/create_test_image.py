@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Create a normalized test image for YOLO aerial detection
-Expected size: 640x640 (standard YOLOv8 input size)
+Create a normalized test image for aerial detection
+Expected size: 640x640 (standard model input size)
 """
 
 import os
@@ -11,7 +11,7 @@ from io import BytesIO
 
 def create_test_image_from_url(output_path, size=(640, 640)):
     """
-    Download a sample aerial image and resize it to YOLO input size
+    Download a sample aerial image and resize it to model input size
     """
     # Sample aerial images from unsplash (free to use)
     aerial_urls = [
@@ -42,7 +42,7 @@ def create_test_image_from_url(output_path, size=(640, 640)):
     if img.mode != 'RGB':
         img = img.convert('RGB')
     
-    # Resize to expected YOLO input size (640x640) maintaining aspect ratio
+    # Resize to expected input size (640x640) maintaining aspect ratio
     img.thumbnail(size, Image.Resampling.LANCZOS)
     
     # Create a new 640x640 image with padding if needed
@@ -107,7 +107,7 @@ def create_synthetic_test_image(output_path, size=(640, 640)):
         font = ImageFont.load_default()
     
     draw.text((10, 10), "Synthetic Aerial Test Image", fill=(255, 255, 255), font=font)
-    draw.text((10, 35), f"Size: {size[0]}x{size[1]} (YOLO standard)", fill=(255, 255, 255), font=font)
+    draw.text((10, 35), f"Size: {size[0]}x{size[1]} (standard)", fill=(255, 255, 255), font=font)
     
     # Save
     img.save(output_path, 'JPEG', quality=95)
@@ -121,10 +121,10 @@ def main():
     test_data_dir = os.path.join(os.path.dirname(__file__), '..', 'test_data')
     os.makedirs(test_data_dir, exist_ok=True)
     
-    output_path = os.path.join(test_data_dir, 'yolo_air_test.jpg')
+    output_path = os.path.join(test_data_dir, 'aerial_test.jpg')
     
-    print("Creating normalized test image for YOLO aerial detection")
-    print(f"Expected size: 640x640 (standard YOLOv8 input)")
+    print("Creating normalized test image for aerial detection")
+    print(f"Expected size: 640x640 (standard model input)")
     print()
     
     # Try to download real aerial image first, fall back to synthetic
@@ -141,7 +141,7 @@ def main():
     print()
     print("You can now run:")
     print(f"  cd inference")
-    print(f"  cargo run --release --features metal --example detect_yoloair ../test_data/yolo_air_test.jpg")
+    print(f"  cargo run --release --features metal --example detect_video ../test_data/aerial_test.jpg")
 
 if __name__ == '__main__':
     main()

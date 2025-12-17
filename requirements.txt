@@ -2,7 +2,7 @@
 # Minimal requirements for model training and export
 
 # Core ML Framework
-ultralytics>=8.3.0        # YOLOv8 framework
+ultralytics>=8.3.0        # RT-DETR framework
 torch>=2.2.0              # PyTorch with MPS support for macOS
 torchvision>=0.17.0
 opencv-python>=4.9.0      # Image processing

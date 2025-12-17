@@ -11,7 +11,7 @@ import onnx
 import onnxruntime as ort
 import numpy as np
 from pathlib import Path
-from ultralytics import YOLO
+from ultralytics import RTDETR
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class ModelExporter:
     def __init__(self, model_path: str):
         """Initialize exporter with trained model"""
         self.model_path = model_path
-        self.model = YOLO(model_path)
+        self.model = RTDETR(model_path)
         
     def export_to_onnx(self, 
                        output_path: str = None, 
@@ -172,7 +172,7 @@ class ModelExporter:
         model_info = {
             'model_name': 'military_target_detector',
             'version': '1.0.0',
-            'framework': 'YOLOv8',
+            'framework': 'RT-DETR',
             'input_size': [640, 640],
             'input_format': 'RGB',
             'input_range': [0.0, 1.0],

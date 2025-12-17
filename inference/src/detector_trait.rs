@@ -1,7 +1,7 @@
 /// Unified detector trait for different detection architectures
 ///
 /// This trait allows the pipeline to work with any detector architecture
-/// (YOLO, RT-DETR, etc.) as long as they implement this interface.
+/// (RT-DETR, etc.) as long as they implement this interface.
 use crate::types::{Detection, ImageData};
 
 /// Common interface for object detectors
@@ -41,7 +41,6 @@ impl Detector for crate::detector_rtdetr::RTDETRDetector {
 /// Detector type enum for selecting which detector to use
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectorType {
-    YOLOV8,
     RTDETR,
 }
 
@@ -52,7 +51,6 @@ impl DetectorType {
         config: crate::types::DetectorConfig,
     ) -> Result<Box<dyn Detector>, Box<dyn std::error::Error>> {
         match self {
-            DetectorType::YOLOV8 => Err("YOLOv8 detector is not currently implemented".into()),
             DetectorType::RTDETR => {
                 let detector = crate::detector_rtdetr::RTDETRDetector::new(config)?;
                 Ok(Box::new(detector))

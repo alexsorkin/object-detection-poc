@@ -4,7 +4,7 @@
 data: "data.yaml"  # Path to dataset YAML file
 
 # Model configuration
-model: "yolov8n.pt"  # Start with nano model for speed, can upgrade to yolov8s/m/l/x
+model: "rtdetr-l.pt"  # RT-DETR model
 
 # Training hyperparameters
 epochs: 100

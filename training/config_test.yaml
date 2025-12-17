@@ -16,7 +16,7 @@ names:
   3: "heavy_weapon"       # Mounted guns, artillery pieces
 
 # Model configuration
-model: "yolov8n.pt"  # Nano model for fast testing
+model: "rtdetr-l.pt"  # RT-DETR model for testing
 
 # Training hyperparameters - Quick test
 epochs: 1           # Just 1 epoch for testing

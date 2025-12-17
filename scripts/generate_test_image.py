@@ -102,10 +102,10 @@ def generate_test_image_with_tank(output_path: str = "inference/test_data/test_t
     output_path.parent.mkdir(parents=True, exist_ok=True)
     background.save(output_path, quality=95)
     
-    # Generate YOLO label
+    # Generate annotation label
     label_path = output_path.with_suffix('.txt')
     
-    # Calculate bounding box in YOLO format (normalized)
+    # Calculate bounding box (normalized format)
     bbox_x_center = (x + tank.width / 2) / width
     bbox_y_center = (y + tank.height / 2) / height
     bbox_width = tank.width / width
@@ -127,7 +127,7 @@ def generate_test_image_with_tank(output_path: str = "inference/test_data/test_t
             "x_center": x + tank.width / 2,
             "y_center": y + tank.height / 2
         },
-        "yolo_format": {
+        "annotation": {
             "class": 2,
             "x_center": bbox_x_center,
             "y_center": bbox_y_center,

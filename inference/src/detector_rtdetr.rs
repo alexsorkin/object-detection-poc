@@ -1,9 +1,9 @@
 //! RT-DETR (Real-time DEtection TRansformer) detector implementation
 //!
-//! RT-DETR advantages over YOLO:
+//! RT-DETR advantages:
 //! - No NMS required (transformer outputs unique detections)
 //! - Better accuracy for small objects
-//! - End-to-end detection with 300 queries vs 8400 YOLO anchors
+//! - End-to-end detection with 300 queries vs anchor-based methods
 //!
 //! Model outputs:
 //! - pred_boxes: [batch, 300, 4] - (cx, cy, w, h) normalized 0-1
@@ -22,7 +22,7 @@ use rayon::prelude::*;
 pub struct RTDETRDetector {
     session: Session,
     config: DetectorConfig,
-    input_size: (u32, u32), // Model-specific input size (640x640, same as YOLO)
+    input_size: (u32, u32), // Model-specific input size (640x640)
 }
 
 impl RTDETRDetector {
@@ -30,7 +30,7 @@ impl RTDETRDetector {
     pub fn new(config: DetectorConfig) -> Result<Self, DetectionError> {
         log::info!("Initializing RT-DETR detector");
 
-        // RT-DETR uses 640x640 input (same as YOLO for Ultralytics version)
+        // RT-DETR uses 640x640 input
         let input_size = (640, 640);
         log::info!("RT-DETR input size: {}x{}", input_size.0, input_size.1);
 

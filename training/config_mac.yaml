@@ -16,7 +16,7 @@ names:
   3: "heavy_weapon"       # Mounted guns, artillery pieces
 
 # Model configuration
-model: "yolov8n.pt"  # Nano model for Mac efficiency
+model: "rtdetr-l.pt"  # RT-DETR model for Mac
 
 # Training hyperparameters - Mac optimized
 epochs: 100

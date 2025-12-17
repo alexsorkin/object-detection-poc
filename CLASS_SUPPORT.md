@@ -2,9 +2,10 @@
 
 ## Overview
 
-The detection system now supports **all YOLO-World object classes**, including:
-- **COCO** (80 classes) - Most common objects
+The detection system supports object classes from standard datasets:
+- **COCO** (80 classes) - Most common objects  
 - **Objects365** (365 classes) - Comprehensive object detection dataset
+- **Custom trained models** - Any class definitions
 
 ## Implementation
 
@@ -73,33 +74,35 @@ Colors are automatically generated using a deterministic algorithm based on clas
 
 ## Usage
 
-### Detecting with any YOLO model
+### Detecting with RT-DETR
 
 ```rust
-use military_target_detector::{DetectorONNX, DetectorConfig};
+use military_target_detector::{DetectorConfig, RTDETRDetector};
 
-let config = DetectorConfig::default()
-    .with_confidence_threshold(0.25)
-    .with_iou_threshold(0.45);
+let config = DetectorConfig {
+    model_path: "models/rtdetr_v2_r50vd_fp32.onnx".to_string(),
+    confidence_threshold: 0.5,
+    ..Default::default()
+};
 
-let detector = DetectorONNX::new("path/to/model.onnx", config)?;
+let detector = RTDETRDetector::new(config)?;
 let detections = detector.detect(&image)?;
 
 for detection in detections {
     println!("Class: {} (ID: {})", 
-        detection.class_name, 
-        detection.class_id
+        detection.class.name(), 
+        detection.class as u32
     );
 }
 ```
 
 ### Example Models
 
-1. **COCO-trained YOLOv8**: Detects 80 common objects
-   - Export: `yolo export model=yolov8s.pt format=onnx`
+1. **COCO-trained RT-DETR**: Detects 80 common objects
+   - Models: rtdetr_v2_r18vd, rtdetr_v2_r50vd, rtdetr_v2_r101vd
    - Classes: person, car, bicycle, dog, cat, etc.
 
-2. **Objects365-trained YOLO**: Detects 365 object classes
+2. **Objects365-trained models**: Detects 365 object classes
    - More comprehensive object detection
    - Better coverage of uncommon objects
 
@@ -166,4 +169,4 @@ match class_name.as_str() {
 
 - COCO Dataset: https://cocodataset.org/
 - Objects365 Dataset: https://www.objects365.org/
-- YOLO-World: https://github.com/AILab-CVC/YOLO-World
+- RT-DETR: https://github.com/lyuwenyu/RT-DETR

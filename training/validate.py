@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import torch
 from pathlib import Path
-from ultralytics import YOLO
+from ultralytics import RTDETR
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import List, Dict, Tuple
@@ -18,12 +18,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 class ModelValidator:
-    """Validation utilities for military target detection model"""
+    \"\"\"Validation utilities for military target detection model\"\"\"
     
     def __init__(self, model_path: str):
-        """Initialize validator with trained model"""
+        \"\"\"Initialize validator with trained model\"\"\"
         self.model_path = model_path
-        self.model = YOLO(model_path)
+        self.model = RTDETR(model_path)
         self.class_names = ['armed_personnel', 'rocket_launcher', 'military_vehicle', 'heavy_weapon']
         
     def validate_on_video(self, video_path: str, output_path: str = None, conf_threshold: float = 0.5):

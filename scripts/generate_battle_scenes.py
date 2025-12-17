@@ -279,7 +279,7 @@ class BattleSceneGenerator:
             # Paste tank onto background
             bg_pil.paste(tank_img, (x, y), tank_img)
             
-            # Create YOLO format annotation
+            # Create normalized annotation
             tank_center_x = (x + tank_img.width / 2) / width
             tank_center_y = (y + tank_img.height / 2) / height
             tank_width = tank_img.width / width
@@ -301,12 +301,12 @@ class BattleSceneGenerator:
         scene_path = self.output_dir / "images" / scene_filename
         cv2.imwrite(str(scene_path), final_scene)
         
-        # Save annotations in YOLO format
-        label_filename = f"battle_scene_{scene_id:05d}.txt"
-        label_path = self.output_dir / "labels" / label_filename
+        # Save annotations
+        label_filename = f\"battle_scene_{scene_id:05d}.txt\"
+        label_path = self.output_dir / \"labels\" / label_filename
         with open(label_path, 'w') as f:
             for ann in annotations:
-                # YOLO format: class x_center y_center width height
+                # Format: class x_center y_center width height
                 f.write(f"{ann['class']} {ann['bbox'][0]:.6f} {ann['bbox'][1]:.6f} "
                        f"{ann['bbox'][2]:.6f} {ann['bbox'][3]:.6f}\n")
         

@@ -198,14 +198,14 @@ let allowed_classes: Vec<String> = if args.len() > 3 {
 
 Usage:
 ```bash
-# Use defaults (airplane, car, truck)
-cargo run --release --features metal --example detect_yoloair image.jpg
+# Use defaults (person, car, motorcycle, airplane, truck)
+cargo run --release --features metal --example detect_video test_data/video.mp4
 
 # Specify classes
-cargo run --release --features metal --example detect_yoloair image.jpg output.jpg airplane bus train
+cargo run --release --features metal --example detect_video -- --classes 4,5,6 test_data/video.mp4
 
-# Single class
-cargo run --release --features metal --example detect_yoloair image.jpg output.jpg person
+# Single class (person only)
+cargo run --release --features metal --example detect_video -- --classes 0 test_data/video.mp4
 ```
 
 ## Disable Filtering

@@ -2,7 +2,7 @@
 """
 Military Target Detection Training Script
 
-This script trains a YOLOv8 model to detect military targets in video streams.
+This script trains an RT-DETR model to detect military targets in video streams.
 Optimized for real-time inference and cross-platform deployment.
 """
 
@@ -12,7 +12,7 @@ import yaml
 import torch
 import logging
 from pathlib import Path
-from ultralytics import YOLO
+from ultralytics import RTDETR
 from ultralytics.utils import LOGGER, colorstr
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MilitaryTargetTrainer:
-    """Military target detection model trainer using YOLOv8"""
+    """Military target detection model trainer using RT-DETR"""
     
     def __init__(self, config_path="config.yaml"):
         """Initialize trainer with configuration"""
@@ -179,12 +179,12 @@ class MilitaryTargetTrainer:
         return True
     
     def initialize_model(self):
-        """Initialize YOLOv8 model"""
-        model_name = self.config.get('model', 'yolov8n.pt')
+        """Initialize RT-DETR model\"\"\"
+        model_name = self.config.get('model', 'rtdetr-l.pt')
         
         try:
-            self.model = YOLO(model_name)
-            logger.info(f"Initialized YOLOv8 model: {model_name}")
+            self.model = RTDETR(model_name)
+            logger.info(f\"Initialized RT-DETR model: {model_name}\")
             
             # Print model info
             logger.info(f"Model parameters: {sum(p.numel() for p in self.model.model.parameters()):,}")
@@ -282,7 +282,7 @@ class MilitaryTargetTrainer:
                 # Fall back to alternative name
                 best_model_path = Path("../models/military_targets_best.pt")
             
-            best_model = YOLO(str(best_model_path))
+            best_model = RTDETR(str(best_model_path))
             
             export_path = best_model.export(
                 format=export_format,
@@ -338,7 +338,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train military target detection model')
     # Config file approach (original)
     parser.add_argument('--config', default=None, help='Configuration file path')
-    # YOLOv8 CLI arguments (for workflow.py compatibility)
+    # RT-DETR CLI arguments (for workflow.py compatibility)
     parser.add_argument('--data', help='Path to dataset YAML file')
     parser.add_argument('--epochs', type=int, help='Number of training epochs')
     parser.add_argument('--batch', type=int, help='Batch size')
@@ -362,7 +362,7 @@ def main():
         else:
             # Default config (without data section - we'll use the dataset YAML directly)
             config = {
-                'model': 'yolov8m.pt',
+                'model': 'rtdetr-l.pt',
                 'epochs': 100,
                 'batch': 16,
                 'imgsz': 640,
