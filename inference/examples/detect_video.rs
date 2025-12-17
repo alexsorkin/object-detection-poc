@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut confidence_threshold = 0.50; // Default 50%
     let mut allowed_classes: Vec<u32> = vec![0, 2, 3, 4, 7]; // person, car, motorcycle, airplane, truck
     let mut headless = false; // Default: show display window
-    let mut model_variant = RTDETRModel::R18VD_FP32; // Default: r18_fp32
+    let mut model_variant = RTDETRModel::R50VD_FP32; // Default: r18_fp32
     let mut tracking_method = TrackingMethod::ByteTrack; // Default: Kalman
     let mut detector_type = DetectorType::RTDETR; // Default: RT-DETR
     let mut video_source: Option<String> = None;
@@ -415,7 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if frames_drained > 0 {
-                log::warn!("Drained frames: {} (pipeline overload)", frames_drained);
+                log::warn!("Drained frames: {} (behind schedule)", frames_drained);
             }
 
             if latest_detector_frame.is_some() {
