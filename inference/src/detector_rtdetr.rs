@@ -92,7 +92,26 @@ impl RTDETRDetector {
                     }
                     Err(e) => {
                         log::warn!("CoreML initialization failed: {}", e);
-                        log::warn!("Falling back to next GPU backend or CPU...");
+                        log::warn!("Falling back to next GPU backend...");
+                    }
+                }
+            }
+
+            // Try ROCm (AMD GPU)
+            #[cfg(feature = "rocm")]
+            {
+                match Self::try_create_rocm_session(&model_path, &config) {
+                    Ok(session) => {
+                        log::info!("✓ RT-DETR loaded successfully with ROCm (AMD GPU)");
+                        return Ok(Self {
+                            session,
+                            config,
+                            input_size,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("ROCm initialization failed: {}", e);
+                        log::warn!("Falling back to next GPU backend...");
                     }
                 }
             }
@@ -120,6 +139,7 @@ impl RTDETRDetector {
                 feature = "coreml",
                 feature = "cuda",
                 feature = "tensorrt",
+                feature = "rocm",
                 feature = "openvino"
             )))]
             {
@@ -189,13 +209,40 @@ impl RTDETRDetector {
         model_path: &str,
         _config: &DetectorConfig,
     ) -> Result<Session, DetectionError> {
+        use ort::execution_providers::TensorRTExecutionProvider;
+
         log::info!("Attempting to use TensorRT backend (NVIDIA GPU)...");
 
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .with_execution_providers([
+                TensorRTExecutionProvider::default()
+                    .with_device_id(0)
+                    .build(),
+            ])
+            .map_err(|e| DetectionError::ModelLoadError(format!("TensorRT provider failed: {}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| {
                 DetectionError::ModelLoadError(format!("Failed to load model with TensorRT: {}", e))
+            })?;
+
+        Ok(session)
+    }
+
+    /// Try to create a GPU-accelerated session with ROCm
+    #[cfg(feature = "rocm")]
+    fn try_create_rocm_session(
+        model_path: &str,
+        _config: &DetectorConfig,
+    ) -> Result<Session, DetectionError> {
+        log::info!("Attempting to use ROCm backend (AMD GPU)...");
+
+        // Create session WITHOUT specifying execution providers (inherited from global init)
+        let session = Session::builder()
+            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
+            .commit_from_file(model_path)
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("Failed to load model with ROCm: {}", e))
             })?;
 
         Ok(session)

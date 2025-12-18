@@ -6,7 +6,7 @@ using UnityEngine;
 namespace MilitaryTargetDetection
 {
     /// <summary>
-    /// Unity C# wrapper for the military target detection library
+    /// Unity C# wrapper for the military target detection library\n    /// \n    /// Updated for RT-DETR with COCO class support (80 classes)\n    /// Compatible with ONNX Runtime GPU backends: CUDA, TensorRT, CoreML, OpenVINO, ROCm
     /// </summary>
     public class MilitaryTargetDetector : MonoBehaviour, IDisposable
     {
@@ -25,11 +25,11 @@ namespace MilitaryTargetDetection
 
         [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)]
         private static extern int mtd_create_detector(
+            int detector_type,
             string model_path,
             int input_width,
             int input_height,
             float confidence_threshold,
-            float nms_threshold,
             int max_detections,
             int use_gpu
         );
@@ -63,7 +63,6 @@ namespace MilitaryTargetDetection
         private static extern int mtd_update_config(
             int detector_id,
             float confidence_threshold,
-            float nms_threshold,
             int max_detections
         );
 
@@ -109,14 +108,90 @@ namespace MilitaryTargetDetection
         #region Public Types
 
         /// <summary>
-        /// Target class enumeration
+        /// Target class enumeration (COCO classes)
         /// </summary>
         public enum TargetClass
         {
-            ArmedPersonnel = 0,
-            RocketLauncher = 1,
-            MilitaryVehicle = 2,
-            HeavyWeapon = 3
+            Person = 0,
+            Bicycle = 1,
+            Car = 2,
+            Motorcycle = 3,
+            Airplane = 4,
+            Bus = 5,
+            Train = 6,
+            Truck = 7,
+            Boat = 8,
+            TrafficLight = 9,
+            FireHydrant = 10,
+            StopSign = 11,
+            ParkingMeter = 12,
+            Bench = 13,
+            Bird = 14,
+            Cat = 15,
+            Dog = 16,
+            Horse = 17,
+            Sheep = 18,
+            Cow = 19,
+            Elephant = 20,
+            Bear = 21,
+            Zebra = 22,
+            Giraffe = 23,
+            Backpack = 24,
+            Umbrella = 25,
+            Handbag = 26,
+            Tie = 27,
+            Suitcase = 28,
+            Frisbee = 29,
+            Skis = 30,
+            Snowboard = 31,
+            SportsBall = 32,
+            Kite = 33,
+            BaseballBat = 34,
+            BaseballGlove = 35,
+            Skateboard = 36,
+            Surfboard = 37,
+            TennisRacket = 38,
+            Bottle = 39,
+            WineGlass = 40,
+            Cup = 41,
+            Fork = 42,
+            Knife = 43,
+            Spoon = 44,
+            Bowl = 45,
+            Banana = 46,
+            Apple = 47,
+            Sandwich = 48,
+            Orange = 49,
+            Broccoli = 50,
+            Carrot = 51,
+            HotDog = 52,
+            Pizza = 53,
+            Donut = 54,
+            Cake = 55,
+            Chair = 56,
+            Couch = 57,
+            PottedPlant = 58,
+            Bed = 59,
+            DiningTable = 60,
+            Toilet = 61,
+            Tv = 62,
+            Laptop = 63,
+            Mouse = 64,
+            Remote = 65,
+            Keyboard = 66,
+            CellPhone = 67,
+            Microwave = 68,
+            Oven = 69,
+            Toaster = 70,
+            Sink = 71,
+            Refrigerator = 72,
+            Book = 73,
+            Clock = 74,
+            Vase = 75,
+            Scissors = 76,
+            TeddyBear = 77,
+            HairDrier = 78,
+            Toothbrush = 79
         }
 
         /// <summary>
@@ -215,8 +290,6 @@ namespace MilitaryTargetDetection
         [Header("Detection Parameters")]
         [Range(0f, 1f)]
         [SerializeField] private float confidenceThreshold = 0.5f;
-        [Range(0f, 1f)]
-        [SerializeField] private float nmsThreshold = 0.45f;
         [SerializeField] private int maxDetections = 100;
 
         [Header("Performance")]
@@ -292,11 +365,11 @@ namespace MilitaryTargetDetection
                 string fullModelPath = System.IO.Path.Combine(Application.streamingAssetsPath, modelPath);
                 
                 detectorId = mtd_create_detector(
+                    0, // detector_type: 0 = RTDETR
                     fullModelPath,
                     inputSize.x,
                     inputSize.y,
                     confidenceThreshold,
-                    nmsThreshold,
                     maxDetections,
                     useGPU ? 1 : 0
                 );
@@ -440,9 +513,9 @@ namespace MilitaryTargetDetection
 
         /// <summary>
         /// Update detector configuration
+        /// Note: Configuration updates require recreating the detector in current implementation
         /// </summary>
         public bool UpdateConfiguration(float? newConfidenceThreshold = null, 
-                                      float? newNmsThreshold = null, 
                                       int? newMaxDetections = null)
         {
             if (!isInitialized)
@@ -452,18 +525,21 @@ namespace MilitaryTargetDetection
             }
 
             float confThresh = newConfidenceThreshold ?? confidenceThreshold;
-            float nmsThresh = newNmsThreshold ?? nmsThreshold;
             int maxDet = newMaxDetections ?? maxDetections;
 
-            int result = mtd_update_config(detectorId, confThresh, nmsThresh, maxDet);
+            int result = mtd_update_config(detectorId, confThresh, maxDet);
             
             if (result == 0)
             {
                 confidenceThreshold = confThresh;
-                nmsThreshold = nmsThresh;
                 maxDetections = maxDet;
                 Log("Configuration updated successfully");
                 return true;
+            }
+            else if (result == -2)
+            {
+                LogError("Configuration updates not supported - recreate detector instead");
+                return false;
             }
             else
             {

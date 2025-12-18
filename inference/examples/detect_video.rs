@@ -107,6 +107,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("OpenVINO global init failed: {}", e))?;
     }
 
+    #[cfg(feature = "rocm")]
+    {
+        use ort::execution_providers::ROCmExecutionProvider;
+        ort::init()
+            .with_execution_providers([
+                ROCmExecutionProvider::default()
+                    .with_device_id(0)
+                    .build()
+            ])
+            .commit()
+            .map_err(|e| format!("ROCm global init failed: {}", e))?;
+    }
+
     eprintln!("📝 Parsing arguments...");
 
     let args: Vec<String> = env::args().collect();
