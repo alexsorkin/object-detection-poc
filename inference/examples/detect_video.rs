@@ -744,7 +744,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut display_mat,
                 imgproc::COLOR_RGB2BGR,
                 0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             );
 
             let _ =

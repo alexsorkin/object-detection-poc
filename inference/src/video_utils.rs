@@ -240,7 +240,6 @@ impl VideoResizer {
                 &mut rgb_mat,
                 imgproc::COLOR_BGR2RGB,
                 0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             )
             .map_err(|e| DetectionError::Other(format!("Failed to convert BGR to RGB: {}", e)))?;
 
@@ -263,7 +262,6 @@ impl VideoResizer {
                 &mut rgb_mat,
                 imgproc::COLOR_BGR2RGB,
                 0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             )
             .map_err(|e| DetectionError::Other(format!("Failed to convert BGR to RGB: {}", e)))?;
 

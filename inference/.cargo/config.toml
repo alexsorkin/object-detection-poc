@@ -1,31 +1,37 @@
-# Platform-specific environment variables for cargo build
+# Cross-platform environment variables for cargo build
+
+# Essential environment variables - override in target sections for other platforms
+[env]
+CPLUS_INCLUDE_PATH = "/usr/include/c++/13:/usr/include/x86_64-linux-gnu/c++/13"
 
 # macOS Intel (x86_64) - Homebrew installs to /usr/local
-[target.x86_64-apple-darwin]
-rustflags = []
-
 [target.x86_64-apple-darwin.env]
 DYLD_LIBRARY_PATH = "/usr/local/opt/llvm/lib"
 LIBCLANG_PATH = "/usr/local/opt/llvm/lib"
 LLVM_CONFIG_PATH = "/usr/local/opt/llvm/bin/llvm-config"
 OpenCV_DIR = "/usr/local/opt/opencv"
+CPLUS_INCLUDE_PATH = "/usr/local/opt/llvm/include/c++/v1"
 
 # macOS Apple Silicon (ARM64) - Homebrew installs to /opt/homebrew
-[target.aarch64-apple-darwin]
-rustflags = []
-
 [target.aarch64-apple-darwin.env]
 DYLD_LIBRARY_PATH = "/opt/homebrew/opt/llvm/lib"
 LIBCLANG_PATH = "/opt/homebrew/opt/llvm/lib"
 LLVM_CONFIG_PATH = "/opt/homebrew/opt/llvm/bin/llvm-config"
 OpenCV_DIR = "/opt/homebrew/opt/opencv"
+CPLUS_INCLUDE_PATH = "/opt/homebrew/opt/llvm/include/c++/v1"
 
-# Linux x86_64
-[target.x86_64-unknown-linux-gnu]
-rustflags = []
-
+# Linux x86_64 - Use conda OpenCV installation
 [target.x86_64-unknown-linux-gnu.env]
-# LLVM and OpenCV paths will typically be in standard system locations
-# Uncomment and adjust if needed:
-# LIBCLANG_PATH = "/usr/lib/llvm-14/lib"
-# OpenCV_DIR = "/usr/lib/x86_64-linux-gnu/cmake/opencv4"
+LIBCLANG_PATH = "/usr/lib/llvm-18/lib"
+LLVM_CONFIG_PATH = "/usr/bin/llvm-config"
+OpenCV_DIR = "/home/alexs/miniconda3"
+PKG_CONFIG_PATH = "/home/alexs/miniconda3/lib/pkgconfig"
+
+# Windows x86_64 (if using vcpkg or manual OpenCV installation)
+[target.x86_64-pc-windows-msvc.env]
+# Uncomment and adjust paths as needed for your OpenCV installation
+# OPENCV_LINK_LIBS = "opencv_world4,opencv_img_hash4"
+# OPENCV_LINK_PATHS = "C:\\opencv\\build\\x64\\vc16\\lib"
+# OPENCV_INCLUDE_PATHS = "C:\\opencv\\build\\include"
+# Override Linux paths that don't work on Windows
+# CPLUS_INCLUDE_PATH = ""
