@@ -235,6 +235,19 @@ impl VideoResizer {
         if total_pixels < 100_000 {
             // Convert BGR to RGB using OpenCV
             let mut rgb_mat = Mat::default();
+            
+            // macOS OpenCV requires AlgorithmHint parameter, Linux does not
+            #[cfg(target_os = "macos")]
+            imgproc::cvt_color(
+                mat,
+                &mut rgb_mat,
+                imgproc::COLOR_BGR2RGB,
+                0,
+                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+            )
+            .map_err(|e| DetectionError::Other(format!("Failed to convert BGR to RGB: {}", e)))?;
+            
+            #[cfg(not(target_os = "macos"))]
             imgproc::cvt_color(
                 mat,
                 &mut rgb_mat,
@@ -257,6 +270,19 @@ impl VideoResizer {
             // OPTIMIZATION: Parallel processing for large images
             // Convert BGR to RGB using OpenCV first (still fastest for color conversion)
             let mut rgb_mat = Mat::default();
+            
+            // macOS OpenCV requires AlgorithmHint parameter, Linux does not
+            #[cfg(target_os = "macos")]
+            imgproc::cvt_color(
+                mat,
+                &mut rgb_mat,
+                imgproc::COLOR_BGR2RGB,
+                0,
+                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+            )
+            .map_err(|e| DetectionError::Other(format!("Failed to convert BGR to RGB: {}", e)))?;
+            
+            #[cfg(not(target_os = "macos"))]
             imgproc::cvt_color(
                 mat,
                 &mut rgb_mat,

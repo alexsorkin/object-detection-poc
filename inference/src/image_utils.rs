@@ -21,14 +21,19 @@ use crate::frame_pipeline::TileDetection;
 pub fn remove_shadows_clahe(bgr_mat: &Mat) -> Result<Mat, Box<dyn std::error::Error>> {
     // Convert BGR to LAB color space
     let mut lab_mat = Mat::default();
-    
-    // Use cross-platform compatible API call
+
+    // macOS OpenCV requires AlgorithmHint parameter, Linux does not
+    #[cfg(target_os = "macos")]
     imgproc::cvt_color(
         bgr_mat,
         &mut lab_mat,
         imgproc::COLOR_BGR2Lab,
         0,
+        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
+
+    #[cfg(not(target_os = "macos"))]
+    imgproc::cvt_color(bgr_mat, &mut lab_mat, imgproc::COLOR_BGR2Lab, 0)?;
 
     // Split LAB channels
     let mut lab_channels = Vector::<Mat>::new();
@@ -46,14 +51,21 @@ pub fn remove_shadows_clahe(bgr_mat: &Mat) -> Result<Mat, Box<dyn std::error::Er
     let mut lab_enhanced = Mat::default();
     opencv::core::merge(&lab_channels, &mut lab_enhanced)?;
 
-    // Convert back to BGR - cross-platform compatible API call
+    // Convert back to BGR
     let mut bgr_enhanced = Mat::default();
+
+    // macOS OpenCV requires AlgorithmHint parameter, Linux does not
+    #[cfg(target_os = "macos")]
     imgproc::cvt_color(
         &lab_enhanced,
         &mut bgr_enhanced,
         imgproc::COLOR_Lab2BGR,
         0,
+        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
+
+    #[cfg(not(target_os = "macos"))]
+    imgproc::cvt_color(&lab_enhanced, &mut bgr_enhanced, imgproc::COLOR_Lab2BGR, 0)?;
 
     Ok(bgr_enhanced)
 }

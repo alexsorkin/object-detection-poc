@@ -739,12 +739,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut display_mat = Mat::default();
 
             // Reuse pre-allocated display_mat buffer for BGR conversion
+            // macOS OpenCV requires AlgorithmHint parameter, Linux does not
+            #[cfg(target_os = "macos")]
             let _ = imgproc::cvt_color(
                 &mat,
                 &mut display_mat,
                 imgproc::COLOR_RGB2BGR,
                 0,
+                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             );
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = imgproc::cvt_color(&mat, &mut display_mat, imgproc::COLOR_RGB2BGR, 0);
 
             let _ =
                 display_tx.try_send((display_mat.clone(), frame_arc.width(), frame_arc.height()));
