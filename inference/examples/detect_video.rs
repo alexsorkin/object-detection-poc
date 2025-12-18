@@ -55,17 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    
+
     // Initialize CUDA globally first (critical for GPU acceleration to work)
     #[cfg(feature = "cuda")]
     {
         use ort::execution_providers::CUDAExecutionProvider;
         ort::init()
-            .with_execution_providers([
-                CUDAExecutionProvider::default()
-                    .with_device_id(0)
-                    .build()
-            ])
+            .with_execution_providers([CUDAExecutionProvider::default().with_device_id(0).build()])
             .commit()
             .map_err(|e| format!("CUDA global init failed: {}", e))?;
     }
@@ -74,11 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use ort::execution_providers::TensorRTExecutionProvider;
         ort::init()
-            .with_execution_providers([
-                TensorRTExecutionProvider::default()
-                    .with_device_id(0)
-                    .build()
-            ])
+            .with_execution_providers([TensorRTExecutionProvider::default()
+                .with_device_id(0)
+                .build()])
             .commit()
             .map_err(|e| format!("TensorRT global init failed: {}", e))?;
     }
@@ -87,10 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use ort::execution_providers::CoreMLExecutionProvider;
         ort::init()
-            .with_execution_providers([
-                CoreMLExecutionProvider::default()
-                    .build()
-            ])
+            .with_execution_providers([CoreMLExecutionProvider::default().build()])
             .commit()
             .map_err(|e| format!("CoreML global init failed: {}", e))?;
     }
@@ -99,10 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use ort::execution_providers::OpenVINOExecutionProvider;
         ort::init()
-            .with_execution_providers([
-                OpenVINOExecutionProvider::default()
-                    .build()
-            ])
+            .with_execution_providers([OpenVINOExecutionProvider::default().build()])
             .commit()
             .map_err(|e| format!("OpenVINO global init failed: {}", e))?;
     }
@@ -111,11 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use ort::execution_providers::ROCmExecutionProvider;
         ort::init()
-            .with_execution_providers([
-                ROCmExecutionProvider::default()
-                    .with_device_id(0)
-                    .build()
-            ])
+            .with_execution_providers([ROCmExecutionProvider::default().with_device_id(0).build()])
             .commit()
             .map_err(|e| format!("ROCm global init failed: {}", e))?;
     }
@@ -760,6 +744,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut display_mat,
                 imgproc::COLOR_RGB2BGR,
                 0,
+                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
             );
 
             let _ =

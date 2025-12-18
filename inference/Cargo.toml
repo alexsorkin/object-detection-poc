@@ -75,7 +75,7 @@ default = []
 coreml = ["ort/coreml"]      # Enable CoreML GPU acceleration on Apple platforms
 openvino = ["ort/openvino"]  # Enable OpenVINO GPU acceleration on Intel eGPU
 cuda = ["ort/cuda"]          # Enable CUDA GPU acceleration on NVIDIA platforms
-tensorrt = ["ort/tensorrt"]  # Enable TensorRT GPU acceleration on NVIDIA platforms (optimized)
+tensorrt = ["ort/tensorrt"]  # Enable TensorRT GPU acceleration on NVIDIA platforms
 rocm = ["ort/rocm"]          # Enable ROCm GPU acceleration on AMD platforms
 
 [profile.release]

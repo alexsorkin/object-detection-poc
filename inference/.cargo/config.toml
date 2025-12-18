@@ -1,17 +1,31 @@
-# Linux environment variables for cargo build
-# Copy this file to config.toml on Linux systems:
-#   cp config.toml.linux.example config.toml
-#
-# After installing dependencies:
-#   sudo apt install llvm-dev libclang-dev libopencv-dev pkg-config  # Ubuntu/Debian
-#   sudo dnf install llvm-devel clang-devel opencv-devel             # Fedora
-#
-# Most Linux systems auto-detect via pkg-config, but you can override here if needed:
+# Platform-specific environment variables for cargo build
 
-[env]
-# Uncomment and adjust paths if auto-detection fails:
-LIBCLANG_PATH = { value = "/usr/lib/llvm-18/lib", force = true, relative = false }
-LLVM_CONFIG_PATH = { value = "/usr/bin/llvm-config", force = true, relative = false }
-OpenCV_DIR = { value = "/usr", force = true, relative = false }
-# Add C++ include paths for opencv binding generator to find stdlib headers
-CPLUS_INCLUDE_PATH = { value = "/usr/include/c++/13:/usr/include/x86_64-linux-gnu/c++/13", force = true, relative = false }
+# macOS Intel (x86_64) - Homebrew installs to /usr/local
+[target.x86_64-apple-darwin]
+rustflags = []
+
+[target.x86_64-apple-darwin.env]
+DYLD_LIBRARY_PATH = "/usr/local/opt/llvm/lib"
+LIBCLANG_PATH = "/usr/local/opt/llvm/lib"
+LLVM_CONFIG_PATH = "/usr/local/opt/llvm/bin/llvm-config"
+OpenCV_DIR = "/usr/local/opt/opencv"
+
+# macOS Apple Silicon (ARM64) - Homebrew installs to /opt/homebrew
+[target.aarch64-apple-darwin]
+rustflags = []
+
+[target.aarch64-apple-darwin.env]
+DYLD_LIBRARY_PATH = "/opt/homebrew/opt/llvm/lib"
+LIBCLANG_PATH = "/opt/homebrew/opt/llvm/lib"
+LLVM_CONFIG_PATH = "/opt/homebrew/opt/llvm/bin/llvm-config"
+OpenCV_DIR = "/opt/homebrew/opt/opencv"
+
+# Linux x86_64
+[target.x86_64-unknown-linux-gnu]
+rustflags = []
+
+[target.x86_64-unknown-linux-gnu.env]
+# LLVM and OpenCV paths will typically be in standard system locations
+# Uncomment and adjust if needed:
+# LIBCLANG_PATH = "/usr/lib/llvm-14/lib"
+# OpenCV_DIR = "/usr/lib/x86_64-linux-gnu/cmake/opencv4"
