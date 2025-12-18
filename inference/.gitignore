@@ -28,3 +28,6 @@ benchmark_reports
 
 # System
 .DS_Store
+
+# Local cargo config (platform-specific)
+.cargo/config.toml

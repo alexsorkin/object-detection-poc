@@ -12,15 +12,15 @@ fn generate_test_detections(
     frame_width: f32,
     frame_height: f32,
 ) -> Vec<TileDetection> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut detections = Vec::with_capacity(count);
 
     for _i in 0..count {
-        let width = rng.gen_range(20.0..100.0);
-        let height = rng.gen_range(20.0..100.0);
-        let x = rng.gen_range(0.0..(frame_width - width));
-        let y = rng.gen_range(0.0..(frame_height - height));
-        let confidence = rng.gen_range(0.3..0.95);
+        let width = rng.random_range(20.0..100.0);
+        let height = rng.random_range(20.0..100.0);
+        let x = rng.random_range(0.0..(frame_width - width));
+        let y = rng.random_range(0.0..(frame_height - height));
+        let confidence = rng.random_range(0.3..0.95);
 
         detections.push(TileDetection {
             x,
@@ -28,8 +28,8 @@ fn generate_test_detections(
             w: width,
             h: height,
             confidence,
-            class_id: rng.gen_range(0..8), // Common COCO classes
-            class_name: Arc::from(format!("class_{}", rng.gen_range(0..8)).as_str()),
+            class_id: rng.random_range(0..8), // Common COCO classes
+            class_name: Arc::from(format!("class_{}", rng.random_range(0..8)).as_str()),
             tile_idx: 0,
             vx: None,
             vy: None,

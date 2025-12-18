@@ -1,8 +1,9 @@
 //! Benchmarks for tracking algorithms
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use ioutrack::{ByteMultiTracker, SortMultiTracker};
 use ndarray::Array2;
+use std::hint::black_box;
 
 fn create_test_detections(n_detections: usize, n_frames: usize) -> Vec<Array2<f32>> {
     (0..n_frames)
@@ -268,12 +269,12 @@ fn bench_sparse_assignment(c: &mut Criterion) {
 
         // Create sparse matrix
         let valid_count = (size * size * sparsity) / 100;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..valid_count {
-            let i = rng.gen_range(0..size);
-            let j = rng.gen_range(0..size);
+            let i = rng.random_range(0..size);
+            let j = rng.random_range(0..size);
             let idx = i * size + j;
-            cost_matrix_data[idx] = rng.gen_range(0.0..threshold);
+            cost_matrix_data[idx] = rng.random_range(0.0..threshold);
         }
 
         let cost_matrix = Array2::from_shape_vec((size, size), cost_matrix_data).unwrap();

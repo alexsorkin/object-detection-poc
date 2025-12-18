@@ -9,18 +9,18 @@ use std::sync::Arc;
 
 /// Generate test detection data for image processing benchmarks
 fn generate_test_tile_detections(count: usize) -> Vec<TileDetection> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut detections = Vec::with_capacity(count);
 
     for i in 0..count {
         detections.push(TileDetection {
-            x: rng.gen_range(0.0..1800.0),
-            y: rng.gen_range(0.0..1000.0),
-            w: rng.gen_range(20.0..200.0),
-            h: rng.gen_range(20.0..200.0),
-            confidence: rng.gen_range(0.5..1.0),
-            class_id: rng.gen_range(0..8),
-            class_name: Arc::from(format!("class_{}", rng.gen_range(0..8)).as_str()),
+            x: rng.random_range(0.0..1800.0),
+            y: rng.random_range(0.0..1000.0),
+            w: rng.random_range(20.0..200.0),
+            h: rng.random_range(20.0..200.0),
+            confidence: rng.random_range(0.5..1.0),
+            class_id: rng.random_range(0..8),
+            class_name: Arc::from(format!("class_{}", rng.random_range(0..8)).as_str()),
             tile_idx: 0,
             vx: None,
             vy: None,
@@ -44,14 +44,14 @@ fn create_test_image(width: u32, height: u32) -> RgbImage {
     }
 
     // Add some noise for realism
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for _ in 0..(width * height / 100) {
-        let x = rng.gen_range(0..width);
-        let y = rng.gen_range(0..height);
+        let x = rng.random_range(0..width);
+        let y = rng.random_range(0..height);
         let noise = Rgb([
-            rng.gen_range(0..255),
-            rng.gen_range(0..255),
-            rng.gen_range(0..255),
+            rng.random_range(0..255),
+            rng.random_range(0..255),
+            rng.random_range(0..255),
         ]);
         image.put_pixel(x, y, noise);
     }
@@ -121,17 +121,17 @@ fn bench_draw_rect_batch(c: &mut Criterion) {
             let image = create_test_image(*width, *height);
 
             // Generate rectangles to draw
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let rects: Vec<_> = (0..count)
                 .map(|_| {
-                    let x = rng.gen_range(0..(*width as i32 - 100));
-                    let y = rng.gen_range(0..(*height as i32 - 100));
-                    let w = rng.gen_range(20..100);
-                    let h = rng.gen_range(20..100);
+                    let x = rng.random_range(0..(*width as i32 - 100));
+                    let y = rng.random_range(0..(*height as i32 - 100));
+                    let w = rng.random_range(20..100);
+                    let h = rng.random_range(20..100);
                     let color = Rgb([
-                        rng.gen_range(0..255),
-                        rng.gen_range(0..255),
-                        rng.gen_range(0..255),
+                        rng.random_range(0..255),
+                        rng.random_range(0..255),
+                        rng.random_range(0..255),
                     ]);
                     (x, y, w, h, color, 2) // thickness = 2
                 })

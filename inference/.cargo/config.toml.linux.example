@@ -10,8 +10,6 @@
 
 [env]
 # Uncomment and adjust paths if auto-detection fails:
-LIBCLANG_PATH = { value = "/usr/lib/llvm-18/lib", force = true, relative = false }
-LLVM_CONFIG_PATH = { value = "/usr/bin/llvm-config", force = true, relative = false }
-OpenCV_DIR = { value = "/usr", force = true, relative = false }
-# Add C++ include paths for opencv binding generator to find stdlib headers
-CPLUS_INCLUDE_PATH = { value = "/usr/include/c++/13:/usr/include/x86_64-linux-gnu/c++/13", force = true, relative = false }
+# LIBCLANG_PATH = { value = "/usr/lib/llvm-14/lib", force = true, relative = false }
+# LLVM_CONFIG_PATH = { value = "/usr/bin/llvm-config", force = true, relative = false }
+# OpenCV_DIR = { value = "/usr", force = true, relative = false }

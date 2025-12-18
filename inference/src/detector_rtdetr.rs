@@ -40,7 +40,7 @@ impl RTDETRDetector {
 
         // Try GPU path first if requested
         if config.use_gpu && use_gpu_backend {
-            // Try CUDA first (NVIDIA)
+            // Try CUDA (NVIDIA)
             #[cfg(feature = "cuda")]
             {
                 match Self::try_create_cuda_session(&model_path, &config) {
@@ -54,12 +54,12 @@ impl RTDETRDetector {
                     }
                     Err(e) => {
                         log::warn!("CUDA initialization failed: {}", e);
-                        log::warn!("Trying TensorRT fallback...");
+                        log::warn!("Falling back to next GPU backend...");
                     }
                 }
             }
 
-            // Try TensorRT (NVIDIA - optimized)
+            // Try TensorRT (NVIDIA)
             #[cfg(feature = "tensorrt")]
             {
                 match Self::try_create_tensorrt_session(&model_path, &config) {
@@ -73,6 +73,7 @@ impl RTDETRDetector {
                     }
                     Err(e) => {
                         log::warn!("TensorRT initialization failed: {}", e);
+                        log::warn!("Falling back to next GPU backend...");
                     }
                 }
             }
@@ -169,16 +170,11 @@ impl RTDETRDetector {
         model_path: &str,
         _config: &DetectorConfig,
     ) -> Result<Session, DetectionError> {
-        use ort::execution_providers::CUDAExecutionProvider;
-
         log::info!("Attempting to use CUDA backend (NVIDIA GPU)...");
-
+        
+        // Create session WITHOUT specifying execution providers (inherited from global init)
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_execution_providers([CUDAExecutionProvider::default().build()])
-            .map_err(|e| DetectionError::ModelLoadError(format!("CUDA provider failed: {}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| {
                 DetectionError::ModelLoadError(format!("Failed to load model with CUDA: {}", e))
@@ -191,23 +187,12 @@ impl RTDETRDetector {
     #[cfg(feature = "tensorrt")]
     fn try_create_tensorrt_session(
         model_path: &str,
-        config: &DetectorConfig,
+        _config: &DetectorConfig,
     ) -> Result<Session, DetectionError> {
-        use ort::execution_providers::TensorRTExecutionProvider;
-
-        log::info!("Attempting to use TensorRT backend (NVIDIA GPU - optimized)...");
+        log::info!("Attempting to use TensorRT backend (NVIDIA GPU)...");
 
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_execution_providers([TensorRTExecutionProvider::default()
-                .with_device_id(config.gpu_device_id)
-                .with_fp16(true)
-                .build()])
-            .map_err(|e| {
-                DetectionError::ModelLoadError(format!("TensorRT provider failed: {}", e))
-            })?
             .commit_from_file(model_path)
             .map_err(|e| {
                 DetectionError::ModelLoadError(format!("Failed to load model with TensorRT: {}", e))
@@ -222,21 +207,15 @@ impl RTDETRDetector {
         model_path: &str,
         _config: &DetectorConfig,
     ) -> Result<Session, DetectionError> {
-        use ort::execution_providers::coreml::CoreMLComputeUnits;
-        use ort::execution_providers::CoreMLExecutionProvider;
-
         log::info!("Attempting to use CoreML (Metal GPU only, no Neural Engine)...");
 
+        // Create session WITHOUT specifying execution providers (inherited from global init)
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_execution_providers([CoreMLExecutionProvider::default()
-                .with_compute_units(CoreMLComputeUnits::CPUAndGPU) // Use GPU only, disable Neural Engine
-                .build()])
-            .map_err(|e| DetectionError::ModelLoadError(format!("CoreML provider failed: {}", e)))?
             .commit_from_file(model_path)
-            .map_err(|e| DetectionError::ModelLoadError(format!("Failed to load model: {}", e)))?;
+            .map_err(|e| {
+                DetectionError::ModelLoadError(format!("Failed to load model with CoreML: {}", e))
+            })?;
 
         Ok(session)
     }
@@ -247,18 +226,11 @@ impl RTDETRDetector {
         model_path: &str,
         _config: &DetectorConfig,
     ) -> Result<Session, DetectionError> {
-        use ort::execution_providers::OpenVINOExecutionProvider;
-
         log::info!("Attempting to use OpenVINO backend (Intel GPU/VPU)...");
 
+        // Create session WITHOUT specifying execution providers (inherited from global init)
         let session = Session::builder()
             .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| DetectionError::ModelLoadError(e.to_string()))?
-            .with_execution_providers([OpenVINOExecutionProvider::default().build()])
-            .map_err(|e| {
-                DetectionError::ModelLoadError(format!("OpenVINO provider failed: {}", e))
-            })?
             .commit_from_file(model_path)
             .map_err(|e| {
                 DetectionError::ModelLoadError(format!("Failed to load model with OpenVINO: {}", e))
@@ -291,19 +263,29 @@ impl RTDETRDetector {
         let input_tensor = self.preprocess(image)?;
 
         // Run inference
-        let tensor_ref = TensorRef::from_array_view(&input_tensor)
+        let tensor_ref = TensorRef::from_array_view(input_tensor.view())
             .map_err(|e| DetectionError::InferenceError(e.to_string()))?;
 
+        let input_name = self.session.inputs[0].name.clone();
+        
         let outputs = self
             .session
-            .run(ort::inputs![tensor_ref])
+            .run(ort::inputs![input_name => tensor_ref])
             .map_err(|e| DetectionError::InferenceError(e.to_string()))?;
 
-        // Auto-detect output format: Ultralytics (1 output) vs Hugging Face (2 outputs)
+        // RT-DETR models may have many outputs (up to 14), but we only need the first 2:
+        // outputs[0]: pred_logits [batch, 300, num_classes]  
+        // outputs[1]: pred_boxes [batch, 300, 4]
+        // outputs[2..]: intermediate/debug tensors (ignore for TensorRT optimization)
+        
+        if outputs.len() < 2 {
+            return Err(DetectionError::postprocessing(
+                format!("Expected at least 2 outputs, got {}", outputs.len())
+            ));
+        }
+
         let (pred_boxes, pred_logits) = if outputs.len() >= 2 {
-            // Hugging Face format: separate pred_logits and pred_boxes tensors
-            // outputs[0]: pred_logits [1, 300, 80]
-            // outputs[1]: pred_boxes [1, 300, 4]
+            // Standard RT-DETR format: separate pred_logits and pred_boxes (ignore outputs[2..])
             let logits = outputs[0]
                 .try_extract_array::<f32>()
                 .map_err(|e| DetectionError::postprocessing(e.to_string()))?

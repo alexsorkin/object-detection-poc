@@ -26,7 +26,6 @@ pub fn remove_shadows_clahe(bgr_mat: &Mat) -> Result<Mat, Box<dyn std::error::Er
         &mut lab_mat,
         imgproc::COLOR_BGR2Lab,
         0,
-        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
 
     // Split LAB channels
@@ -52,7 +51,6 @@ pub fn remove_shadows_clahe(bgr_mat: &Mat) -> Result<Mat, Box<dyn std::error::Er
         &mut bgr_enhanced,
         imgproc::COLOR_Lab2BGR,
         0,
-        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
 
     Ok(bgr_enhanced)

@@ -23,21 +23,21 @@ fn create_test_image(width: u32, height: u32) -> RgbImage {
 
 /// Generate test detections
 fn generate_test_detections(count: usize) -> Vec<TileDetection> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut detections = Vec::with_capacity(count);
 
     for i in 0..count {
         detections.push(TileDetection {
-            x: rng.gen_range(0.0..1800.0),
-            y: rng.gen_range(0.0..1000.0),
-            w: rng.gen_range(20.0..200.0),
-            h: rng.gen_range(20.0..200.0),
-            confidence: rng.gen_range(0.5..1.0),
+            x: rng.random_range(0.0..1800.0),
+            y: rng.random_range(0.0..1000.0),
+            w: rng.random_range(20.0..200.0),
+            h: rng.random_range(20.0..200.0),
+            confidence: rng.random_range(0.5..1.0),
             class_id: (i % 8) as u32,
             class_name: Arc::from(format!("class_{}", i % 8).as_str()),
             tile_idx: 0,
-            vx: Some(rng.gen_range(-5.0..5.0)),
-            vy: Some(rng.gen_range(-5.0..5.0)),
+            vx: Some(rng.random_range(-5.0..5.0)),
+            vy: Some(rng.random_range(-5.0..5.0)),
             track_id: Some(i as u32),
         });
     }

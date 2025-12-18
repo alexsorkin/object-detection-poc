@@ -30,9 +30,24 @@ cargo run --release --example detect -- ../models/military_target_detector.onnx 
 ```
 
 ### Real-Time Video with Kalman Tracking
-```bash
-# Prerequisites: brew install opencv llvm
 
+**Setup (required):**
+```bash
+# macOS:
+brew install opencv llvm
+cp .cargo/config.toml.macos.example .cargo/config.toml
+
+# Linux (Ubuntu/Debian):
+sudo apt install llvm-dev libclang-dev libopencv-dev pkg-config
+cp .cargo/config.toml.linux.example .cargo/config.toml
+
+# Linux (Fedora):
+sudo dnf install llvm-devel clang-devel opencv-devel
+cp .cargo/config.toml.linux.example .cargo/config.toml
+```
+
+**Run:**
+```bash
 # Test Kalman tracker (no video file required)
 cargo run --release --features metal --example test_kalman
 

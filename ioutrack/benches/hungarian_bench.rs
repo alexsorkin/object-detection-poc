@@ -1,11 +1,12 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use ioutrack::hungarian::HungarianSolver;
 use ndarray::Array2;
 use rand::prelude::*;
+use std::hint::black_box;
 
 fn generate_random_cost_matrix(detections: usize, tracks: usize) -> Array2<f32> {
-    let mut rng = thread_rng();
-    Array2::from_shape_fn((detections, tracks), |_| rng.gen_range(0.0..1.0))
+    let mut rng = rand::rng();
+    Array2::from_shape_fn((detections, tracks), |_| rng.random_range(0.0..1.0))
 }
 
 fn bench_hungarian_small(c: &mut Criterion) {

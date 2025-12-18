@@ -104,6 +104,7 @@ Assets/AssetStoreTools*
 *.sln
 *.suo
 *.tmp
+*.bck
 *.user
 *.userprefs
 *.pidb
